@@ -1,16 +1,12 @@
-
-
-https://github.com/user-attachments/assets/cf2bd7ea-e3fa-4140-a59b-066bf845f924
-
 # AI NetGuard
 
 Windows 平台下的 AI 专属网络隔离与防泄漏安全网关（基于 **Tauri 2 + Rust + React 18 + sing-box + Windows Filtering Platform (WFP)**）。
 
 ## 宣传视频与展示
 
-[![点击观看 AI NetGuard 宣传视频](docs/media/ai-netguard-cover.jpg)](docs/media/ai-netguard-promo.mp4)
+https://github.com/user-attachments/assets/cf2bd7ea-e3fa-4140-a59b-066bf845f924
 
-> ▶ **[点击播放宣传视频 (MP4, ~4.5 MB)](docs/media/ai-netguard-promo.mp4)** · **[下载最新安装包 (v0.1.0)](https://github.com/henghaxiaowu/ai-netguard/releases/tag/v0.1.0)**
+**[下载最新安装包 (v0.1.0)](https://github.com/henghaxiaowu/ai-netguard/releases/tag/v0.1.0)**
 
 ## 核心特性
 
