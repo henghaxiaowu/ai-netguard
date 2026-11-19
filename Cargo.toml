@@ -1,0 +1,7 @@
+[workspace]
+members = [
+  "guard-protocol",
+  "guard-helper",
+  "src-tauri",
+]
+resolver = "2"

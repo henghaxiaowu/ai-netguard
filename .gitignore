@@ -1,0 +1,15 @@
+node_modules/
+dist/
+target/
+src-tauri/target/
+guard-helper/target/
+*.log
+.DS_Store
+runtime/
+data/
+src-tauri/binaries/*.exe
+!src-tauri/binaries/.gitkeep
+netguard-showreel/
+ui-guide/
+promo/
+
