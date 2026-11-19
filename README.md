@@ -1,3 +1,7 @@
+
+
+Uploading ai-netguard-promo.mp4…
+
 # AI NetGuard
 
 Windows 平台下的 AI 专属网络隔离与防泄漏安全网关（基于 **Tauri 2 + Rust + React 18 + sing-box + Windows Filtering Platform (WFP)**）。
