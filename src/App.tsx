@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import {
+  AppWindow,
   LayoutGrid,
   Monitor,
   Fingerprint,
@@ -33,6 +34,7 @@ import {
   X,
 } from "lucide-react";
 import { api } from "./api";
+import { AppsEnvView } from "./components/AppsEnvView";
 import { NodeEditor } from "./components/NodeEditor";
 import { ClaudeStarburst } from "./components/ClaudeMotifs";
 import { ExitIpMap } from "./components/ExitIpMap";
@@ -56,12 +58,13 @@ import {
 import { cn } from "@/lib/utils";
 import type {
   AppConfig,
+  AppEnvSnapshot,
   DiagnosticCheck,
   DownloadProgress,
   GatewayStatus,
 } from "./types";
 
-type TabKey = "dashboard" | "verify" | "nodes" | "hardening" | "logs";
+type TabKey = "dashboard" | "apps" | "verify" | "nodes" | "hardening" | "logs";
 type CheckFilter = "all" | "core" | "security" | "coexistence" | "cli";
 
 const NAV_GROUPS: {
@@ -72,6 +75,7 @@ const NAV_GROUPS: {
     group: "网关",
     items: [
       { key: "dashboard", label: "总览与安全启动", crumb: "总览", icon: Monitor },
+      { key: "apps", label: "AI 应用与环境", crumb: "AI 应用与环境", icon: AppWindow },
       { key: "verify", label: "IP 与指纹体检", crumb: "IP 与指纹体检", icon: Fingerprint },
       { key: "nodes", label: "出口与共存路由", crumb: "出口与共存路由", icon: GitFork },
     ],
@@ -190,6 +194,8 @@ export default function App() {
   const [logFilter, setLogFilter] = useState("");
   const [domainsOpen, setDomainsOpen] = useState(false);
   const [latencyHistory, setLatencyHistory] = useState<number[]>([]);
+  const [appEnv, setAppEnv] = useState<AppEnvSnapshot | null>(null);
+  const [scanningApps, setScanningApps] = useState(false);
 
   const didAutoStartRef = useRef(false);
   const toastRef = useRef<HTMLDivElement>(null);
@@ -294,10 +300,23 @@ export default function App() {
     document.title = `${item?.label || "总览与安全启动"} | AI NetGuard`;
   }, [tab]);
 
+  const refreshAppEnv = useCallback(async () => {
+    setScanningApps(true);
+    try {
+      const snap = await api.inspectAppsEnv();
+      setAppEnv(snap);
+    } catch {
+      // Ignore if running outside Tauri runtime during preview
+    } finally {
+      setScanningApps(false);
+    }
+  }, []);
+
   const refreshAll = async () => {
     const [cfg, st] = await Promise.all([api.getConfig(), api.getStatus()]);
     setConfig(cfg);
     setStatus(st);
+    void refreshAppEnv();
     return { cfg, st };
   };
 
@@ -345,8 +364,13 @@ export default function App() {
       api.getStatus().then(setStatus).catch(() => {});
     }, 3500);
 
+    const envTimer = setInterval(() => {
+      api.inspectAppsEnv().then(setAppEnv).catch(() => {});
+    }, 8000);
+
     return () => {
       clearInterval(timer);
+      clearInterval(envTimer);
       unsubs.forEach((fn) => fn());
     };
   }, [notify]);
@@ -476,6 +500,29 @@ export default function App() {
     }
   };
 
+  const handleLaunchManagedApp = async (appId: string, relaunch: boolean) => {
+    try {
+      const msg = await api.launchManagedApp(appId, relaunch);
+      notify(msg);
+      setStatus(await api.getStatus());
+      setTimeout(() => {
+        void refreshAppEnv();
+      }, 900);
+    } catch (err) {
+      notify(`操作失败: ${String(err)}`);
+    }
+  };
+
+  const handleCleanRegistryEnv = async () => {
+    try {
+      const msg = await api.cleanRegistryProxyEnv();
+      notify(msg);
+      await refreshAppEnv();
+    } catch (err) {
+      notify(`清理失败: ${String(err)}`);
+    }
+  };
+
   const handlePasteOAuth = async () => {
     try {
       const clip = (await navigator.clipboard.readText()).trim();
@@ -594,6 +641,11 @@ export default function App() {
                           aria-hidden="true"
                         />
                         <span className="truncate">{item.label}</span>
+                        {item.key === "apps" && (appEnv?.pollutedCount ?? 0) > 0 && (
+                          <span className="mono-num ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[#dc2626] px-1 text-[0.65rem] font-semibold text-white">
+                            {appEnv?.pollutedCount}
+                          </span>
+                        )}
                       </button>
                     );
                   })}
@@ -671,7 +723,7 @@ export default function App() {
                   共存旁路: {status.detectedConflicts.join(" / ")}
                 </Badge>
               ) : null}
-              {dirty && tab !== "nodes" && tab !== "hardening" && (
+              {dirty && tab !== "nodes" && tab !== "hardening" && tab !== "apps" && (
                 <Button variant="solid" size="xs" onClick={() => handleSaveConfig()}>
                   保存未提交更改
                 </Button>
@@ -680,6 +732,31 @@ export default function App() {
           </div>
 
           <div className="vt-page-content flex flex-col">
+            {/* Live Polluted Process Alert Banner on Overview */}
+            {tab === "dashboard" && (appEnv?.pollutedCount ?? 0) > 0 && (
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[#fecaca] bg-[#fef2f2] px-4 py-2.5 text-[0.77rem] text-[#991b1b]">
+                <div className="flex min-w-0 items-center gap-2">
+                  <AlertTriangle className="h-4 w-4 shrink-0 text-[#dc2626]" aria-hidden="true" />
+                  <span className="font-medium">
+                    检测到 {appEnv?.pollutedCount} 个运行中的 AI 进程存在失效或冲突代理环境
+                    {appEnv?.systemProxy.enabled && appEnv.systemProxy.alive
+                      ? `（系统代理 ${appEnv.systemProxy.hostPort || ""} 实际正常，属于继承脏环境变量）`
+                      : ""}
+                  </span>
+                </div>
+                <Button
+                  variant="destructive"
+                  size="xs"
+                  onClick={() => {
+                    switchTab("apps");
+                    void refreshAppEnv();
+                  }}
+                >
+                  前往一键干净重启
+                </Button>
+              </div>
+            )}
+
             {/* ======================= VIEW 01: OVERVIEW ======================= */}
             {tab === "dashboard" && (
               <div className="bento-sheet flex flex-col divide-y divide-[#eaecef] rounded-2xl border border-[#eaecef] bg-white shadow-[0_1px_3px_rgba(15,23,42,0.03)]">
@@ -1465,6 +1542,28 @@ export default function App() {
                   </div>
                 </section>
               </div>
+            )}
+
+            {/* ======================= VIEW 01B: AI APPS & LAUNCH ENV ======================= */}
+            {tab === "apps" && config && (
+              <AppsEnvView
+                config={config}
+                snapshot={appEnv}
+                scanning={scanningApps}
+                gatewayRunning={Boolean(status?.running && !status?.blockedByKillSwitch)}
+                dirty={dirty}
+                onConfigChange={(next) => {
+                  setConfig(next);
+                  setDirty(true);
+                }}
+                onSave={async () => {
+                  await handleSaveConfig();
+                  await refreshAppEnv();
+                }}
+                onRescan={refreshAppEnv}
+                onLaunchApp={handleLaunchManagedApp}
+                onCleanRegistryEnv={handleCleanRegistryEnv}
+              />
             )}
 
             {/* ======================= VIEW 03: EGRESS & ROUTING ======================= */}

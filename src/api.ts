@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AppConfig,
+  AppEnvSnapshot,
   DiagnosticCheck,
   DownloadProgress,
   GatewayStatus,
@@ -28,6 +29,10 @@ export const api = {
   launchClaudeDesktop: () => invoke<string>("launch_claude_desktop"),
   launchClaudeTerminal: (workDir: string, strictWfp: boolean) =>
     invoke<string>("launch_claude_terminal", { workDir, strictWfp }),
+  inspectAppsEnv: () => invoke<AppEnvSnapshot>("inspect_apps_env"),
+  launchManagedApp: (appId: string, relaunch: boolean) =>
+    invoke<string>("launch_managed_app", { appId, relaunch }),
+  cleanRegistryProxyEnv: () => invoke<string>("clean_registry_proxy_env"),
   connectGuard: () => invoke<GatewayStatus>("connect_guard"),
   clearLogs: () => invoke<void>("clear_logs"),
   generateVpsScript: (protocol: "vless-reality" | "hysteria2", port: number) =>

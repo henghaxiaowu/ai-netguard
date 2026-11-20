@@ -353,8 +353,11 @@ impl ProcessLauncher {
         // but honors `--proxy-pac-url` cleanly! Combined with WFP port-locked loopback and sing-box
         // protocol:quic/IPv6 reject rules, 100% of traffic exits via our SOCKS5 proxy at `browser_port`
         // without injecting `--disable-quic`/`--lang` anomalies into Electron attestation checks.
+        let clean_env = crate::app_env::build_clean_base_env();
         let mut cmd = Command::new(&exe);
-        cmd.arg(format!("--proxy-pac-url=http://127.0.0.1:{pac_port}/proxy.pac"))
+        cmd.env_clear()
+            .envs(&clean_env)
+            .arg(format!("--proxy-pac-url=http://127.0.0.1:{pac_port}/proxy.pac"))
             .arg("--force-webrtc-ip-handling-policy")
             .arg("--webrtc-ip-handling-policy=disable_non_proxied_udp")
             .env("HTTP_PROXY", format!("http://127.0.0.1:{}", cfg.cli_port))

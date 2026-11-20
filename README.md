@@ -23,6 +23,7 @@ https://github.com/user-attachments/assets/cf2bd7ea-e3fa-4140-a59b-066bf845f924
 - **WFP 内核级硬锁**：提权守护进程 `netguard-guard` 在驱动层封死受保护进程直连、QUIC (UDP 443)、WebRTC STUN 与公网明文 DNS，支持 **Fail-Closed 紧急熔断** 与 **Claude Desktop 持久化离线硬锁**。
 - **不改系统代理，共存不冲突**：通过 **Physical Bypass** 绑定物理网卡直接绕过 Clash Verge / Tailscale 虚拟网卡，也可通过 **Upstream Detour** 走前置链式代理。
 - **全客户端隔离工作区**：自动下载并启动独立便携版 **Ungoogled-Chromium**（带 MV3 时区/语言对齐扩展）、PAC 接管 **Claude Desktop**、环境变量/严格 WFP 启动 **Claude Code CLI**。
+- **AI 应用启动环境管家（PEB 扫描）**：内置 `Claude Desktop` / `Antigravity` / `ChatGPT` / `Cockpit Tools` 及自定义 `.exe` 管理，实时读取活跃进程内存 (PEB) 代理变量与端口活体，精准揪出脏继承死端口并一键干净重启。
 - **实时防泄漏体检**：内置 8 项实时核验（出口 IP、VPN 共存、DNS、IPv6、WebRTC/QUIC、WFP、熔断、CLI 链路）与每 4 秒出口巡检。
 
 ---
@@ -55,7 +56,7 @@ https://github.com/user-attachments/assets/cf2bd7ea-e3fa-4140-a59b-066bf845f924
 
 ## 🚀 3 步快速上手
 
-1. **下载安装**：从 [Releases](https://github.com/henghaxiaowu/ai-netguard/releases/latest) 下载 `AI.NetGuard_0.1.1_x64-setup.exe` 安装（升级前先彻底退出托盘中的旧进程）。
+1. **下载安装**：从 [Releases](https://github.com/henghaxiaowu/ai-netguard/releases/latest) 下载 `AI.NetGuard_0.1.2_x64-setup.exe` 安装（升级前先彻底退出托盘中的旧进程）。
 2. **配置节点**：进入 **「出口与共存路由」**，粘贴 `vless://`、`hy2://`、`ss://`、`trojan://` 或 `socks5://` 链接（或用内置向导生成独享 VPS 一键脚本），填好预期国家与时区语言并保存。
 3. **启动使用**：回到 **「总览与安全启动」** 点击 **「启动安全网关」**（首次需 UAC 提权），随后按需打开 **防泄漏浏览器**、**Claude Desktop** 或 **Claude Code 终端** 即可。
 

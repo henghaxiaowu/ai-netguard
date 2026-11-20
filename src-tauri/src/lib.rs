@@ -1,3 +1,4 @@
+mod app_env;
 mod healthcheck;
 mod ipc_client;
 mod launcher;
@@ -11,8 +12,8 @@ use guard_protocol::{GuardRequest, ProtectedTarget};
 use ipc_client::GuardClient;
 use launcher::{download_and_install_browser, ProcessLauncher};
 use models::{
-    load_config, save_config_to_disk, AppConfig, DiagnosticCheck, ExitIpInfo, GatewayStatus,
-    KillSwitchMode, LogBuffer, NodeProfile, OutboundMode,
+    load_config, save_config_to_disk, AppConfig, AppEnvSnapshot, AppProxyMode, DiagnosticCheck,
+    ExitIpInfo, GatewayStatus, KillSwitchMode, LogBuffer, NodeProfile, OutboundMode,
 };
 use network::{
     detect_physical_nic, detect_running_vpn_conflicts, probe_exit_ip, resolve_server_ipv4,
@@ -111,6 +112,28 @@ impl AppState {
             });
         }
         targets.extend(Self::build_desktop_wfp_targets(inner, true));
+        for app in &inner.config.managed_apps {
+            if app.id != "claude-desktop"
+                && app.wfp_lock
+                && matches!(app.proxy_mode, AppProxyMode::Netguard)
+            {
+                if let Some(exe) =
+                    app_env::resolve_managed_app_exe(app, &inner.config, &inner.launcher)
+                {
+                    let exe_str = exe.to_string_lossy().to_string();
+                    if !targets
+                        .iter()
+                        .any(|t| t.exe_path.eq_ignore_ascii_case(&exe_str))
+                    {
+                        targets.push(ProtectedTarget {
+                            exe_path: exe_str,
+                            allow_private_lan: false,
+                            allowed_loopback_ports: vec![inner.config.cli_port],
+                        });
+                    }
+                }
+            }
+        }
         for extra in &inner.extra_wfp_targets {
             if !targets.iter().any(|t| t.exe_path == extra.exe_path) {
                 targets.push(extra.clone());
@@ -177,6 +200,14 @@ fn save_config(state: State<'_, Arc<AppState>>, config: AppConfig) -> Result<App
     save_config_to_disk(&config)?;
     let mut inner = state.inner.lock().unwrap();
     inner.config = config.clone();
+    if inner.guard.is_connected() {
+        if inner.config.wfp_lock_enabled {
+            let targets = AppState::build_wfp_targets(&inner);
+            let _ = inner.guard.call(GuardRequest::ApplyWfpLock { targets });
+        } else {
+            let _ = inner.guard.call(GuardRequest::ClearWfpLock);
+        }
+    }
     state.logs.push("已保存配置");
     Ok(config)
 }
@@ -649,6 +680,62 @@ fn clear_logs(state: State<'_, Arc<AppState>>) {
     state.logs.clear();
 }
 
+#[tauri::command]
+fn inspect_apps_env(state: State<'_, Arc<AppState>>) -> Result<AppEnvSnapshot, String> {
+    let mut inner = state.inner.lock().unwrap();
+    let gateway_running = inner.singbox.is_running() && !inner.singbox.is_blocked();
+    Ok(app_env::inspect_all_apps_env(
+        &inner.config,
+        &inner.launcher,
+        gateway_running,
+    ))
+}
+
+#[tauri::command]
+fn launch_managed_app(
+    state: State<'_, Arc<AppState>>,
+    app_id: String,
+    relaunch: bool,
+) -> Result<String, String> {
+    let mut inner = state.inner.lock().unwrap();
+    let app = inner
+        .config
+        .managed_apps
+        .iter()
+        .find(|a| a.id == app_id)
+        .cloned()
+        .ok_or_else(|| format!("未找到受控应用配置: {app_id}"))?;
+    let gateway_running = inner.singbox.is_running() && !inner.singbox.is_blocked();
+    if app.wfp_lock
+        && matches!(app.proxy_mode, AppProxyMode::Netguard)
+        && inner.config.wfp_lock_enabled
+        && inner.guard.is_connected()
+    {
+        let targets = AppState::build_wfp_targets(&inner);
+        inner.guard.call(GuardRequest::ApplyWfpLock { targets })?;
+    }
+    let cfg = inner.config.clone();
+    let _ = inner.pac.ensure_started(cfg.browser_port);
+    let pac_port = PAC_PORT;
+    app_env::launch_managed_app_with_clean_env(
+        &app,
+        &cfg,
+        &mut inner.launcher,
+        pac_port,
+        gateway_running,
+        relaunch,
+        state.logs.clone(),
+    )
+}
+
+#[tauri::command]
+fn clean_registry_proxy_env(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    let cfg = state.inner.lock().unwrap().config.clone();
+    let msg = healthcheck::apply_fix_action("fix_claude_env", &cfg)?;
+    state.logs.push(format!("[应用环境] {msg}"));
+    Ok(msg)
+}
+
 fn check_node_expectation(node: &NodeProfile, exit: &ExitIpInfo) -> Option<String> {
     if let Some(exp_ip) = node.expected_ip.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         if exp_ip != exit.ip {
@@ -946,6 +1033,9 @@ pub fn run() {
             toggle_persistent_claude_lock,
             launch_claude_desktop,
             launch_claude_terminal,
+            inspect_apps_env,
+            launch_managed_app,
+            clean_registry_proxy_env,
             clear_logs,
         ])
         .run(tauri::generate_context!())

@@ -29,6 +29,87 @@ pub enum KillSwitchMode {
     MonitorOnly,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppProxyMode {
+    Netguard,
+    SystemProxy,
+    Direct,
+    CustomProxy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedAppConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub builtin: bool,
+    #[serde(default)]
+    pub exe_path: Option<String>,
+    #[serde(default)]
+    pub process_names: Vec<String>,
+    pub proxy_mode: AppProxyMode,
+    #[serde(default)]
+    pub custom_proxy_url: Option<String>,
+    #[serde(default)]
+    pub wfp_lock: bool,
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+}
+
+pub fn default_managed_apps() -> Vec<ManagedAppConfig> {
+    vec![
+        ManagedAppConfig {
+            id: "claude-desktop".into(),
+            name: "Claude Desktop".into(),
+            builtin: true,
+            exe_path: None,
+            process_names: vec!["claude.exe".into()],
+            proxy_mode: AppProxyMode::Netguard,
+            custom_proxy_url: None,
+            wfp_lock: true,
+            extra_args: Vec::new(),
+        },
+        ManagedAppConfig {
+            id: "antigravity".into(),
+            name: "Antigravity".into(),
+            builtin: true,
+            exe_path: None,
+            process_names: vec![
+                "Antigravity.exe".into(),
+                "language_server_windows_x64.exe".into(),
+            ],
+            proxy_mode: AppProxyMode::SystemProxy,
+            custom_proxy_url: None,
+            wfp_lock: false,
+            extra_args: Vec::new(),
+        },
+        ManagedAppConfig {
+            id: "chatgpt".into(),
+            name: "ChatGPT / Codex".into(),
+            builtin: true,
+            exe_path: None,
+            process_names: vec!["ChatGPT.exe".into()],
+            proxy_mode: AppProxyMode::SystemProxy,
+            custom_proxy_url: None,
+            wfp_lock: false,
+            extra_args: Vec::new(),
+        },
+        ManagedAppConfig {
+            id: "cockpit-tools".into(),
+            name: "Cockpit Tools".into(),
+            builtin: true,
+            exe_path: None,
+            process_names: vec!["cockpit-tools.exe".into()],
+            proxy_mode: AppProxyMode::SystemProxy,
+            custom_proxy_url: None,
+            wfp_lock: false,
+            extra_args: Vec::new(),
+        },
+    ]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeProfile {
@@ -117,6 +198,8 @@ pub struct AppConfig {
     #[serde(default = "default_true")]
     pub require_netguard_for_claude: bool,
     pub ai_domains: Vec<String>,
+    #[serde(default = "default_managed_apps")]
+    pub managed_apps: Vec<ManagedAppConfig>,
 }
 
 impl Default for AppConfig {
@@ -184,6 +267,7 @@ impl Default for AppConfig {
                 "ip.net.coffee".into(),
                 "fuck-claude.vercel.app".into(),
             ],
+            managed_apps: default_managed_apps(),
         }
     }
 }
@@ -270,6 +354,60 @@ pub struct DownloadProgress {
     pub downloaded_bytes: u64,
     pub total_bytes: u64,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvVarHealth {
+    pub scope: String, // "user" | "machine" | "process"
+    pub key: String,
+    pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_port: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alive: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemProxyStatus {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_port: Option<String>,
+    pub alive: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_config_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedAppRuntimeStatus {
+    pub id: String,
+    pub name: String,
+    pub builtin: bool,
+    pub installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_path: Option<String>,
+    pub running: bool,
+    pub pids: Vec<u32>,
+    pub proxy_mode: AppProxyMode,
+    pub wfp_lock: bool,
+    pub health: String, // "clean" | "dead_proxy" | "mismatch" | "stopped"
+    pub diagnosis: String,
+    pub env_vars: Vec<EnvVarHealth>,
+    pub needs_clean_relaunch: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppEnvSnapshot {
+    pub system_proxy: SystemProxyStatus,
+    pub registry_proxy_vars: Vec<EnvVarHealth>,
+    pub apps: Vec<ManagedAppRuntimeStatus>,
+    pub polluted_count: usize,
+    pub scanned_at: String,
 }
 
 pub fn app_data_dir() -> PathBuf {

@@ -10,6 +10,20 @@ export type OutboundMode = "physical_bypass" | "upstream_detour" | "default_rout
 
 export type KillSwitchMode = "fail_closed" | "monitor_only";
 
+export type AppProxyMode = "netguard" | "system_proxy" | "direct" | "custom_proxy";
+
+export interface ManagedAppConfig {
+  id: string;
+  name: string;
+  builtin: boolean;
+  exePath?: string | null;
+  processNames: string[];
+  proxyMode: AppProxyMode;
+  customProxyUrl?: string | null;
+  wfpLock: boolean;
+  extraArgs: string[];
+}
+
 export interface NodeProfile {
   id: string;
   name: string;
@@ -63,6 +77,7 @@ export interface AppConfig {
   autoLaunchClaudeDesktop: boolean;
   requireNetguardForClaude: boolean;
   aiDomains: string[];
+  managedApps: ManagedAppConfig[];
 }
 
 export type CheckSeverity = "pass" | "warn" | "fail" | "pending";
@@ -123,4 +138,44 @@ export interface DownloadProgress {
   downloadedBytes: number;
   totalBytes: number;
   message: string;
+}
+
+export interface EnvVarHealth {
+  scope: "user" | "machine" | "process" | string;
+  key: string;
+  value: string;
+  hostPort?: string;
+  alive?: boolean;
+}
+
+export interface SystemProxyStatus {
+  enabled: boolean;
+  server?: string;
+  hostPort?: string;
+  alive: boolean;
+  autoConfigUrl?: string;
+}
+
+export interface ManagedAppRuntimeStatus {
+  id: string;
+  name: string;
+  builtin: boolean;
+  installed: boolean;
+  resolvedPath?: string;
+  running: boolean;
+  pids: number[];
+  proxyMode: AppProxyMode;
+  wfpLock: boolean;
+  health: "clean" | "dead_proxy" | "mismatch" | "stopped";
+  diagnosis: string;
+  envVars: EnvVarHealth[];
+  needsCleanRelaunch: boolean;
+}
+
+export interface AppEnvSnapshot {
+  systemProxy: SystemProxyStatus;
+  registryProxyVars: EnvVarHealth[];
+  apps: ManagedAppRuntimeStatus[];
+  pollutedCount: number;
+  scannedAt: string;
 }

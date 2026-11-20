@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "ai-netguard"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1326,7 +1326,7 @@ dependencies = [
 
 [[package]]
 name = "guard-helper"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "guard-protocol",
  "serde",
@@ -1336,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "guard-protocol"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hex",
  "serde",
