@@ -245,7 +245,7 @@ pub async fn run_eight_checks(cfg: &AppConfig, status: &GatewayStatus) -> Vec<Di
     };
 
     // 8. Claude Code CLI & environment check
-    let env_conflicts = inspect_user_proxy_env(cfg.cli_port);
+    let env_conflicts = inspect_user_proxy_env();
     let anthropic_probe = if status.running && !status.blocked_by_kill_switch {
         check_anthropic_via_http_proxy(cfg.cli_port).await.ok()
     } else {
@@ -258,8 +258,8 @@ pub async fn run_eight_checks(cfg: &AppConfig, status: &GatewayStatus) -> Vec<Di
             title: "8. Claude Code CLI 链路与环境变量检测".into(),
             category: "cli".into(),
             status: "warn".into(),
-            summary: format!("用户环境变量存在旧代理指向: {}", env_conflicts.join(", ")),
-            detail: "建议清理全局残留或使用“一键修正”，改由安全终端局部注入".into(),
+            summary: format!("检测到全局代理环境变量: {}", env_conflicts.join(", ")),
+            detail: "全局代理变量会劫持其他软件（如关闭网关后导致断网）；建议点击“一键修正”清空，改由安全终端局部注入".into(),
             fixable: true,
             fix_action: Some("fix_claude_env".into()),
         }
@@ -307,18 +307,25 @@ fn browser_prefs_hardened() -> bool {
     false
 }
 
-fn inspect_user_proxy_env(expected_port: u16) -> Vec<String> {
-    let expected = format!("127.0.0.1:{expected_port}");
+fn find_proxy_env_conflicts<'a, I>(vars: I) -> Vec<String>
+where
+    I: IntoIterator<Item = (&'a str, Option<String>)>,
+{
     let mut bad = Vec::new();
-    for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
-        if let Ok(val) = std::env::var(key) {
-            let trimmed = val.trim();
-            if !trimmed.is_empty() && !trimmed.contains(&expected) {
+    for (key, val) in vars {
+        if let Some(raw) = val {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
                 bad.push(format!("{key}={trimmed}"));
             }
         }
     }
     bad
+}
+
+fn inspect_user_proxy_env() -> Vec<String> {
+    let keys = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"];
+    find_proxy_env_conflicts(keys.into_iter().map(|k| (k, std::env::var(k).ok())))
 }
 
 #[cfg(test)]
@@ -351,37 +358,25 @@ pub fn encode_utf8_b64(s: &str) -> String {
     STANDARD.encode(s.as_bytes())
 }
 
-pub fn apply_fix_action(action: &str, cfg: &AppConfig) -> Result<String, String> {
+pub fn apply_fix_action(action: &str, _cfg: &AppConfig) -> Result<String, String> {
     match action {
         "fix_claude_env" => {
-            let http_val = format!("http://127.0.0.1:{}", cfg.cli_port);
-            let socks_val = format!("socks5h://127.0.0.1:{}", cfg.cli_port);
-            let clean_no_proxy: String = cfg
-                .extra_no_proxy
-                .chars()
-                .filter(|c| !c.is_control())
-                .collect();
-            let ps_static = "[Environment]::SetEnvironmentVariable('HTTP_PROXY', $env:NG_FIX_HTTP, 'User'); \
-                 [Environment]::SetEnvironmentVariable('HTTPS_PROXY', $env:NG_FIX_HTTP, 'User'); \
-                 [Environment]::SetEnvironmentVariable('ALL_PROXY', $env:NG_FIX_SOCKS, 'User'); \
-                 [Environment]::SetEnvironmentVariable('NO_PROXY', $env:NG_FIX_NO_PROXY, 'User')";
+            let ps_static = "foreach ($k in 'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY') { \
+                 [Environment]::SetEnvironmentVariable($k, $null, 'User') \
+                 }";
             let out = Command::new("powershell.exe")
                 .args(["-NoLogo", "-NoProfile", "-Command", ps_static])
-                .env("NG_FIX_HTTP", &http_val)
-                .env("NG_FIX_SOCKS", &socks_val)
-                .env("NG_FIX_NO_PROXY", &clean_no_proxy)
                 .creation_flags(CREATE_NO_WINDOW)
                 .output()
-                .map_err(|e| format!("写入用户环境变量失败: {e}"))?;
+                .map_err(|e| format!("清理用户环境变量失败: {e}"))?;
             if !out.status.success() {
                 return Err(String::from_utf8_lossy(&out.stderr).to_string());
             }
-            // Update current process env too so immediate re-check sees it
-            std::env::set_var("HTTP_PROXY", &http_val);
-            std::env::set_var("HTTPS_PROXY", &http_val);
-            std::env::set_var("ALL_PROXY", &socks_val);
-            std::env::set_var("NO_PROXY", &clean_no_proxy);
-            Ok(format!("已将当前用户环境变量修正为 127.0.0.1:{}", cfg.cli_port))
+            // Clear current process env too so immediate re-check reflects the clean state
+            for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"] {
+                std::env::remove_var(key);
+            }
+            Ok("已清空用户级全局代理环境变量，后续仅由安全终端局部注入".into())
         }
         "harden_browser_prefs" => {
             let default_dir = app_data_dir().join("browser-profile").join("Default");
@@ -447,5 +442,22 @@ mod tests {
         let checks = run_eight_checks(&cfg, &status).await;
         assert_eq!(checks[0].id, "exit_ip");
         assert_eq!(checks[0].status, "fail");
+    }
+
+    #[test]
+    fn inspect_proxy_env_flags_both_external_and_gateway_ports() {
+        let conflicts = find_proxy_env_conflicts([
+            ("HTTP_PROXY", Some("http://127.0.0.1:17890".into())),
+            ("HTTPS_PROXY", Some("http://127.0.0.1:7897".into())),
+            ("ALL_PROXY", Some("   ".into())),
+        ]);
+        assert_eq!(
+            conflicts,
+            vec![
+                "HTTP_PROXY=http://127.0.0.1:17890",
+                "HTTPS_PROXY=http://127.0.0.1:7897",
+            ]
+        );
+        assert!(find_proxy_env_conflicts([("HTTP_PROXY", None)]).is_empty());
     }
 }
