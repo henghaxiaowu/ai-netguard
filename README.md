@@ -6,11 +6,11 @@
 
 Tauri 2 · Rust · React 18 · sing-box · Windows Filtering Platform (WFP)
 
-[![Release](https://img.shields.io/github/v/release/henghaxiaowu/ai-netguard?style=flat-square&color=2563eb)](https://github.com/henghaxiaowu/ai-netguard/releases/tag/v0.1.0)
+[![Release](https://img.shields.io/github/v/release/henghaxiaowu/ai-netguard?style=flat-square&color=2563eb)](https://github.com/henghaxiaowu/ai-netguard/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-16a34a.svg?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-0f172a.svg?style=flat-square)](#源码构建)
 
-[下载安装包](https://github.com/henghaxiaowu/ai-netguard/releases/tag/v0.1.0) · [Agent 一键配置](#-agent-一键配置) · [快速上手](#-3-步快速上手) · [架构与端口](#-架构与端口速览) · [架构与审计文档](docs/SECURITY_AND_DEVELOPMENT_GUIDE.md)
+[下载安装包](https://github.com/henghaxiaowu/ai-netguard/releases/latest) · [Agent 一键配置](#-agent-一键配置) · [快速上手](#-3-步快速上手) · [架构与端口](#-架构与端口速览) · [架构与审计文档](docs/SECURITY_AND_DEVELOPMENT_GUIDE.md)
 
 </div>
 
@@ -55,7 +55,7 @@ https://github.com/user-attachments/assets/cf2bd7ea-e3fa-4140-a59b-066bf845f924
 
 ## 🚀 3 步快速上手
 
-1. **下载安装**：从 [Releases](https://github.com/henghaxiaowu/ai-netguard/releases/tag/v0.1.0) 下载 `AI.NetGuard_0.1.0_x64-setup.exe` 安装（升级前先彻底退出托盘中的旧进程）。
+1. **下载安装**：从 [Releases](https://github.com/henghaxiaowu/ai-netguard/releases/latest) 下载 `AI.NetGuard_0.1.1_x64-setup.exe` 安装（升级前先彻底退出托盘中的旧进程）。
 2. **配置节点**：进入 **「出口与共存路由」**，粘贴 `vless://`、`hy2://`、`ss://`、`trojan://` 或 `socks5://` 链接（或用内置向导生成独享 VPS 一键脚本），填好预期国家与时区语言并保存。
 3. **启动使用**：回到 **「总览与安全启动」** 点击 **「启动安全网关」**（首次需 UAC 提权），随后按需打开 **防泄漏浏览器**、**Claude Desktop** 或 **Claude Code 终端** 即可。
 
