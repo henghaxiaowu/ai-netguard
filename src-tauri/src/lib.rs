@@ -9,7 +9,11 @@ mod pac;
 mod singbox;
 mod uri_parser;
 
-use accounts::{load_accounts, normalize_account, save_accounts, AccountRecord};
+use accounts::{
+    default_env_presets, discover_clash_verge_nodes, load_accounts, load_env_presets,
+    normalize_account, normalize_env_presets, save_accounts, save_env_presets, AccountEnvPreset,
+    AccountRecord, ClashVergeNodesSnapshot,
+};
 
 use guard_protocol::{GuardRequest, ProtectedTarget};
 use ipc_client::GuardClient;
@@ -58,6 +62,7 @@ impl Drop for StartingResetGuard {
 pub struct AppState {
     inner: Mutex<InnerState>,
     accounts: Mutex<Vec<AccountRecord>>,
+    account_envs: Mutex<Vec<AccountEnvPreset>>,
     logs: Arc<LogBuffer>,
 }
 
@@ -71,6 +76,13 @@ impl AppState {
             Err(err) => {
                 logs.push(format!("[账号库] 读取加密库失败: {err}"));
                 Vec::new()
+            }
+        };
+        let account_envs = match load_env_presets() {
+            Ok(list) => list,
+            Err(err) => {
+                logs.push(format!("[账号库] 读取启动环境列表失败: {err}"));
+                default_env_presets()
             }
         };
         Self {
@@ -88,6 +100,7 @@ impl AppState {
                 active_gateway_ip: None,
             }),
             accounts: Mutex::new(accounts),
+            account_envs: Mutex::new(account_envs),
             logs,
         }
     }
@@ -907,6 +920,37 @@ fn import_accounts(
     Ok(next)
 }
 
+#[tauri::command]
+fn list_account_environments(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<AccountEnvPreset>, String> {
+    let list = state
+        .account_envs
+        .lock()
+        .map_err(|_| "环境列表锁定失败".to_string())?;
+    Ok(list.clone())
+}
+
+#[tauri::command]
+fn save_account_environments(
+    state: State<'_, Arc<AppState>>,
+    presets: Vec<AccountEnvPreset>,
+) -> Result<Vec<AccountEnvPreset>, String> {
+    let mut guard = state
+        .account_envs
+        .lock()
+        .map_err(|_| "环境列表锁定失败".to_string())?;
+    let normalized = normalize_env_presets(presets);
+    save_env_presets(&normalized)?;
+    *guard = normalized.clone();
+    Ok(normalized)
+}
+
+#[tauri::command]
+fn list_clash_verge_nodes() -> ClashVergeNodesSnapshot {
+    discover_clash_verge_nodes()
+}
+
 fn check_node_expectation(node: &NodeProfile, exit: &ExitIpInfo) -> Option<String> {
     if let Some(exp_ip) = node.expected_ip.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         if exp_ip != exit.ip {
@@ -1218,6 +1262,9 @@ pub fn run() {
             delete_account,
             delete_accounts,
             import_accounts,
+            list_account_environments,
+            save_account_environments,
+            list_clash_verge_nodes,
             clear_logs,
         ])
         .run(tauri::generate_context!())

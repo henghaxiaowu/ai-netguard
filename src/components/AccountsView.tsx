@@ -1,6 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
+  Check,
   ChevronDown,
   ChevronUp,
   Copy,
@@ -20,9 +21,12 @@ import {
   X,
 } from "lucide-react";
 import type {
+  AccountEnvPreset,
   AccountEnvType,
+  AccountNodeSource,
   AccountRecord,
   AccountStatus,
+  ClashVergeNodesSnapshot,
   NodeProfile,
 } from "../types";
 import { generateStrongPassword, generateTotp } from "../lib/totp";
@@ -40,11 +44,16 @@ import {
 interface AccountsViewProps {
   accounts: AccountRecord[];
   nodes: NodeProfile[];
+  envPresets: AccountEnvPreset[];
+  clashNodes: ClashVergeNodesSnapshot | null;
   loading: boolean;
+  loadingClashNodes: boolean;
   onUpsert: (account: AccountRecord) => Promise<void>;
   onDelete: (id: string) => Promise<void>;
   onBulkDelete: (ids: string[]) => Promise<void>;
   onImport: (records: AccountRecord[], replace: boolean) => Promise<void>;
+  onSaveEnvPresets: (presets: AccountEnvPreset[]) => Promise<void>;
+  onRefreshClashNodes: () => Promise<void>;
   onNotify: (msg: string) => void;
 }
 
@@ -62,7 +71,9 @@ interface AccountFormState {
   envType: AccountEnvType;
   environmentName: string;
   environmentProfile: string;
+  linkedNodeSource: AccountNodeSource;
   linkedNodeId: string;
+  linkedNodeName: string;
   purpose: string;
   tagsText: string;
   status: AccountStatus;
@@ -86,31 +97,60 @@ const STATUS_META: Record<
 
 const ENV_TYPE_META: Record<
   AccountEnvType,
-  { label: string; badgeVariant: "iris" | "obsidian" | "success" | "neutral" | "warning" }
+  { label: string; short: string; badgeVariant: "iris" | "neutral" | "obsidian" }
 > = {
-  adspower: { label: "AdsPower 指纹浏览器", badgeVariant: "iris" },
-  claude_code: { label: "Claude Code / Desktop", badgeVariant: "warning" },
-  netguard_browser: { label: "NetGuard 防泄漏浏览器", badgeVariant: "success" },
-  local: { label: "本地环境", badgeVariant: "neutral" },
-  fingerprint_other: { label: "其他指纹浏览器", badgeVariant: "iris" },
-  custom: { label: "自定义环境", badgeVariant: "obsidian" },
+  fingerprint: { label: "指纹浏览器", short: "指纹", badgeVariant: "iris" },
+  local: { label: "本地", short: "本地", badgeVariant: "neutral" },
+  custom: { label: "自定义", short: "自定义", badgeVariant: "obsidian" },
 };
 
-const PROVIDER_PRESETS = ["Google", "Claude", "OpenAI", "GitHub"];
-
-const ENV_PRESETS: { label: string; envType: AccountEnvType; envName: string }[] = [
-  { label: "AdsPower", envType: "adspower", envName: "AdsPower" },
-  { label: "CloudCart", envType: "custom", envName: "CloudCart" },
-  { label: "Claude Code", envType: "claude_code", envName: "Claude Code" },
-  { label: "NetGuard 浏览器", envType: "netguard_browser", envName: "NetGuard 安全浏览器" },
-  { label: "本地 Chrome", envType: "local", envName: "本地 Chrome" },
+const NODE_SOURCE_OPTIONS: { value: AccountNodeSource; label: string }[] = [
+  { value: "none", label: "不绑定" },
+  { value: "netguard", label: "AI NetGuard" },
+  { value: "clash_verge", label: "Clash Verge" },
+  { value: "custom", label: "自定义 / 直连" },
 ];
+
+const PROVIDER_PRESETS = ["Google", "Claude", "OpenAI", "GitHub"];
 
 const NATIVE_SELECT_CLASS =
   "flex min-h-8 w-full rounded-lg border border-[#dce0e6] bg-white px-2.5 py-1.5 text-[0.765rem] text-[#111827] shadow-[0_1px_1px_rgba(15,23,42,0.02)] transition-colors hover:border-[#c3cad6] focus-visible:outline-2 focus-visible:outline-[#5b48c4] focus-visible:outline-offset-1 cursor-pointer";
 
 const TEXTAREA_CLASS =
   "flex w-full rounded-lg border border-[#dce0e6] bg-white px-2.5 py-1.5 text-[0.765rem] text-[#111827] shadow-[0_1px_1px_rgba(15,23,42,0.02)] placeholder:text-[#9ca3af] transition-colors hover:border-[#c3cad6] focus-visible:outline-2 focus-visible:outline-[#5b48c4] focus-visible:outline-offset-1";
+
+export function normalizeEnvType(raw?: string | null): AccountEnvType {
+  switch (raw) {
+    case "fingerprint":
+    case "adspower":
+    case "fingerprint_other":
+      return "fingerprint";
+    case "local":
+    case "claude_code":
+    case "netguard_browser":
+      return "local";
+    default:
+      return "custom";
+  }
+}
+
+export function normalizeNodeSource(
+  raw?: string | null,
+  linkedNodeId?: string | null,
+): AccountNodeSource {
+  if (
+    raw === "none" ||
+    raw === "netguard" ||
+    raw === "clash_verge" ||
+    raw === "custom"
+  ) {
+    return raw;
+  }
+  if (linkedNodeId && linkedNodeId.trim()) {
+    return "netguard";
+  }
+  return "none";
+}
 
 function emptyFormState(): AccountFormState {
   return {
@@ -122,10 +162,12 @@ function emptyFormState(): AccountFormState {
     totpSecret: "",
     recoveryCodes: "",
     recoveryEmail: "",
-    envType: "adspower",
-    environmentName: "AdsPower",
+    envType: "fingerprint",
+    environmentName: "",
     environmentProfile: "",
+    linkedNodeSource: "none",
     linkedNodeId: "",
+    linkedNodeName: "",
     purpose: "",
     tagsText: "",
     status: "active",
@@ -135,6 +177,7 @@ function emptyFormState(): AccountFormState {
 }
 
 function recordToFormState(acc: AccountRecord): AccountFormState {
+  const source = normalizeNodeSource(acc.linkedNodeSource, acc.linkedNodeId);
   return {
     id: acc.id,
     label: acc.label || "",
@@ -144,10 +187,12 @@ function recordToFormState(acc: AccountRecord): AccountFormState {
     totpSecret: acc.totpSecret || "",
     recoveryCodes: acc.recoveryCodes || "",
     recoveryEmail: acc.recoveryEmail || "",
-    envType: acc.envType || "adspower",
+    envType: normalizeEnvType(acc.envType),
     environmentName: acc.environmentName || "",
     environmentProfile: acc.environmentProfile || "",
+    linkedNodeSource: source,
     linkedNodeId: acc.linkedNodeId || "",
+    linkedNodeName: acc.linkedNodeName || "",
     purpose: acc.purpose || "",
     tagsText: (acc.tags || []).join(", "),
     status: acc.status || "active",
@@ -172,6 +217,57 @@ function providerAvatar(provider: string): { code: string; classes: string } {
   }
   const letters = provider.trim().slice(0, 2).toUpperCase() || "AC";
   return { code: letters, classes: "bg-[#f0edfc] text-[#5b48c4] border-[#dcd4fb]" };
+}
+
+function resolveAccountNodeDisplay(
+  acc: AccountRecord,
+  nodeById: Map<string, NodeProfile>,
+): {
+  source: AccountNodeSource;
+  sourceLabel: string;
+  name: string;
+  badgeText: string;
+  variant: "iris" | "warning" | "neutral";
+} | null {
+  const source = normalizeNodeSource(acc.linkedNodeSource, acc.linkedNodeId);
+  if (source === "none") return null;
+
+  if (source === "netguard") {
+    const node = acc.linkedNodeId ? nodeById.get(acc.linkedNodeId) : undefined;
+    const rawName = node
+      ? `${node.name}${node.expectedCountry ? ` (${node.expectedCountry})` : ""}`
+      : acc.linkedNodeName?.trim() || acc.linkedNodeId?.trim() || "";
+    if (!rawName) return null;
+    const missingSuffix = !node && acc.linkedNodeId ? " (未在列表)" : "";
+    return {
+      source,
+      sourceLabel: "AI NetGuard",
+      name: rawName,
+      badgeText: `NetGuard · ${rawName}${missingSuffix}`,
+      variant: "iris",
+    };
+  }
+
+  const name = acc.linkedNodeName?.trim() || "";
+  if (!name) return null;
+
+  if (source === "clash_verge") {
+    return {
+      source,
+      sourceLabel: "Clash Verge",
+      name,
+      badgeText: `Clash · ${name}`,
+      variant: "warning",
+    };
+  }
+
+  return {
+    source,
+    sourceLabel: "自定义 / 直连",
+    name,
+    badgeText: `节点 · ${name}`,
+    variant: "neutral",
+  };
 }
 
 function attachLightDismissFallback(dialog: HTMLDialogElement | null) {
@@ -208,11 +304,16 @@ function attachLightDismissFallback(dialog: HTMLDialogElement | null) {
 export function AccountsView({
   accounts,
   nodes,
+  envPresets,
+  clashNodes,
   loading,
+  loadingClashNodes,
   onUpsert,
   onDelete,
   onBulkDelete,
   onImport,
+  onSaveEnvPresets,
+  onRefreshClashNodes,
   onNotify,
 }: AccountsViewProps) {
   const uid = useId();
@@ -233,6 +334,11 @@ export function AccountsView({
   const [form, setForm] = useState<AccountFormState>(emptyFormState);
   const [formError, setFormError] = useState("");
   const [showFormPassword, setShowFormPassword] = useState(false);
+
+  const [addingPreset, setAddingPreset] = useState(false);
+  const [newPresetName, setNewPresetName] = useState("");
+  const [newPresetType, setNewPresetType] = useState<AccountEnvType>("custom");
+  const [clashSearch, setClashSearch] = useState("");
 
   const [confirmTarget, setConfirmTarget] = useState<ConfirmTarget | null>(null);
 
@@ -280,6 +386,11 @@ export function AccountsView({
     return Array.from(set).sort((a, b) => a.localeCompare(b, "zh-CN"));
   }, [accounts]);
 
+  const hasEmptyEnvAccount = useMemo(
+    () => accounts.some((acc) => !acc.environmentName.trim()),
+    [accounts],
+  );
+
   const stats = useMemo(() => {
     let active = 0;
     let standby = 0;
@@ -312,21 +423,31 @@ export function AccountsView({
       if (statusFilter !== "all" && acc.status !== statusFilter) {
         return false;
       }
-      if (envFilter !== "__all__" && acc.environmentName.trim() !== envFilter) {
+      if (envFilter === "__empty__" && acc.environmentName.trim() !== "") {
+        return false;
+      }
+      if (
+        envFilter !== "__all__" &&
+        envFilter !== "__empty__" &&
+        acc.environmentName.trim() !== envFilter
+      ) {
         return false;
       }
       if (!query) return true;
-      const node = acc.linkedNodeId ? nodeById.get(acc.linkedNodeId) : undefined;
+      const nodeDisplay = resolveAccountNodeDisplay(acc, nodeById);
+      const envMeta = ENV_TYPE_META[normalizeEnvType(acc.envType)];
       const haystack = [
         acc.label,
         acc.provider,
         acc.email,
         acc.environmentName,
         acc.environmentProfile || "",
+        envMeta.label,
+        nodeDisplay?.sourceLabel || "",
+        nodeDisplay?.name || "",
         acc.purpose,
         acc.recoveryEmail || "",
         acc.notes || "",
-        node?.name || "",
         ...acc.tags,
       ]
         .join(" ")
@@ -334,6 +455,30 @@ export function AccountsView({
       return haystack.includes(query);
     });
   }, [accounts, statusFilter, envFilter, search, nodeById]);
+
+  const filteredClashGroups = useMemo(() => {
+    const list = clashNodes?.groups ?? [];
+    const q = clashSearch.trim().toLowerCase();
+    return q
+      ? list.filter(
+          (item) =>
+            item.name.toLowerCase().includes(q) ||
+            item.nodeType.toLowerCase().includes(q),
+        )
+      : list;
+  }, [clashNodes?.groups, clashSearch]);
+
+  const filteredClashProxies = useMemo(() => {
+    const list = clashNodes?.proxies ?? [];
+    const q = clashSearch.trim().toLowerCase();
+    return q
+      ? list.filter(
+          (item) =>
+            item.name.toLowerCase().includes(q) ||
+            item.nodeType.toLowerCase().includes(q),
+        )
+      : list;
+  }, [clashNodes?.proxies, clashSearch]);
 
   const formTotpPreview = useMemo(() => {
     const trimmed = form.totpSecret.trim();
@@ -345,7 +490,14 @@ export function AccountsView({
     setForm(existing ? recordToFormState(existing) : emptyFormState());
     setFormError("");
     setShowFormPassword(false);
+    setAddingPreset(false);
+    setNewPresetName("");
+    setNewPresetType("custom");
+    setClashSearch("");
     setEditorOpen(true);
+    if (!clashNodes?.detected) {
+      void onRefreshClashNodes();
+    }
     const dlg = editorDialogRef.current;
     if (dlg && !dlg.open) {
       dlg.showModal();
@@ -406,6 +558,75 @@ export function AccountsView({
     }
   };
 
+  const handleAddEnvPreset = async () => {
+    const name = newPresetName.trim();
+    if (!name) return;
+    const existing = envPresets.find(
+      (p) => p.name.trim().toLowerCase() === name.toLowerCase(),
+    );
+    if (existing) {
+      setForm((prev) => ({
+        ...prev,
+        envType: existing.envType,
+        environmentName: existing.name,
+      }));
+      setAddingPreset(false);
+      setNewPresetName("");
+      onNotify(`已选中现有环境「${existing.name}」`);
+      return;
+    }
+    const created: AccountEnvPreset = {
+      id: `env-${Date.now().toString(36)}`,
+      name,
+      envType: newPresetType,
+    };
+    await onSaveEnvPresets([...envPresets, created]);
+    setForm((prev) => ({
+      ...prev,
+      envType: created.envType,
+      environmentName: created.name,
+    }));
+    setAddingPreset(false);
+    setNewPresetName("");
+    onNotify(`已新增启动环境「${created.name}」`);
+  };
+
+  const handleRemoveEnvPreset = async (preset: AccountEnvPreset) => {
+    const next = envPresets.filter((p) => p.id !== preset.id);
+    await onSaveEnvPresets(next);
+    onNotify(`已从环境预设移除「${preset.name}」（已有账号记录保留不变）`);
+  };
+
+  const handleSelectNodeSource = (nextSource: AccountNodeSource) => {
+    if (nextSource === "clash_verge" && !clashNodes?.detected) {
+      void onRefreshClashNodes();
+    }
+    setForm((prev) => {
+      if (nextSource === "none") {
+        return {
+          ...prev,
+          linkedNodeSource: "none",
+          linkedNodeId: "",
+          linkedNodeName: "",
+        };
+      }
+      if (nextSource === "netguard") {
+        const currentNode = prev.linkedNodeId ? nodeById.get(prev.linkedNodeId) : undefined;
+        return {
+          ...prev,
+          linkedNodeSource: "netguard",
+          linkedNodeName: currentNode?.name || "",
+        };
+      }
+      return {
+        ...prev,
+        linkedNodeSource: nextSource,
+        linkedNodeId: "",
+        linkedNodeName: prev.linkedNodeSource === nextSource ? prev.linkedNodeName : "",
+      };
+    });
+  };
+
   const handleSubmitForm = async (e: React.FormEvent) => {
     e.preventDefault();
     const email = form.email.trim();
@@ -420,6 +641,28 @@ export function AccountsView({
       .map((t) => t.trim())
       .filter(Boolean);
 
+    let effectiveSource = form.linkedNodeSource;
+    let effectiveNodeId: string | null = null;
+    let effectiveNodeName: string | null = null;
+
+    if (effectiveSource === "netguard") {
+      const id = form.linkedNodeId.trim();
+      const matched = id ? nodeById.get(id) : undefined;
+      if (id) {
+        effectiveNodeId = id;
+        effectiveNodeName = matched?.name || form.linkedNodeName.trim() || null;
+      } else {
+        effectiveSource = "none";
+      }
+    } else if (effectiveSource === "clash_verge" || effectiveSource === "custom") {
+      const name = form.linkedNodeName.trim();
+      if (name) {
+        effectiveNodeName = name;
+      } else {
+        effectiveSource = "none";
+      }
+    }
+
     const record: AccountRecord = {
       id: form.id,
       label: form.label.trim(),
@@ -432,7 +675,9 @@ export function AccountsView({
       envType: form.envType,
       environmentName: form.environmentName.trim(),
       environmentProfile: form.environmentProfile.trim() || null,
-      linkedNodeId: form.linkedNodeId.trim() || null,
+      linkedNodeSource: effectiveSource,
+      linkedNodeId: effectiveNodeId,
+      linkedNodeName: effectiveNodeName,
       purpose: form.purpose.trim(),
       tags,
       status: form.status,
@@ -509,38 +754,57 @@ export function AccountsView({
       const validRecords: AccountRecord[] = listRaw
         .filter(
           (item): item is Record<string, unknown> =>
-            Boolean(item && typeof item === "object" && typeof (item as { email?: unknown }).email === "string" && (item as { email: string }).email.trim()),
+            Boolean(
+              item &&
+                typeof item === "object" &&
+                typeof (item as { email?: unknown }).email === "string" &&
+                (item as { email: string }).email.trim(),
+            ),
         )
-        .map((item) => ({
-          id: typeof item.id === "string" ? item.id : "",
-          label: typeof item.label === "string" ? item.label : "",
-          provider: typeof item.provider === "string" ? item.provider : "Google",
-          email: String(item.email).trim(),
-          password: typeof item.password === "string" ? item.password : "",
-          totpSecret: typeof item.totpSecret === "string" ? item.totpSecret : null,
-          recoveryCodes: typeof item.recoveryCodes === "string" ? item.recoveryCodes : null,
-          recoveryEmail: typeof item.recoveryEmail === "string" ? item.recoveryEmail : null,
-          envType:
-            typeof item.envType === "string"
-              ? (item.envType as AccountEnvType)
-              : "adspower",
-          environmentName:
-            typeof item.environmentName === "string" ? item.environmentName : "",
-          environmentProfile:
-            typeof item.environmentProfile === "string" ? item.environmentProfile : null,
-          linkedNodeId: typeof item.linkedNodeId === "string" ? item.linkedNodeId : null,
-          purpose: typeof item.purpose === "string" ? item.purpose : "",
-          tags: Array.isArray(item.tags)
-            ? item.tags.filter((t): t is string => typeof t === "string")
-            : [],
-          status:
-            typeof item.status === "string"
-              ? (item.status as AccountStatus)
-              : "active",
-          notes: typeof item.notes === "string" ? item.notes : null,
-          createdAt: typeof item.createdAt === "string" ? item.createdAt : "",
-          updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : "",
-        }));
+        .map((item) => {
+          const linkedNodeId =
+            typeof item.linkedNodeId === "string" ? item.linkedNodeId : null;
+          const linkedNodeSource = normalizeNodeSource(
+            typeof item.linkedNodeSource === "string" ? item.linkedNodeSource : null,
+            linkedNodeId,
+          );
+          return {
+            id: typeof item.id === "string" ? item.id : "",
+            label: typeof item.label === "string" ? item.label : "",
+            provider: typeof item.provider === "string" ? item.provider : "Google",
+            email: String(item.email).trim(),
+            password: typeof item.password === "string" ? item.password : "",
+            totpSecret: typeof item.totpSecret === "string" ? item.totpSecret : null,
+            recoveryCodes:
+              typeof item.recoveryCodes === "string" ? item.recoveryCodes : null,
+            recoveryEmail:
+              typeof item.recoveryEmail === "string" ? item.recoveryEmail : null,
+            envType: normalizeEnvType(
+              typeof item.envType === "string" ? item.envType : null,
+            ),
+            environmentName:
+              typeof item.environmentName === "string" ? item.environmentName : "",
+            environmentProfile:
+              typeof item.environmentProfile === "string"
+                ? item.environmentProfile
+                : null,
+            linkedNodeSource,
+            linkedNodeId,
+            linkedNodeName:
+              typeof item.linkedNodeName === "string" ? item.linkedNodeName : null,
+            purpose: typeof item.purpose === "string" ? item.purpose : "",
+            tags: Array.isArray(item.tags)
+              ? item.tags.filter((t): t is string => typeof t === "string")
+              : [],
+            status:
+              typeof item.status === "string"
+                ? (item.status as AccountStatus)
+                : "active",
+            notes: typeof item.notes === "string" ? item.notes : null,
+            createdAt: typeof item.createdAt === "string" ? item.createdAt : "",
+            updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : "",
+          };
+        });
 
       if (validRecords.length === 0) {
         onNotify("未找到包含有效 email 的账号记录");
@@ -583,7 +847,7 @@ export function AccountsView({
             </Badge>
           </div>
           <p className="mt-0.5 text-[0.76rem] text-[#7c8495]">
-            统一记录 Google 等账号凭据、离线 2FA 动态码、AdsPower / CloudCart / 本地启动环境与用途状态
+            统一记录 Google 等账号凭据、离线 2FA 动态码、自定义启动环境与 NetGuard / Clash Verge 绑定节点
           </p>
         </div>
 
@@ -690,12 +954,12 @@ export function AccountsView({
               aria-hidden="true"
             />
             <label htmlFor={fid("search")} className="visually-hidden">
-              搜索账号或环境
+              搜索账号、环境或节点
             </label>
             <Input
               id={fid("search")}
               className="pl-8"
-              placeholder="搜索邮箱、别名、用途、AdsPower / CloudCart 环境、窗口ID、标签..."
+              placeholder="搜索邮箱、别名、用途、环境名、Clash/NetGuard 节点、标签..."
               value={search}
               onChange={(e) => setSearch(e.target.value)}
             />
@@ -708,6 +972,9 @@ export function AccountsView({
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="__all__">全部环境 ({accounts.length})</SelectItem>
+                {hasEmptyEnvAccount && (
+                  <SelectItem value="__empty__">未设置环境</SelectItem>
+                )}
                 {distinctEnvironments.map((env) => (
                   <SelectItem key={env} value={env}>
                     {env}
@@ -779,7 +1046,7 @@ export function AccountsView({
                 还没有录入任何账号与启动环境
               </div>
               <p className="text-[0.76rem] text-[#7c8495]">
-                把不同指纹浏览器（如 AdsPower、CloudCart）或本地环境使用的 Google / AI 账号、密码、2FA 密钥和用途统一加密收纳在这里。
+                统一记录 Google / AI 等账号、密码与离线 2FA 动态码，并可自由配置指纹浏览器、本地或自定义环境与 NetGuard / Clash Verge 节点。
               </p>
             </div>
             <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
@@ -818,8 +1085,11 @@ export function AccountsView({
           filteredAccounts.map((acc) => {
             const avatar = providerAvatar(acc.provider);
             const statusMeta = STATUS_META[acc.status] || STATUS_META.active;
-            const envMeta = ENV_TYPE_META[acc.envType] || ENV_TYPE_META.custom;
-            const linkedNode = acc.linkedNodeId ? nodeById.get(acc.linkedNodeId) : undefined;
+            const envType = normalizeEnvType(acc.envType);
+            const envMeta = ENV_TYPE_META[envType];
+            const envNameTrimmed = acc.environmentName.trim();
+            const envProfileTrimmed = acc.environmentProfile?.trim() || "";
+            const nodeDisplay = resolveAccountNodeDisplay(acc, nodeById);
             const isExpanded = Boolean(expandedIds[acc.id]);
             const isPassShown = Boolean(revealedPasswords[acc.id]);
             const isSecretShown = Boolean(revealedSecrets[acc.id]);
@@ -862,16 +1132,17 @@ export function AccountsView({
                         </span>
                         <Badge variant={statusMeta.variant}>{statusMeta.label}</Badge>
                         <Badge variant="neutral">{acc.provider}</Badge>
-                        <Badge variant={envMeta.badgeVariant}>
-                          {acc.environmentName}
-                          {acc.environmentProfile ? ` · ${acc.environmentProfile}` : ""}
-                        </Badge>
-                        {acc.linkedNodeId && (
-                          <Badge variant="neutral">
-                            节点:{" "}
-                            {linkedNode
-                              ? `${linkedNode.name}${linkedNode.expectedCountry ? ` (${linkedNode.expectedCountry})` : ""}`
-                              : `${acc.linkedNodeId} (未在列表)`}
+                        {envNameTrimmed ? (
+                          <Badge variant={envMeta.badgeVariant}>
+                            [{envMeta.short}] {envNameTrimmed}
+                            {envProfileTrimmed ? ` · ${envProfileTrimmed}` : ""}
+                          </Badge>
+                        ) : envProfileTrimmed ? (
+                          <Badge variant="neutral">环境标识 · {envProfileTrimmed}</Badge>
+                        ) : null}
+                        {nodeDisplay && (
+                          <Badge variant={nodeDisplay.variant}>
+                            {nodeDisplay.badgeText}
                           </Badge>
                         )}
                       </div>
@@ -1025,7 +1296,7 @@ export function AccountsView({
 
                 {/* Inline Expanded Details */}
                 {isExpanded && (
-                  <div className="rounded-xl border border-[#eaecef] bg-[#fafbfc] p-4 space-y-3">
+                  <div className="space-y-3 rounded-xl border border-[#eaecef] bg-[#fafbfc] p-4">
                     <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#eaecef] pb-2.5">
                       <div className="flex flex-wrap items-center gap-1.5">
                         <span className="text-[0.72rem] font-medium text-[#525866]">
@@ -1054,15 +1325,39 @@ export function AccountsView({
                       </div>
 
                       <div className="mono-num flex flex-wrap items-center gap-3 text-[0.69rem] text-[#7c8495]">
-                        <span>环境分类: {envMeta.label}</span>
+                        <span>
+                          启动环境: {envNameTrimmed ? `${envMeta.label} · ${envNameTrimmed}` : "未绑定"}
+                        </span>
                         {acc.createdAt && <span>创建: {acc.createdAt}</span>}
                         {acc.updatedAt && <span>更新: {acc.updatedAt}</span>}
                       </div>
                     </div>
 
                     <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                      {/* Bound Node Info */}
+                      <div className="space-y-1 rounded-lg border border-[#eaecef] bg-white p-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[0.71rem] font-medium text-[#7c8495]">
+                            绑定节点 ({nodeDisplay ? nodeDisplay.sourceLabel : "未绑定"})
+                          </span>
+                          {nodeDisplay && (
+                            <button
+                              type="button"
+                              onClick={() => handleCopy(nodeDisplay.name, "节点名称")}
+                              className="inline-flex items-center gap-1 text-[0.69rem] text-[#5b48c4] hover:underline cursor-pointer"
+                            >
+                              <Copy className="h-3 w-3" aria-hidden="true" />
+                              复制节点名
+                            </button>
+                          )}
+                        </div>
+                        <div className="mono-num break-all text-[0.76rem] text-[#111827]">
+                          {nodeDisplay ? nodeDisplay.name : "未绑定固定出口节点"}
+                        </div>
+                      </div>
+
                       {/* Recovery Email */}
-                      <div className="rounded-lg border border-[#eaecef] bg-white p-3 space-y-1">
+                      <div className="space-y-1 rounded-lg border border-[#eaecef] bg-white p-3">
                         <div className="flex items-center justify-between gap-2">
                           <span className="text-[0.71rem] font-medium text-[#7c8495]">
                             辅助邮箱 / 恢复手机
@@ -1086,7 +1381,7 @@ export function AccountsView({
                       </div>
 
                       {/* Raw 2FA Secret */}
-                      <div className="rounded-lg border border-[#eaecef] bg-white p-3 space-y-1">
+                      <div className="space-y-1 rounded-lg border border-[#eaecef] bg-white p-3">
                         <div className="flex items-center justify-between gap-2">
                           <span className="text-[0.71rem] font-medium text-[#7c8495]">
                             2FA 原始密钥 / URI
@@ -1121,7 +1416,7 @@ export function AccountsView({
                       </div>
 
                       {/* Recovery Codes */}
-                      <div className="rounded-lg border border-[#eaecef] bg-white p-3 space-y-1">
+                      <div className="space-y-1 rounded-lg border border-[#eaecef] bg-white p-3">
                         <div className="flex items-center justify-between gap-2">
                           <span className="text-[0.71rem] font-medium text-[#7c8495]">
                             2FA 备用恢复码
@@ -1158,7 +1453,7 @@ export function AccountsView({
                       </div>
 
                       {/* Notes */}
-                      <div className="rounded-lg border border-[#eaecef] bg-white p-3 space-y-1">
+                      <div className="space-y-1 rounded-lg border border-[#eaecef] bg-white p-3 md:col-span-2">
                         <span className="block text-[0.71rem] font-medium text-[#7c8495]">
                           环境与账号备注
                         </span>
@@ -1245,9 +1540,9 @@ export function AccountsView({
                           key={p}
                           type="button"
                           onClick={() => setForm((prev) => ({ ...prev, provider: p }))}
-                          className={`rounded px-1.5 py-0.5 text-[0.66rem] border cursor-pointer ${
+                          className={`rounded border px-1.5 py-0.5 text-[0.66rem] cursor-pointer ${
                             form.provider === p
-                              ? "border-[#dcd4fb] bg-[#f0edfc] text-[#5b48c4] font-semibold"
+                              ? "border-[#dcd4fb] bg-[#f0edfc] font-semibold text-[#5b48c4]"
                               : "border-[#eaecef] bg-[#f8f9fb] text-[#525866] hover:bg-[#f3f4f6]"
                           }`}
                         >
@@ -1320,7 +1615,7 @@ export function AccountsView({
                   </label>
                   <Input
                     id={fid("label")}
-                    placeholder="例如：Google 主号 #1 / CloudCart 美区店"
+                    placeholder="例如：Google 主号 #1 / 美区店铺号"
                     value={form.label}
                     onChange={(e) =>
                       setForm((prev) => ({ ...prev, label: e.target.value }))
@@ -1463,43 +1758,129 @@ export function AccountsView({
               </div>
             </fieldset>
 
-            {/* Section 3: Launch Environment */}
+            {/* Section 3: Customizable Optional Launch Environment + Multi-Source Node Binding */}
             <fieldset className="space-y-3 border-t border-[#eaecef] pt-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <legend className="text-[0.76rem] font-semibold text-[#111827]">
-                  3. 启动环境与绑定节点
+                  3. 启动环境与绑定节点（均为可选项，可留空）
                 </legend>
-                <div className="flex flex-wrap gap-1">
-                  {ENV_PRESETS.map((preset) => (
-                    <button
-                      key={preset.label}
-                      type="button"
-                      onClick={() =>
-                        setForm((prev) => ({
-                          ...prev,
-                          envType: preset.envType,
-                          environmentName: preset.envName,
-                        }))
-                      }
-                      className={`rounded-md border px-2 py-0.5 text-[0.68rem] cursor-pointer ${
-                        form.environmentName === preset.envName
-                          ? "border-[#dcd4fb] bg-[#f0edfc] text-[#5b48c4] font-semibold"
-                          : "border-[#eaecef] bg-[#f8f9fb] text-[#525866] hover:bg-[#f3f4f6]"
-                      }`}
-                    >
-                      {preset.label}
-                    </button>
-                  ))}
-                </div>
+                <button
+                  type="button"
+                  onClick={() => setAddingPreset((v) => !v)}
+                  className="inline-flex items-center gap-1 rounded-md border border-[#dce0e6] bg-white px-2 py-0.5 text-[0.68rem] font-medium text-[#5b48c4] hover:bg-[#f0edfc] cursor-pointer"
+                >
+                  <Plus className="h-3 w-3" aria-hidden="true" />
+                  新增环境预设
+                </button>
               </div>
 
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              {/* Customizable Environment Chips */}
+              <div className="space-y-2">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {envPresets.length > 0 ? (
+                    envPresets.map((preset) => {
+                      const active =
+                        form.environmentName.trim() === preset.name &&
+                        form.envType === preset.envType;
+                      const meta = ENV_TYPE_META[normalizeEnvType(preset.envType)];
+                      return (
+                        <div
+                          key={preset.id}
+                          className={`inline-flex items-center overflow-hidden rounded-md border text-[0.69rem] ${
+                            active
+                              ? "border-[#c4b5fd] bg-[#f0edfc] text-[#5b48c4] font-semibold"
+                              : "border-[#eaecef] bg-[#f8f9fb] text-[#525866]"
+                          }`}
+                        >
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setForm((prev) =>
+                                active
+                                  ? { ...prev, environmentName: "" }
+                                  : {
+                                      ...prev,
+                                      envType: normalizeEnvType(preset.envType),
+                                      environmentName: preset.name,
+                                    },
+                              )
+                            }
+                            className="inline-flex items-center gap-1 px-2 py-0.5 hover:bg-black/5 cursor-pointer"
+                          >
+                            <span className="opacity-70">[{meta.short}]</span>
+                            <span>{preset.name}</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveEnvPreset(preset)}
+                            aria-label={`删除环境预设 ${preset.name}`}
+                            className="inline-grid h-5 w-5 place-items-center border-l border-black/10 text-[#7c8495] hover:bg-[#fee2e2] hover:text-[#dc2626] cursor-pointer"
+                          >
+                            <X className="h-2.5 w-2.5" aria-hidden="true" />
+                          </button>
+                        </div>
+                      );
+                    })
+                  ) : (
+                    <span className="text-[0.71rem] text-[#9ca3af]">
+                      预设环境列表已清空，可点击右上角「新增环境预设」或直接在下方输入/留空
+                    </span>
+                  )}
+                </div>
+
+                {addingPreset && (
+                  <div className="flex flex-wrap items-center gap-2 rounded-xl border border-[#dcd4fb] bg-[#f8f7fe] p-2.5">
+                    <Input
+                      className="min-w-[9rem] flex-1"
+                      placeholder="输入常用环境名，例如 CloudCart / 比特浏览器"
+                      value={newPresetName}
+                      onChange={(e) => setNewPresetName(e.target.value)}
+                    />
+                    <div className="w-32 shrink-0">
+                      <select
+                        aria-label="新环境分类"
+                        className={NATIVE_SELECT_CLASS}
+                        value={newPresetType}
+                        onChange={(e) =>
+                          setNewPresetType(e.target.value as AccountEnvType)
+                        }
+                      >
+                        <option value="fingerprint">指纹浏览器</option>
+                        <option value="local">本地</option>
+                        <option value="custom">自定义</option>
+                      </select>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="solid"
+                      size="xs"
+                      onClick={handleAddEnvPreset}
+                      disabled={!newPresetName.trim()}
+                    >
+                      添加
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="xs"
+                      onClick={() => {
+                        setAddingPreset(false);
+                        setNewPresetName("");
+                      }}
+                    >
+                      取消
+                    </Button>
+                  </div>
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
                 <div className="space-y-1.5">
                   <label
                     htmlFor={fid("envType")}
                     className="block text-[0.73rem] font-medium text-[#525866]"
                   >
-                    环境分类
+                    环境大类
                   </label>
                   <select
                     id={fid("envType")}
@@ -1512,12 +1893,9 @@ export function AccountsView({
                       }))
                     }
                   >
-                    <option value="adspower">AdsPower 指纹浏览器</option>
-                    <option value="custom">自定义环境 (CloudCart 等)</option>
-                    <option value="fingerprint_other">其他指纹浏览器 (BitBrowser 等)</option>
-                    <option value="claude_code">Claude Code / Desktop</option>
-                    <option value="netguard_browser">NetGuard 防泄漏浏览器</option>
-                    <option value="local">本地浏览器 / 本地环境</option>
+                    <option value="fingerprint">指纹浏览器</option>
+                    <option value="local">本地</option>
+                    <option value="custom">自定义</option>
                   </select>
                 </div>
 
@@ -1526,19 +1904,36 @@ export function AccountsView({
                     htmlFor={fid("environmentName")}
                     className="block text-[0.73rem] font-medium text-[#525866]"
                   >
-                    环境名称
+                    环境名称（可留空）
                   </label>
-                  <Input
-                    id={fid("environmentName")}
-                    placeholder="AdsPower / CloudCart / 本地 Chrome..."
-                    value={form.environmentName}
-                    onChange={(e) =>
-                      setForm((prev) => ({
-                        ...prev,
-                        environmentName: e.target.value,
-                      }))
-                    }
-                  />
+                  <div className="flex items-center gap-1">
+                    <Input
+                      id={fid("environmentName")}
+                      className="flex-1"
+                      placeholder="留空或手填，如 CloudCart"
+                      value={form.environmentName}
+                      onChange={(e) =>
+                        setForm((prev) => ({
+                          ...prev,
+                          environmentName: e.target.value,
+                        }))
+                      }
+                    />
+                    {form.environmentName && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        aria-label="清空环境名称"
+                        onClick={() =>
+                          setForm((prev) => ({ ...prev, environmentName: "" }))
+                        }
+                        className="h-8 w-8 shrink-0 text-[#7c8495]"
+                      >
+                        <X className="h-3.5 w-3.5" aria-hidden="true" />
+                      </Button>
+                    )}
+                  </div>
                 </div>
 
                 <div className="space-y-1.5">
@@ -1546,12 +1941,12 @@ export function AccountsView({
                     htmlFor={fid("environmentProfile")}
                     className="block text-[0.73rem] font-medium text-[#525866]"
                   >
-                    窗口编号 / Profile ID / 环境标识
+                    窗口编号 / 标识（可选）
                   </label>
                   <Input
                     id={fid("environmentProfile")}
                     className="mono-num"
-                    placeholder="例如：#042 / Profile-US-01 / 独立容器"
+                    placeholder="例如：#042 / Profile-US"
                     value={form.environmentProfile}
                     onChange={(e) =>
                       setForm((prev) => ({
@@ -1561,31 +1956,242 @@ export function AccountsView({
                     }
                   />
                 </div>
+              </div>
 
-                <div className="space-y-1.5">
-                  <label
-                    htmlFor={fid("linkedNodeId")}
-                    className="block text-[0.73rem] font-medium text-[#525866]"
-                  >
-                    关联 NetGuard 出口节点
-                  </label>
-                  <select
-                    id={fid("linkedNodeId")}
-                    className={NATIVE_SELECT_CLASS}
-                    value={form.linkedNodeId}
-                    onChange={(e) =>
-                      setForm((prev) => ({ ...prev, linkedNodeId: e.target.value }))
-                    }
-                  >
-                    <option value="">不关联节点</option>
-                    {nodes.map((node) => (
-                      <option key={node.id} value={node.id}>
-                        {node.name}
-                        {node.expectedCountry ? ` (${node.expectedCountry})` : ""}
-                      </option>
-                    ))}
-                  </select>
+              {/* Multi-Source Node Binding */}
+              <div className="space-y-2.5 rounded-xl border border-[#eaecef] bg-[#fafbfc] p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-[0.73rem] font-medium text-[#525866]">
+                    绑定出口节点（支持 NetGuard / Clash Verge / 自定义）
+                  </span>
+                  <div className="flex flex-wrap gap-1" role="group" aria-label="节点来源">
+                    {NODE_SOURCE_OPTIONS.map((opt) => {
+                      const active = form.linkedNodeSource === opt.value;
+                      return (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          aria-pressed={active}
+                          onClick={() => handleSelectNodeSource(opt.value)}
+                          className={`rounded-md border px-2 py-0.5 text-[0.69rem] font-medium transition-colors cursor-pointer ${
+                            active
+                              ? "border-[#dcd4fb] bg-[#6d5bd0] text-white"
+                              : "border-[#dce0e6] bg-white text-[#525866] hover:bg-[#f3f4f6]"
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
+
+                {form.linkedNodeSource === "netguard" && (
+                  <div className="space-y-1.5">
+                    <label
+                      htmlFor={fid("linkedNodeId")}
+                      className="visually-hidden"
+                    >
+                      选择 AI NetGuard 节点
+                    </label>
+                    <select
+                      id={fid("linkedNodeId")}
+                      className={NATIVE_SELECT_CLASS}
+                      value={form.linkedNodeId}
+                      onChange={(e) => {
+                        const id = e.target.value;
+                        const matched = id ? nodeById.get(id) : undefined;
+                        setForm((prev) => ({
+                          ...prev,
+                          linkedNodeId: id,
+                          linkedNodeName: matched?.name || "",
+                        }));
+                      }}
+                    >
+                      <option value="">-- 请选择 AI NetGuard 节点（可留空）--</option>
+                      {nodes.map((node) => (
+                        <option key={node.id} value={node.id}>
+                          {node.name}
+                          {node.expectedCountry ? ` (${node.expectedCountry})` : ""}
+                        </option>
+                      ))}
+                    </select>
+                    {nodes.length === 0 && (
+                      <p className="text-[0.7rem] text-[#9ca3af]">
+                        当前未检测到 NetGuard 节点，可切换到「Clash Verge」或「自定义 / 直连」。
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {form.linkedNodeSource === "clash_verge" && (
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-[0.7rem] text-[#7c8495]">
+                      <span>
+                        {clashNodes?.detected
+                          ? `已自动读取本地 Clash Verge：${clashNodes.groups.length} 个策略组 · ${clashNodes.proxies.length} 个节点`
+                          : "未检测到本地 Clash Verge 配置文件，可直接手动输入节点名"}
+                      </span>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="xs"
+                        onClick={() => void onRefreshClashNodes()}
+                        disabled={loadingClashNodes}
+                      >
+                        <RefreshCw
+                          className={`h-3 w-3 ${loadingClashNodes ? "animate-spin" : ""}`}
+                          aria-hidden="true"
+                        />
+                        刷新 Clash 节点
+                      </Button>
+                    </div>
+
+                    <div className="flex items-center gap-1.5">
+                      <Input
+                        className="flex-1"
+                        placeholder="点击下方列表选择，或直接输入 Clash 节点 / 策略组名称"
+                        value={form.linkedNodeName}
+                        onChange={(e) =>
+                          setForm((prev) => ({
+                            ...prev,
+                            linkedNodeName: e.target.value,
+                          }))
+                        }
+                      />
+                      {form.linkedNodeName && (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          aria-label="清空绑定节点"
+                          onClick={() =>
+                            setForm((prev) => ({ ...prev, linkedNodeName: "" }))
+                          }
+                          className="h-8 w-8 shrink-0 text-[#7c8495]"
+                        >
+                          <X className="h-3.5 w-3.5" aria-hidden="true" />
+                        </Button>
+                      )}
+                    </div>
+
+                    {((clashNodes?.groups.length ?? 0) > 0 ||
+                      (clashNodes?.proxies.length ?? 0) > 0) && (
+                      <div className="space-y-1.5">
+                        <div className="relative">
+                          <Search
+                            className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#9ca3af]"
+                            aria-hidden="true"
+                          />
+                          <Input
+                            className="pl-8"
+                            placeholder="搜索策略组或节点名（如 香港、美国、自动选择）..."
+                            value={clashSearch}
+                            onChange={(e) => setClashSearch(e.target.value)}
+                          />
+                        </div>
+
+                        <div className="app-scroll max-h-36 space-y-2 overflow-y-auto rounded-lg border border-[#eaecef] bg-white p-1.5">
+                          {filteredClashGroups.length > 0 && (
+                            <div className="space-y-1">
+                              <div className="px-2 pt-0.5 text-[0.67rem] font-semibold text-[#7c8495]">
+                                策略组 ({filteredClashGroups.length})
+                              </div>
+                              {filteredClashGroups.map((item) => {
+                                const selected = form.linkedNodeName === item.name;
+                                return (
+                                  <button
+                                    key={`grp-${item.name}`}
+                                    type="button"
+                                    onClick={() =>
+                                      setForm((prev) => ({
+                                        ...prev,
+                                        linkedNodeName: item.name,
+                                      }))
+                                    }
+                                    className={`flex w-full items-center justify-between gap-2 rounded-md px-2 py-1 text-left text-[0.74rem] transition-colors cursor-pointer ${
+                                      selected
+                                        ? "bg-[#f0edfc] font-semibold text-[#5b48c4]"
+                                        : "text-[#111827] hover:bg-[#f3f4f6]"
+                                    }`}
+                                  >
+                                    <span className="flex min-w-0 items-center gap-1.5 truncate">
+                                      {selected && (
+                                        <Check className="h-3 w-3 shrink-0" aria-hidden="true" />
+                                      )}
+                                      <span className="truncate">{item.name}</span>
+                                    </span>
+                                    <span className="mono-num shrink-0 rounded bg-[#f3f4f6] px-1.5 py-0.5 text-[0.65rem] text-[#525866]">
+                                      {item.nodeType}
+                                    </span>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          )}
+
+                          {filteredClashProxies.length > 0 && (
+                            <div className="space-y-1">
+                              <div className="px-2 pt-0.5 text-[0.67rem] font-semibold text-[#7c8495]">
+                                代理节点 ({filteredClashProxies.length})
+                              </div>
+                              {filteredClashProxies.map((item) => {
+                                const selected = form.linkedNodeName === item.name;
+                                return (
+                                  <button
+                                    key={`px-${item.name}`}
+                                    type="button"
+                                    onClick={() =>
+                                      setForm((prev) => ({
+                                        ...prev,
+                                        linkedNodeName: item.name,
+                                      }))
+                                    }
+                                    className={`flex w-full items-center justify-between gap-2 rounded-md px-2 py-1 text-left text-[0.74rem] transition-colors cursor-pointer ${
+                                      selected
+                                        ? "bg-[#f0edfc] font-semibold text-[#5b48c4]"
+                                        : "text-[#111827] hover:bg-[#f3f4f6]"
+                                    }`}
+                                  >
+                                    <span className="flex min-w-0 items-center gap-1.5 truncate">
+                                      {selected && (
+                                        <Check className="h-3 w-3 shrink-0" aria-hidden="true" />
+                                      )}
+                                      <span className="truncate">{item.name}</span>
+                                    </span>
+                                    <span className="mono-num shrink-0 rounded bg-[#f3f4f6] px-1.5 py-0.5 text-[0.65rem] text-[#525866]">
+                                      {item.nodeType}
+                                    </span>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          )}
+
+                          {filteredClashGroups.length === 0 &&
+                            filteredClashProxies.length === 0 && (
+                              <div className="px-2 py-3 text-center text-[0.72rem] text-[#9ca3af]">
+                                没有匹配的 Clash 策略组或节点
+                              </div>
+                            )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {form.linkedNodeSource === "custom" && (
+                  <Input
+                    placeholder="输入自定义代理节点或直连描述，如：静态住宅 1.2.3.4 / 本地直连 / 指纹内置 Socks5"
+                    value={form.linkedNodeName}
+                    onChange={(e) =>
+                      setForm((prev) => ({
+                        ...prev,
+                        linkedNodeName: e.target.value,
+                      }))
+                    }
+                  />
+                )}
               </div>
             </fieldset>
 
@@ -1605,7 +2211,7 @@ export function AccountsView({
                   </label>
                   <Input
                     id={fid("purpose")}
-                    placeholder="例如：CloudCart 店铺收款 / Google Ads / Claude 登录"
+                    placeholder="例如：CloudCart 店铺管理 / Google Ads / Claude 登录"
                     value={form.purpose}
                     onChange={(e) =>
                       setForm((prev) => ({ ...prev, purpose: e.target.value }))
@@ -1653,7 +2259,7 @@ export function AccountsView({
           </div>
 
           {/* Modal Footer */}
-          <div className="flex items-center justify-end gap-2 border-t border-[#eaecef] bg-[#fafbfc] px-6 py-3.5">
+          <div className="flex shrink-0 items-center justify-end gap-2 border-t border-[#eaecef] bg-[#fafbfc] px-6 py-3.5">
             <Button type="button" variant="outline" size="sm" onClick={closeEditor}>
               取消
             </Button>

@@ -1,9 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AccountEnvPreset,
   AccountRecord,
   AppConfig,
   AppEnvSnapshot,
+  ClashVergeNodesSnapshot,
   DiagnosticCheck,
   DownloadProgress,
   GatewayStatus,
@@ -44,6 +46,12 @@ export const api = {
     invoke<AccountRecord[]>("delete_accounts", { ids }),
   importAccounts: (accounts: AccountRecord[], replace: boolean) =>
     invoke<AccountRecord[]>("import_accounts", { accounts, replace }),
+  listAccountEnvironments: () =>
+    invoke<AccountEnvPreset[]>("list_account_environments"),
+  saveAccountEnvironments: (presets: AccountEnvPreset[]) =>
+    invoke<AccountEnvPreset[]>("save_account_environments", { presets }),
+  listClashVergeNodes: () =>
+    invoke<ClashVergeNodesSnapshot>("list_clash_verge_nodes"),
   connectGuard: () => invoke<GatewayStatus>("connect_guard"),
   clearLogs: () => invoke<void>("clear_logs"),
   generateVpsScript: (protocol: "vless-reality" | "hysteria2", port: number) =>

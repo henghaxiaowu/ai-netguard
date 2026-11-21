@@ -24,7 +24,7 @@ https://github.com/user-attachments/assets/cf2bd7ea-e3fa-4140-a59b-066bf845f924
 - **不改系统代理，共存不冲突**：通过 **Physical Bypass** 绑定物理网卡直接绕过 Clash Verge / Tailscale 虚拟网卡，也可通过 **Upstream Detour** 走前置链式代理。
 - **全客户端隔离工作区**：自动下载并启动独立便携版 **Ungoogled-Chromium**（带 MV3 时区/语言对齐扩展）、PAC 接管 **Claude Desktop**、环境变量/严格 WFP 启动 **Claude Code CLI**。
 - **AI 应用启动环境管家（PEB 扫描）**：内置 `Claude Desktop` / `Antigravity` / `ChatGPT` / `Cockpit Tools` 及自定义 `.exe` 管理，实时读取活跃进程内存 (PEB) 代理变量与端口活体，精准揪出脏继承死端口并一键干净重启。
-- **账号与环境库（Windows DPAPI 本地加密）**：集中管理 Google 等平台账号凭据、离线 RFC 6238 2FA 动态验证码（支持 Base32 与 `otpauth://`）及备用恢复码；记录 `AdsPower`、`CloudCart`、`Claude Code`、`NetGuard 安全浏览器`、本地或自定义启动环境与窗口 ID，支持关联出口节点、用途标签、状态标记（`正常`/`备用`/`受限`/`已封禁`）、批量清理封禁号及 JSON 备份导入导出。
+- **账号与环境库（Windows DPAPI 本地加密）**：集中管理 Google 等平台账号凭据、离线 RFC 6238 2FA 动态验证码（支持 Base32 与 `otpauth://`）及备用恢复码；支持自由增删自定义启动环境预设（`指纹浏览器`/`本地`/`自定义`，可留空），以及按来源绑定 `AI NetGuard` 节点、自动读取本地 `Clash Verge` 策略组与节点（支持搜索）或自定义/直连代理，配合用途标签、状态标记（`正常`/`备用`/`受限`/`已封禁`）、批量清理封禁号及 JSON 备份导入导出。
 - **实时防泄漏体检**：内置 8 项实时核验（出口 IP、VPN 共存、DNS、IPv6、WebRTC/QUIC、WFP、熔断、CLI 链路）与每 4 秒出口巡检。
 
 ---
@@ -57,7 +57,7 @@ https://github.com/user-attachments/assets/cf2bd7ea-e3fa-4140-a59b-066bf845f924
 
 ## 🚀 3 步快速上手
 
-1. **下载安装**：从 [Releases](https://github.com/henghaxiaowu/ai-netguard/releases/latest) 下载 `AI.NetGuard_0.1.4_x64-setup.exe` 安装（升级前先彻底退出托盘中的旧进程）。
+1. **下载安装**：从 [Releases](https://github.com/henghaxiaowu/ai-netguard/releases/latest) 下载 `AI.NetGuard_0.1.5_x64-setup.exe` 安装（升级前先彻底退出托盘中的旧进程）。
 2. **配置节点**：进入 **「出口与共存路由」**，粘贴 `vless://`、`hy2://`、`ss://`、`trojan://` 或 `socks5://` 链接（或用内置向导生成独享 VPS 一键脚本），填好预期国家与时区语言并保存。
 3. **启动使用**：回到 **「总览与安全启动」** 点击 **「启动安全网关」**（首次需 UAC 提权），随后按需打开 **防泄漏浏览器**、**Claude Desktop** 或 **Claude Code 终端** 即可。
 
@@ -96,7 +96,7 @@ https://github.com/user-attachments/assets/cf2bd7ea-e3fa-4140-a59b-066bf845f924
 <details>
 <summary><b>配置与浏览器数据存放在哪里？</b></summary>
 
-全部运行时数据位于 `%LOCALAPPDATA%\AI-NetGuard\`（包含 `config.json`、DPAPI 本地加密账号库 `accounts.vault`、便携浏览器 `browser/` 与独立配置文件 `browser-profile/`）。
+全部运行时数据位于 `%LOCALAPPDATA%\AI-NetGuard\`（包含 `config.json`、DPAPI 本地加密账号库 `accounts.vault`、自定义启动环境预设 `account-environments.json`、便携浏览器 `browser/` 与独立配置文件 `browser-profile/`）。
 
 </details>
 

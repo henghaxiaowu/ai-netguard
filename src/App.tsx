@@ -59,9 +59,11 @@ import {
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type {
+  AccountEnvPreset,
   AccountRecord,
   AppConfig,
   AppEnvSnapshot,
+  ClashVergeNodesSnapshot,
   DiagnosticCheck,
   DownloadProgress,
   GatewayStatus,
@@ -209,6 +211,12 @@ export default function App() {
   const [scanningApps, setScanningApps] = useState(false);
   const [accounts, setAccounts] = useState<AccountRecord[]>([]);
   const [loadingAccounts, setLoadingAccounts] = useState(true);
+  const [envPresets, setEnvPresets] = useState<AccountEnvPreset[]>([
+    { id: "env-adspower", name: "AdsPower", envType: "fingerprint" },
+    { id: "env-local-browser", name: "本地浏览器", envType: "local" },
+  ]);
+  const [clashNodes, setClashNodes] = useState<ClashVergeNodesSnapshot | null>(null);
+  const [loadingClashNodes, setLoadingClashNodes] = useState(false);
 
   const didAutoStartRef = useRef(false);
   const toastRef = useRef<HTMLDivElement>(null);
@@ -325,11 +333,27 @@ export default function App() {
     }
   }, []);
 
+  const refreshClashNodes = useCallback(async () => {
+    setLoadingClashNodes(true);
+    try {
+      const snap = await api.listClashVergeNodes();
+      setClashNodes(snap);
+    } catch {
+      // Ignore if running outside Tauri runtime during Vite preview
+    } finally {
+      setLoadingClashNodes(false);
+    }
+  }, []);
+
   const refreshAccounts = useCallback(async () => {
     setLoadingAccounts(true);
     try {
-      const list = await api.listAccounts();
+      const [list, presets] = await Promise.all([
+        api.listAccounts(),
+        api.listAccountEnvironments(),
+      ]);
       setAccounts(list);
+      setEnvPresets(presets);
     } catch {
       // Ignore if running outside Tauri runtime during Vite preview
     } finally {
@@ -340,6 +364,7 @@ export default function App() {
   const refreshAll = async () => {
     void refreshAppEnv();
     void refreshAccounts();
+    void refreshClashNodes();
     const [cfg, st] = await Promise.all([api.getConfig(), api.getStatus()]);
     setConfig(cfg);
     setStatus(st);
@@ -580,7 +605,7 @@ export default function App() {
           ...record,
           id,
           provider: record.provider.trim() || "Google",
-          environmentName: record.environmentName.trim() || "AdsPower",
+          environmentName: record.environmentName.trim(),
           createdAt: record.createdAt || now,
           updatedAt: now,
         };
@@ -648,7 +673,7 @@ export default function App() {
               ...rec,
               id,
               provider: rec.provider.trim() || "Google",
-              environmentName: rec.environmentName.trim() || "AdsPower",
+              environmentName: rec.environmentName.trim(),
               createdAt: rec.createdAt || now,
               updatedAt: now,
             };
@@ -667,6 +692,20 @@ export default function App() {
         return;
       }
       notify(`导入账号失败: ${String(err)}`);
+    }
+  };
+
+  const handleSaveEnvPresets = async (presets: AccountEnvPreset[]) => {
+    try {
+      const next = await api.saveAccountEnvironments(presets);
+      setEnvPresets(next);
+    } catch (err) {
+      if (!isTauriEnv()) {
+        setEnvPresets(presets);
+        return;
+      }
+      notify(`保存启动环境预设失败: ${String(err)}`);
+      throw err;
     }
   };
 
@@ -1723,11 +1762,16 @@ export default function App() {
               <AccountsView
                 accounts={accounts}
                 nodes={config?.nodes ?? []}
+                envPresets={envPresets}
+                clashNodes={clashNodes}
                 loading={loadingAccounts}
+                loadingClashNodes={loadingClashNodes}
                 onUpsert={handleUpsertAccount}
                 onDelete={handleDeleteAccount}
                 onBulkDelete={handleBulkDeleteAccounts}
                 onImport={handleImportAccounts}
+                onSaveEnvPresets={handleSaveEnvPresets}
+                onRefreshClashNodes={refreshClashNodes}
                 onNotify={notify}
               />
             )}

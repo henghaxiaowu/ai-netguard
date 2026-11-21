@@ -182,13 +182,28 @@ export interface AppEnvSnapshot {
 
 export type AccountStatus = "active" | "standby" | "restricted" | "banned";
 
-export type AccountEnvType =
-  | "adspower"
-  | "claude_code"
-  | "netguard_browser"
-  | "local"
-  | "fingerprint_other"
-  | "custom";
+export type AccountEnvType = "fingerprint" | "local" | "custom";
+
+export type AccountNodeSource = "none" | "netguard" | "clash_verge" | "custom";
+
+export interface AccountEnvPreset {
+  id: string;
+  name: string;
+  envType: AccountEnvType;
+}
+
+export interface ClashVergeNodeItem {
+  name: string;
+  nodeType: string;
+  isGroup: boolean;
+}
+
+export interface ClashVergeNodesSnapshot {
+  detected: boolean;
+  sourcePath?: string | null;
+  groups: ClashVergeNodeItem[];
+  proxies: ClashVergeNodeItem[];
+}
 
 export interface AccountRecord {
   id: string;
@@ -202,7 +217,9 @@ export interface AccountRecord {
   envType: AccountEnvType;
   environmentName: string;
   environmentProfile?: string | null;
+  linkedNodeSource?: AccountNodeSource;
   linkedNodeId?: string | null;
+  linkedNodeName?: string | null;
   purpose: string;
   tags: string[];
   status: AccountStatus;
