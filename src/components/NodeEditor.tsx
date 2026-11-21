@@ -10,6 +10,7 @@ import {
   AlertTriangle,
   Share2,
   Server,
+  Globe,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -27,15 +28,17 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
-import type { AppConfig, NodeProfile, ProxyProtocol } from "../types";
+import type { AppConfig, NodeProfile, OutboundMode, ProxyProtocol } from "../types";
 import { api } from "../api";
 
 interface Props {
   config: AppConfig;
   dirty: boolean;
+  secondaryNodePorts?: Record<string, number>;
   onUpdateConfig: (next: AppConfig) => void;
   onSave: () => Promise<void>;
   onNotify: (msg: string) => void;
+  onQuickLaunchNodeBrowser?: (node: NodeProfile) => void;
 }
 
 const PROTOCOLS: { value: ProxyProtocol; label: string }[] = [
@@ -60,7 +63,21 @@ const TIMEZONE_PRESETS = [
 
 const LOCALE_PRESETS = ["ko-KR", "ja-JP", "en-US", "en-GB", "de-DE", "en-AU", "fr-FR"];
 
-export function NodeEditor({ config, dirty, onUpdateConfig, onSave, onNotify }: Props) {
+const OUTBOUND_OVERRIDE_LABELS: Record<OutboundMode, string> = {
+  physical_bypass: "物理旁路",
+  upstream_detour: "上游串联",
+  default_route: "默认路由",
+};
+
+export function NodeEditor({
+  config,
+  dirty,
+  secondaryNodePorts,
+  onUpdateConfig,
+  onSave,
+  onNotify,
+  onQuickLaunchNodeBrowser,
+}: Props) {
   const uid = useId();
   const [uriInput, setUriInput] = useState("");
   const [vpsProto, setVpsProto] = useState<"vless-reality" | "hysteria2">("hysteria2");
@@ -377,6 +394,16 @@ export function NodeEditor({ config, dirty, onUpdateConfig, onSave, onNotify }: 
                     </span>
                   </div>
                   <div className="flex shrink-0 items-center gap-1.5">
+                    {n.outboundMode && (
+                      <Badge variant="iris" className="px-1.5 text-[0.62rem]">
+                        {OUTBOUND_OVERRIDE_LABELS[n.outboundMode]}
+                      </Badge>
+                    )}
+                    {!active && secondaryNodePorts?.[n.id] ? (
+                      <Badge variant="neutral" className="mono-num px-1.5 text-[0.63rem]">
+                        :{secondaryNodePorts[n.id]}
+                      </Badge>
+                    ) : null}
                     <Badge variant="neutral" className="mono-num uppercase px-1.5 text-[0.65rem]">
                       {n.protocol}
                     </Badge>
@@ -395,17 +422,29 @@ export function NodeEditor({ config, dirty, onUpdateConfig, onSave, onNotify }: 
         {/* Right Node Configuration Form */}
         {selected && (
           <div className="flex flex-col gap-4 p-5 px-6">
-            <div className="flex items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <h2 className="text-[0.84rem] font-semibold text-[#111827]">节点配置</h2>
-              <Button
-                variant="destructive-outline"
-                size="xs"
-                disabled={config.nodes.length <= 1}
-                onClick={removeSelected}
-              >
-                <Trash2 className="h-3 w-3" aria-hidden="true" />
-                删除节点
-              </Button>
+              <div className="flex flex-wrap items-center gap-2">
+                {onQuickLaunchNodeBrowser && (
+                  <Button
+                    variant="soft"
+                    size="xs"
+                    onClick={() => onQuickLaunchNodeBrowser(selected)}
+                  >
+                    <Globe className="h-3 w-3" aria-hidden="true" />
+                    用此节点启动浏览器
+                  </Button>
+                )}
+                <Button
+                  variant="destructive-outline"
+                  size="xs"
+                  disabled={config.nodes.length <= 1}
+                  onClick={removeSelected}
+                >
+                  <Trash2 className="h-3 w-3" aria-hidden="true" />
+                  删除节点
+                </Button>
+              </div>
             </div>
 
             <div className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2">
@@ -537,6 +576,45 @@ export function NodeEditor({ config, dirty, onUpdateConfig, onSave, onNotify }: 
                     ))}
                   </SelectContent>
                 </Select>
+              </div>
+
+              <div className="flex flex-col gap-1 sm:col-span-2">
+                <label htmlFor={fid("nodeOutboundMode")} className="text-[0.71rem] font-medium text-[#7c8495]">
+                  节点出站覆盖（可单独覆盖全局共存策略，互不影响）
+                </label>
+                <Select
+                  value={selected.outboundMode || "follow_global"}
+                  onValueChange={(v) =>
+                    updateSelected({
+                      outboundMode: v === "follow_global" ? undefined : (v as OutboundMode),
+                    })
+                  }
+                >
+                  <SelectTrigger id={fid("nodeOutboundMode")}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="follow_global">
+                      跟随全局共存路由（当前：{OUTBOUND_OVERRIDE_LABELS[config.outboundMode]}）
+                    </SelectItem>
+                    <SelectItem value="physical_bypass">
+                      强制物理网卡直连绕过 Clash (/32 免疫 Clash 全局与 TUN)
+                    </SelectItem>
+                    <SelectItem value="upstream_detour">
+                      强制经上游代理串联 ({config.upstreamProxy.server}:{config.upstreamProxy.port})
+                    </SelectItem>
+                    <SelectItem value="default_route">
+                      系统默认路由
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-[0.69rem] text-[#7c8495]">
+                  {(selected.outboundMode || config.outboundMode) === "physical_bypass"
+                    ? "该节点会绑定真实物理网卡并自动写入 /32 主机旁路路由，即使 Clash 开启全局 / TUN 模式也不会被劫持。"
+                    : (selected.outboundMode || config.outboundMode) === "upstream_detour"
+                      ? `该节点流量将先经过上游代理 ${config.upstreamProxy.server}:${config.upstreamProxy.port} 再落地目标 IP；请确保上方 Clash 节点本身可直连且能连通。`
+                      : "跟随系统默认路由表出站（若外部软件开启全局 TUN，可能会走入外部 TUN）。"}
+                </p>
               </div>
             </div>
 

@@ -114,6 +114,7 @@ pub fn parse_node_uri(raw: &str) -> Result<NodeProfile, String> {
                 expected_country: None,
                 timezone: Some("Asia/Seoul".into()),
                 locale: Some("ko-KR".into()),
+                outbound_mode: None,
             })
         }
         "trojan" => {
@@ -143,6 +144,7 @@ pub fn parse_node_uri(raw: &str) -> Result<NodeProfile, String> {
                 expected_country: None,
                 timezone: None,
                 locale: None,
+                outbound_mode: None,
             })
         }
         "hy2" | "hysteria2" => {
@@ -172,6 +174,7 @@ pub fn parse_node_uri(raw: &str) -> Result<NodeProfile, String> {
                 expected_country: None,
                 timezone: None,
                 locale: None,
+                outbound_mode: None,
             })
         }
         "ss" => parse_ss_uri(trimmed, id, fragment_name),
@@ -203,6 +206,7 @@ pub fn parse_node_uri(raw: &str) -> Result<NodeProfile, String> {
                 expected_country: None,
                 timezone: None,
                 locale: None,
+                outbound_mode: None,
             })
         }
         "http" | "https" => {
@@ -233,6 +237,7 @@ pub fn parse_node_uri(raw: &str) -> Result<NodeProfile, String> {
                 expected_country: None,
                 timezone: None,
                 locale: None,
+                outbound_mode: None,
             })
         }
         other => Err(format!("暂不支持的协议: {other}")),
@@ -289,6 +294,7 @@ fn parse_ss_uri(raw: &str, id: String, fragment_name: Option<String>) -> Result<
         expected_country: None,
         timezone: None,
         locale: None,
+        outbound_mode: None,
     })
 }
 

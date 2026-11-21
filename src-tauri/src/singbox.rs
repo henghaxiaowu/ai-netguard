@@ -1,8 +1,12 @@
 use crate::launcher::KillOnCloseJob;
-use crate::models::{app_data_dir, AppConfig, LogBuffer, NodeProfile, OutboundMode, ProxyProtocol};
+use crate::models::{
+    app_data_dir, effective_outbound_mode, AppConfig, LogBuffer, NodeProfile, OutboundMode,
+    ProxyProtocol,
+};
 use crate::pac::PAC_PORT;
 use crate::uri_parser::normalize_spki_sha256_base64;
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::windows::process::CommandExt;
@@ -93,13 +97,57 @@ impl SingBoxManager {
         17892
     }
 
+    pub fn secondary_node_port_map(cfg: &AppConfig) -> BTreeMap<String, u16> {
+        let mut used: HashSet<u16> = [
+            cfg.cli_port,
+            cfg.browser_port,
+            Self::probe_port(cfg),
+            PAC_PORT,
+            CLASH_API_PORT,
+        ]
+        .into_iter()
+        .collect();
+
+        let mut map = BTreeMap::new();
+        let mut next_port: u16 = 17901;
+        for node in &cfg.nodes {
+            if map.len() >= 16 {
+                break;
+            }
+            if node.id == cfg.active_node_id || node.server.trim().is_empty() {
+                continue;
+            }
+            if build_node_outbound_with_tag(node, "test").is_err() {
+                continue;
+            }
+            if matches!(
+                effective_outbound_mode(cfg, node),
+                OutboundMode::UpstreamDetour
+            ) && (cfg.upstream_proxy.server.trim().is_empty() || cfg.upstream_proxy.port == 0)
+            {
+                continue;
+            }
+            while used.contains(&next_port) && next_port < u16::MAX {
+                next_port = next_port.saturating_add(1);
+            }
+            if next_port == u16::MAX {
+                break;
+            }
+            used.insert(next_port);
+            map.insert(node.id.clone(), next_port);
+            next_port = next_port.saturating_add(1);
+        }
+        map
+    }
+
     pub fn check_listen_ports(cfg: &AppConfig) -> Result<(), String> {
-        let ports = [
+        let mut ports = vec![
             cfg.cli_port,
             cfg.browser_port,
             Self::probe_port(cfg),
             CLASH_API_PORT,
         ];
+        ports.extend(Self::secondary_node_port_map(cfg).into_values());
         for (index, &port) in ports.iter().enumerate() {
             if port == 0 || port == PAC_PORT || ports[..index].contains(&port) {
                 return Err(format!("网关监听端口 {port} 无效或与其他网关端口重复"));
@@ -130,34 +178,35 @@ impl SingBoxManager {
             return Err("出口节点服务器地址为空，请先在“出口与共存路由”中填写或导入节点".into());
         }
 
-        let mut exit_outbound = build_node_outbound(node)?;
-        let mut outbounds: Vec<Value> = Vec::new();
+        let primary_mode = effective_outbound_mode(cfg, node);
+        let sec_port_map = Self::secondary_node_port_map(cfg);
 
-        match cfg.outbound_mode {
-            OutboundMode::PhysicalBypass => {
-                if let Some(nic) = physical_nic {
-                    exit_outbound["bind_interface"] = json!(nic);
-                }
+        let mut sec_nodes: Vec<(&NodeProfile, u16)> = Vec::new();
+        for (sec_node_id, &sec_port) in &sec_port_map {
+            if let Some(sec_node) = cfg.nodes.iter().find(|n| &n.id == sec_node_id) {
+                sec_nodes.push((sec_node, sec_port));
             }
-            OutboundMode::UpstreamDetour => {
-                let up_type = if cfg.upstream_proxy.protocol == "http" {
-                    "http"
-                } else {
-                    "socks"
-                };
-                outbounds.push(json!({
-                    "type": up_type,
-                    "tag": "upstream_detour",
-                    "server": cfg.upstream_proxy.server,
-                    "server_port": cfg.upstream_proxy.port
-                }));
-                exit_outbound["detour"] = json!("upstream_detour");
-            }
-            OutboundMode::DefaultRoute => {}
         }
 
-        outbounds.insert(
-            0,
+        let any_uses_upstream = matches!(primary_mode, OutboundMode::UpstreamDetour)
+            || sec_nodes.iter().any(|(sec_node, _)| {
+                matches!(
+                    effective_outbound_mode(cfg, sec_node),
+                    OutboundMode::UpstreamDetour
+                )
+            });
+        let any_uses_physical = matches!(primary_mode, OutboundMode::PhysicalBypass)
+            || sec_nodes.iter().any(|(sec_node, _)| {
+                matches!(
+                    effective_outbound_mode(cfg, sec_node),
+                    OutboundMode::PhysicalBypass
+                )
+            });
+
+        let mut exit_outbound = build_node_outbound_with_tag(node, "ai_exit")?;
+        apply_outbound_mode(&mut exit_outbound, &primary_mode, physical_nic);
+
+        let mut outbounds: Vec<Value> = vec![
             json!({
                 "type": "selector",
                 "tag": "ai_selector",
@@ -165,10 +214,48 @@ impl SingBoxManager {
                 "default": "ai_block",
                 "interrupt_exist_connections": true
             }),
-        );
-        outbounds.insert(1, exit_outbound);
-        outbounds.push(json!({ "type": "block", "tag": "ai_block" }));
-        outbounds.push(json!({ "type": "direct", "tag": "direct" }));
+            exit_outbound,
+        ];
+
+        if any_uses_upstream {
+            if matches!(primary_mode, OutboundMode::UpstreamDetour)
+                && (cfg.upstream_proxy.server.trim().is_empty() || cfg.upstream_proxy.port == 0)
+            {
+                return Err("已选择经现有代理串联出站，但上游代理地址或端口为空".into());
+            }
+            let up_type = if cfg.upstream_proxy.protocol == "http" {
+                "http"
+            } else {
+                "socks"
+            };
+            outbounds.push(json!({
+                "type": up_type,
+                "tag": "upstream_detour",
+                "server": cfg.upstream_proxy.server,
+                "server_port": cfg.upstream_proxy.port
+            }));
+        }
+
+        let mut inbounds = vec![
+            json!({
+                "type": "mixed",
+                "tag": "in_cli",
+                "listen": "127.0.0.1",
+                "listen_port": cfg.cli_port
+            }),
+            json!({
+                "type": "socks",
+                "tag": "in_browser",
+                "listen": "127.0.0.1",
+                "listen_port": cfg.browser_port
+            }),
+            json!({
+                "type": "socks",
+                "tag": "in_probe",
+                "listen": "127.0.0.1",
+                "listen_port": Self::probe_port(cfg)
+            }),
+        ];
 
         let mut rules = vec![
             json!({ "action": "sniff" }),
@@ -177,6 +264,28 @@ impl SingBoxManager {
             json!({ "inbound": ["in_probe"], "outbound": "ai_exit" }),
             json!({ "inbound": ["in_browser"], "outbound": "ai_selector" }),
         ];
+
+        for (idx, (sec_node, sec_port)) in sec_nodes.into_iter().enumerate() {
+            let out_tag = format!("sec_exit_{idx}");
+            let in_tag = format!("in_sec_{idx}");
+            let mut sec_outbound = build_node_outbound_with_tag(sec_node, &out_tag)?;
+            let sec_mode = effective_outbound_mode(cfg, sec_node);
+            apply_outbound_mode(&mut sec_outbound, &sec_mode, physical_nic);
+            outbounds.push(sec_outbound);
+            inbounds.push(json!({
+                "type": "socks",
+                "tag": in_tag,
+                "listen": "127.0.0.1",
+                "listen_port": sec_port
+            }));
+            rules.push(json!({
+                "inbound": [in_tag],
+                "outbound": out_tag
+            }));
+        }
+
+        outbounds.push(json!({ "type": "block", "tag": "ai_block" }));
+        outbounds.push(json!({ "type": "direct", "tag": "direct" }));
 
         let mut route_domains: Vec<String> = Vec::new();
         for domain in cfg
@@ -207,21 +316,26 @@ impl SingBoxManager {
 
         // For CLI traffic that does not match AI domains: use upstream clash if configured, else direct.
         let cli_final = if cfg.upstream_proxy.enabled
-            && matches!(cfg.outbound_mode, OutboundMode::UpstreamDetour)
+            && matches!(primary_mode, OutboundMode::UpstreamDetour)
         {
             "upstream_detour"
         } else {
             "direct"
         };
 
-        let local_dns = match (&cfg.outbound_mode, physical_nic) {
-            (OutboundMode::PhysicalBypass, Some(nic)) => json!({
-                "tag": "dns_local",
-                "type": "udp",
-                "server": "223.5.5.5",
-                "bind_interface": nic
-            }),
-            _ => json!({ "tag": "dns_local", "type": "local" }),
+        let local_dns = if any_uses_physical {
+            if let Some(nic) = physical_nic {
+                json!({
+                    "tag": "dns_local",
+                    "type": "udp",
+                    "server": "223.5.5.5",
+                    "bind_interface": nic
+                })
+            } else {
+                json!({ "tag": "dns_local", "type": "local" })
+            }
+        } else {
+            json!({ "tag": "dns_local", "type": "local" })
         };
 
         Ok(json!({
@@ -243,26 +357,7 @@ impl SingBoxManager {
                 "final": "dns_local",
                 "strategy": "ipv4_only"
             },
-            "inbounds": [
-                {
-                    "type": "mixed",
-                    "tag": "in_cli",
-                    "listen": "127.0.0.1",
-                    "listen_port": cfg.cli_port
-                },
-                {
-                    "type": "socks",
-                    "tag": "in_browser",
-                    "listen": "127.0.0.1",
-                    "listen_port": cfg.browser_port
-                },
-                {
-                    "type": "socks",
-                    "tag": "in_probe",
-                    "listen": "127.0.0.1",
-                    "listen_port": Self::probe_port(cfg)
-                }
-            ],
+            "inbounds": inbounds,
             "outbounds": outbounds,
             "route": {
                 "default_domain_resolver": "dns_local",
@@ -380,7 +475,21 @@ impl Drop for SingBoxManager {
     }
 }
 
-fn build_node_outbound(node: &NodeProfile) -> Result<Value, String> {
+fn apply_outbound_mode(outbound: &mut Value, mode: &OutboundMode, physical_nic: Option<&str>) {
+    match mode {
+        OutboundMode::PhysicalBypass => {
+            if let Some(nic) = physical_nic {
+                outbound["bind_interface"] = json!(nic);
+            }
+        }
+        OutboundMode::UpstreamDetour => {
+            outbound["detour"] = json!("upstream_detour");
+        }
+        OutboundMode::DefaultRoute => {}
+    }
+}
+
+fn build_node_outbound_with_tag(node: &NodeProfile, tag: &str) -> Result<Value, String> {
     let base = match node.protocol {
         ProxyProtocol::Vless => {
             let uuid = node.uuid.as_deref().unwrap_or("").trim();
@@ -389,7 +498,7 @@ fn build_node_outbound(node: &NodeProfile) -> Result<Value, String> {
             }
             let mut obj = json!({
                 "type": "vless",
-                "tag": "ai_exit",
+                "tag": tag,
                 "server": node.server.trim(),
                 "server_port": node.port,
                 "uuid": uuid
@@ -406,7 +515,7 @@ fn build_node_outbound(node: &NodeProfile) -> Result<Value, String> {
             let pass = node.password.as_deref().unwrap_or("");
             let mut obj = json!({
                 "type": "trojan",
-                "tag": "ai_exit",
+                "tag": tag,
                 "server": node.server.trim(),
                 "server_port": node.port,
                 "password": pass
@@ -426,7 +535,7 @@ fn build_node_outbound(node: &NodeProfile) -> Result<Value, String> {
             apply_tls_cert_pinning(&mut tls, node)?;
             let mut obj = json!({
                 "type": "hysteria2",
-                "tag": "ai_exit",
+                "tag": tag,
                 "server": node.server.trim(),
                 "server_port": node.port,
                 "password": pass,
@@ -441,7 +550,7 @@ fn build_node_outbound(node: &NodeProfile) -> Result<Value, String> {
         }
         ProxyProtocol::Shadowsocks => json!({
             "type": "shadowsocks",
-            "tag": "ai_exit",
+            "tag": tag,
             "server": node.server.trim(),
             "server_port": node.port,
             "method": node.method.as_deref().unwrap_or("aes-256-gcm"),
@@ -450,7 +559,7 @@ fn build_node_outbound(node: &NodeProfile) -> Result<Value, String> {
         ProxyProtocol::Socks => {
             let mut obj = json!({
                 "type": "socks",
-                "tag": "ai_exit",
+                "tag": tag,
                 "server": node.server.trim(),
                 "server_port": node.port,
                 "version": "5"
@@ -464,7 +573,7 @@ fn build_node_outbound(node: &NodeProfile) -> Result<Value, String> {
         ProxyProtocol::Http => {
             let mut obj = json!({
                 "type": "http",
-                "tag": "ai_exit",
+                "tag": tag,
                 "server": node.server.trim(),
                 "server_port": node.port
             });
@@ -660,6 +769,101 @@ mod tests {
             out3.status.success(),
             "hy2 pinned config check failed: {}",
             String::from_utf8_lossy(&out3.stderr)
+        );
+    }
+
+    #[test]
+    fn multi_node_per_node_override_config_passes_real_singbox_check() {
+        let bin = SingBoxManager::find_binary().expect("sing-box binary present");
+        let mgr = SingBoxManager::new();
+
+        let mut cfg = AppConfig::default();
+        cfg.outbound_mode = OutboundMode::DefaultRoute;
+        cfg.upstream_proxy = UpstreamProxyConfig {
+            enabled: true,
+            protocol: "socks".into(),
+            server: "127.0.0.1".into(),
+            port: 10809,
+        };
+        cfg.nodes[0].server = "1.2.3.4".into();
+        cfg.nodes[0].uuid = Some("11111111-2222-3333-4444-555555555555".into());
+        cfg.nodes[0].public_key = Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into());
+        cfg.nodes[0].short_id = Some("1234abcd".into());
+        cfg.nodes[0].outbound_mode = Some(OutboundMode::PhysicalBypass);
+
+        cfg.nodes.push(NodeProfile {
+            id: "jp-home".into(),
+            name: "日本家宽-川崎".into(),
+            protocol: ProxyProtocol::Socks,
+            server: "212.68.187.81".into(),
+            port: 50101,
+            uuid: None,
+            flow: None,
+            security: None,
+            sni: None,
+            fingerprint: None,
+            public_key: None,
+            short_id: None,
+            method: None,
+            password: Some("pass".into()),
+            username: Some("user".into()),
+            obfs: None,
+            obfs_password: None,
+            allow_insecure: None,
+            certificate_sha256: None,
+            expected_ip: Some("212.68.187.81".into()),
+            expected_country: Some("JP".into()),
+            timezone: Some("Asia/Tokyo".into()),
+            locale: Some("ja-JP".into()),
+            outbound_mode: Some(OutboundMode::UpstreamDetour),
+        });
+
+        let sec_map = SingBoxManager::secondary_node_port_map(&cfg);
+        assert_eq!(sec_map.get("jp-home").copied(), Some(17901));
+
+        let json_cfg = mgr.generate_config(&cfg, Some("Ethernet")).unwrap();
+        assert_eq!(json_cfg["outbounds"][1]["tag"], "ai_exit");
+        assert_eq!(json_cfg["outbounds"][1]["bind_interface"], "Ethernet");
+        let outbounds_arr = json_cfg["outbounds"].as_array().unwrap();
+        let sec_out = outbounds_arr
+            .iter()
+            .find(|o| o["tag"] == "sec_exit_0")
+            .expect("sec_exit_0 present");
+        assert_eq!(sec_out["detour"], "upstream_detour");
+        assert!(sec_out.get("bind_interface").is_none());
+
+        let inbounds_arr = json_cfg["inbounds"].as_array().unwrap();
+        let sec_in = inbounds_arr
+            .iter()
+            .find(|i| i["tag"] == "in_sec_0")
+            .expect("in_sec_0 present");
+        assert_eq!(sec_in["listen_port"], 17901);
+
+        let rules_arr = json_cfg["route"]["rules"].as_array().unwrap();
+        let sec_rule_pos = rules_arr
+            .iter()
+            .position(|r| r["inbound"][0] == "in_sec_0" && r["outbound"] == "sec_exit_0")
+            .expect("in_sec_0 rule present");
+        let domain_rule_pos = rules_arr
+            .iter()
+            .position(|r| r.get("domain_suffix").is_some())
+            .expect("ai domain rule present");
+        assert!(
+            sec_rule_pos < domain_rule_pos,
+            "secondary browser inbound rule must take precedence over AI domain selector rule"
+        );
+
+        let p = std::env::temp_dir().join("ng-test-multi-node.json");
+        std::fs::write(&p, serde_json::to_string_pretty(&json_cfg).unwrap()).unwrap();
+        let out = Command::new(&bin)
+            .args(["check", "-c", &p.to_string_lossy()])
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert!(
+            out.status.success(),
+            "multi-node config check failed: {}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 }

@@ -26,7 +26,14 @@ const VIRTUAL_KEYWORDS: &[&str] = &[
     "wireguard",
     "clash",
     "mihomo",
+    "meta tunnel",
+    "clash.meta",
+    "utun",
+    "tunnel",
     "sing-box",
+    "sing-tun",
+    "flclash",
+    "nekobox",
     "tap-windows",
     "openvpn",
     "tailscale",
@@ -40,6 +47,20 @@ const VIRTUAL_KEYWORDS: &[&str] = &[
     "loopback",
     "pseudo",
 ];
+
+pub fn is_virtual_adapter(name: &str, description: &str) -> bool {
+    let name_l = name.trim().to_lowercase();
+    let desc_l = description.trim().to_lowercase();
+    if name_l == "meta"
+        || name_l.starts_with("meta ")
+        || name_l.starts_with("meta-")
+        || name_l.starts_with("meta_")
+    {
+        return true;
+    }
+    let combined_lower = format!("{name_l} {desc_l}");
+    VIRTUAL_KEYWORDS.iter().any(|kw| combined_lower.contains(kw))
+}
 
 pub fn detect_physical_nic() -> Option<PhysicalNicInfo> {
     unsafe {
@@ -75,8 +96,7 @@ pub fn detect_physical_nic() -> Option<PhysicalNicInfo> {
             if adapter.OperStatus == IfOperStatusUp {
                 let name = adapter.FriendlyName.to_string().unwrap_or_default();
                 let desc = adapter.Description.to_string().unwrap_or_default();
-                let combined_lower = format!("{} {}", name.to_lowercase(), desc.to_lowercase());
-                let is_virtual = VIRTUAL_KEYWORDS.iter().any(|kw| combined_lower.contains(kw));
+                let is_virtual = is_virtual_adapter(&name, &desc);
 
                 if !is_virtual && !adapter.FirstGatewayAddress.is_null() {
                     let gw_addr = &*adapter.FirstGatewayAddress;
@@ -236,6 +256,129 @@ struct IpifyResp {
     ip: String,
 }
 
+#[derive(Deserialize)]
+struct IpInfoResp {
+    #[serde(default)]
+    ip: String,
+    country: Option<String>,
+    region: Option<String>,
+    city: Option<String>,
+    loc: Option<String>,
+    timezone: Option<String>,
+    org: Option<String>,
+}
+
+fn parse_ipinfo_resp(parsed: IpInfoResp, latency_ms: u64) -> Option<ExitIpInfo> {
+    let ip = parsed.ip.trim().to_string();
+    if ip.is_empty() {
+        return None;
+    }
+    let (latitude, longitude) = parsed
+        .loc
+        .as_deref()
+        .and_then(|s| s.split_once(','))
+        .map(|(a, b)| (a.trim().parse::<f64>().ok(), b.trim().parse::<f64>().ok()))
+        .unwrap_or((None, None));
+    let (asn, org_name) = match parsed.org.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(full) => {
+            if let Some((first, rest)) = full.split_once(' ') {
+                if first.starts_with("AS") && first[2..].chars().all(|c| c.is_ascii_digit()) {
+                    let clean_org = rest.trim();
+                    (
+                        Some(first.to_string()),
+                        (!clean_org.is_empty()).then(|| clean_org.to_string()),
+                    )
+                } else {
+                    (None, Some(full.to_string()))
+                }
+            } else if full.starts_with("AS") && full[2..].chars().all(|c| c.is_ascii_digit()) {
+                (Some(full.to_string()), None)
+            } else {
+                (None, Some(full.to_string()))
+            }
+        }
+        None => (None, None),
+    };
+    Some(ExitIpInfo {
+        ip,
+        country: parsed.country.clone(),
+        country_code: parsed.country,
+        region: parsed.region,
+        city: parsed.city,
+        latitude,
+        longitude,
+        timezone: parsed.timezone,
+        isp: org_name.clone(),
+        org: org_name,
+        asn,
+        latency_ms: Some(latency_ms),
+        verified_at: chrono::Local::now().format("%H:%M:%S").to_string(),
+    })
+}
+
+pub async fn probe_exit_ip_fast(socks_port: u16) -> Result<(String, u64), String> {
+    let proxy = Proxy::all(format!("socks5h://127.0.0.1:{socks_port}"))
+        .map_err(|e| format!("构造代理探针失败: {e}"))?;
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("构建 HTTP 探针客户端失败: {e}"))?;
+
+    let started1 = Instant::now();
+    if let Ok(resp) = client.get("https://api.ipify.org?format=json").send().await {
+        if resp.status().is_success() {
+            if let Ok(parsed) = resp.json::<IpifyResp>().await {
+                let candidate = parsed.ip.trim();
+                if candidate.parse::<Ipv4Addr>().is_ok() {
+                    return Ok((
+                        candidate.to_string(),
+                        started1.elapsed().as_millis() as u64,
+                    ));
+                }
+            }
+        }
+    }
+
+    let started2 = Instant::now();
+    if let Ok(resp) = client.get("https://checkip.amazonaws.com/").send().await {
+        if resp.status().is_success() {
+            if let Ok(text) = resp.text().await {
+                let candidate = text.trim();
+                if candidate.parse::<Ipv4Addr>().is_ok() {
+                    return Ok((
+                        candidate.to_string(),
+                        started2.elapsed().as_millis() as u64,
+                    ));
+                }
+            }
+        }
+    }
+
+    let started3 = Instant::now();
+    let resp = client
+        .get("https://ifconfig.me/ip")
+        .send()
+        .await
+        .map_err(|e| format!("代理出口快速探测超时或被阻断: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("ifconfig.me 返回 HTTP {}", resp.status()));
+    }
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("出口 IP 读取失败: {e}"))?;
+    let candidate = text.trim();
+    if candidate.parse::<Ipv4Addr>().is_ok() {
+        Ok((
+            candidate.to_string(),
+            started3.elapsed().as_millis() as u64,
+        ))
+    } else {
+        Err(format!("出口快速探测返回异常 IP 格式: {candidate}"))
+    }
+}
+
 pub async fn probe_exit_ip(socks_port: u16) -> Result<ExitIpInfo, String> {
     let proxy = Proxy::all(format!("socks5h://127.0.0.1:{socks_port}"))
         .map_err(|e| format!("构造代理探针失败: {e}"))?;
@@ -323,6 +466,19 @@ pub async fn probe_exit_ip(socks_port: u16) -> Result<ExitIpInfo, String> {
         }
     }
 
+    let started_geo4 = Instant::now();
+    if let Ok(resp) = client.get("https://ipinfo.io/json").send().await {
+        if resp.status().is_success() {
+            if let Ok(parsed) = resp.json::<IpInfoResp>().await {
+                if let Some(info) =
+                    parse_ipinfo_resp(parsed, started_geo4.elapsed().as_millis() as u64)
+                {
+                    return Ok(info);
+                }
+            }
+        }
+    }
+
     let started2 = Instant::now();
     let resp = client
         .get("https://api.ipify.org?format=json")
@@ -396,5 +552,35 @@ mod tests {
         assert_eq!(parsed.ip, "203.0.113.10");
         assert!((parsed.latitude.unwrap() - 37.566535).abs() < 1e-6);
         assert!((parsed.longitude.unwrap() - 126.9779692).abs() < 1e-6);
+    }
+
+    #[test]
+    fn virtual_adapter_filter_rejects_clash_meta_tun_and_keeps_physical_nics() {
+        assert!(is_virtual_adapter("Meta", "Meta Tunnel"));
+        assert!(is_virtual_adapter("Clash", "Clash Tunnel"));
+        assert!(is_virtual_adapter("utun3", "sing-tun Virtual Adapter"));
+        assert!(is_virtual_adapter("Tailscale", "Tailscale Tunnel"));
+        assert!(!is_virtual_adapter("以太网", "Realtek PCIe GbE Family Controller"));
+        assert!(!is_virtual_adapter("WLAN", "MediaTek Wi-Fi 6E MT7922 PCIe Card"));
+        assert!(!is_virtual_adapter("Ethernet", "Intel(R) Ethernet Controller I225-V"));
+    }
+
+    #[test]
+    fn ipinfo_response_parses_asn_and_coords() {
+        let sample = r#"{
+            "ip": "212.68.187.81",
+            "country": "JP",
+            "region": "Kanagawa",
+            "city": "Kawasaki",
+            "loc": "35.5308,139.7029",
+            "timezone": "Asia/Tokyo",
+            "org": "AS2516 KDDI CORPORATION"
+        }"#;
+        let parsed: IpInfoResp = serde_json::from_str(sample).unwrap();
+        let info = parse_ipinfo_resp(parsed, 42).unwrap();
+        assert_eq!(info.country_code.as_deref(), Some("JP"));
+        assert_eq!(info.asn.as_deref(), Some("AS2516"));
+        assert_eq!(info.org.as_deref(), Some("KDDI CORPORATION"));
+        assert!((info.latitude.unwrap() - 35.5308).abs() < 1e-4);
     }
 }

@@ -1,9 +1,13 @@
 use crate::healthcheck::{encode_powershell_encoded_command, encode_utf8_b64};
-use crate::models::{app_data_dir, AppConfig, DownloadProgress, LogBuffer};
+use crate::models::{
+    app_data_dir, default_browser_profiles, AppConfig, BrowserFingerprintMode, BrowserProfile,
+    DownloadProgress, LogBuffer,
+};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -58,7 +62,7 @@ impl KillOnCloseJob {
 
 pub struct ProcessLauncher {
     job: Option<KillOnCloseJob>,
-    browser_child: Option<Child>,
+    browser_children: HashMap<String, Child>,
     desktop_child: Option<Child>,
 }
 
@@ -66,7 +70,7 @@ impl ProcessLauncher {
     pub fn new() -> Self {
         Self {
             job: KillOnCloseJob::new().ok(),
-            browser_child: None,
+            browser_children: HashMap::new(),
             desktop_child: None,
         }
     }
@@ -77,18 +81,39 @@ impl ProcessLauncher {
         }
     }
 
-    pub fn is_browser_running(&mut self) -> bool {
-        if let Some(child) = &mut self.browser_child {
+    pub fn is_profile_running(&mut self, profile_id: &str) -> bool {
+        if let Some(child) = self.browser_children.get_mut(profile_id) {
             match child.try_wait() {
-                Ok(None) => true,
+                Ok(None) => return true,
                 _ => {
-                    self.browser_child = None;
-                    false
+                    self.browser_children.remove(profile_id);
                 }
             }
-        } else {
-            false
         }
+        false
+    }
+
+    pub fn running_browser_profile_ids(&mut self) -> Vec<String> {
+        self.browser_children
+            .retain(|_, child| matches!(child.try_wait(), Ok(None)));
+        let mut ids: Vec<String> = self.browser_children.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    pub fn is_browser_running(&mut self) -> bool {
+        !self.running_browser_profile_ids().is_empty()
+    }
+
+    pub fn close_browser_profile(&mut self, profile_id: &str) -> bool {
+        if let Some(mut child) = self.browser_children.remove(profile_id) {
+            if matches!(child.try_wait(), Ok(None)) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return true;
+            }
+        }
+        false
     }
 
     pub fn resolve_browser_path(&self, cfg: &AppConfig) -> Option<PathBuf> {
@@ -232,6 +257,63 @@ impl ProcessLauncher {
         target_url: &str,
         logs: Arc<LogBuffer>,
     ) -> Result<String, String> {
+        let profile = cfg
+            .browser_profiles
+            .iter()
+            .find(|p| p.id == "default")
+            .cloned()
+            .unwrap_or_else(|| default_browser_profiles().into_iter().next().unwrap());
+        let bound_node_id = profile
+            .node_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(cfg.active_node_id.as_str());
+        let bound_node = cfg.nodes.iter().find(|n| n.id == bound_node_id);
+        let tz = profile
+            .fingerprint
+            .timezone
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| bound_node.and_then(|n| n.timezone.as_deref()).map(str::trim).filter(|s| !s.is_empty()))
+            .unwrap_or("Asia/Seoul")
+            .to_string();
+        let locale = profile
+            .fingerprint
+            .locale
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| bound_node.and_then(|n| n.locale.as_deref()).map(str::trim).filter(|s| !s.is_empty()))
+            .unwrap_or("ko-KR")
+            .to_string();
+        let node_label = bound_node
+            .map(|n| n.name.clone())
+            .unwrap_or_else(|| "主出口".into());
+
+        self.launch_browser_profile(
+            cfg,
+            &profile,
+            cfg.browser_port,
+            &node_label,
+            &tz,
+            &locale,
+            target_url,
+            logs,
+        )
+    }
+
+    pub fn launch_browser_profile(
+        &mut self,
+        cfg: &AppConfig,
+        profile: &BrowserProfile,
+        socks_port: u16,
+        node_label: &str,
+        effective_tz: &str,
+        effective_locale: &str,
+        target_url: &str,
+        logs: Arc<LogBuffer>,
+    ) -> Result<String, String> {
         let exe = self
             .resolve_browser_path(cfg)
             .ok_or("未安装专属防泄漏浏览器，请先点击下载或指定便携 Chromium 路径")?;
@@ -240,34 +322,32 @@ impl ProcessLauncher {
             return Err("出于安全考虑，专属浏览器仅允许启动 https:// 目标地址".into());
         }
 
-        let profile_dir = app_data_dir().join("browser-profile");
-        let active_node = cfg.nodes.iter().find(|n| n.id == cfg.active_node_id);
-        let tz = active_node
-            .and_then(|n| n.timezone.as_deref())
-            .filter(|s| !s.is_empty())
-            .unwrap_or("Asia/Seoul");
-        let locale = active_node
-            .and_then(|n| n.locale.as_deref())
-            .filter(|s| !s.is_empty())
-            .unwrap_or("ko-KR");
+        let (profile_dir, _) = profile_storage_dirs(&profile.id)?;
+        let should_inject_ext = matches!(
+            profile.fingerprint_mode,
+            BrowserFingerprintMode::IsolatedFingerprint
+        ) || cfg.align_fingerprint;
+        let locale_for_prefs = should_inject_ext.then_some(effective_locale);
+        harden_browser_preferences(&profile_dir, locale_for_prefs)?;
 
-        harden_browser_preferences(&profile_dir, cfg.align_fingerprint.then_some(locale))?;
-
-        // If browser is already running in this hardened profile, opening the URL passes a new tab
-        // into the already-locked running process.
-        if self.is_browser_running() {
+        // If this exact profile window is already running, opening the URL passes a new tab
+        // into that profile's isolated process without affecting any other profile.
+        if self.is_profile_running(&profile.id) {
             Command::new(&exe)
                 .arg(format!("--user-data-dir={}", profile_dir.display()))
                 .arg(target_url)
                 .spawn()
-                .map_err(|e| format!("在专属浏览器打开页面失败: {e}"))?;
-            logs.push(format!("已在当前专属防泄漏浏览器打开: {target_url}"));
-            return Ok(format!("已打开 {target_url}"));
+                .map_err(|e| format!("在浏览器环境 [{}] 打开页面失败: {e}", profile.name))?;
+            logs.push(format!(
+                "已在浏览器环境 [{}] ({node_label}) 打开: {target_url}",
+                profile.name
+            ));
+            return Ok(format!("已在 [{}] 打开 {target_url}", profile.name));
         }
 
         let mut cmd = Command::new(&exe);
         cmd.arg(format!("--user-data-dir={}", profile_dir.display()))
-            .arg(format!("--proxy-server=socks5://127.0.0.1:{}", cfg.browser_port))
+            .arg(format!("--proxy-server=socks5://127.0.0.1:{socks_port}"))
             .arg("--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1")
             .arg("--force-webrtc-ip-handling-policy")
             .arg("--webrtc-ip-handling-policy=disable_non_proxied_udp")
@@ -277,26 +357,53 @@ impl ProcessLauncher {
             .arg("--disable-sync")
             .arg("--disable-background-networking");
 
-        if cfg.align_fingerprint {
-            cmd.arg(format!("--lang={locale}"));
-            let ext_dir = ensure_fingerprint_extension(tz, locale)?;
+        if should_inject_ext {
+            cmd.arg(format!("--lang={effective_locale}"));
+            let ext_dir = ensure_profile_fingerprint_extension(profile, effective_tz, effective_locale)?;
             cmd.arg("--disable-features=DisableLoadExtensionCommandLineSwitch")
                 .arg(format!("--load-extension={}", ext_dir.display()));
+        }
+
+        if matches!(
+            profile.fingerprint_mode,
+            BrowserFingerprintMode::IsolatedFingerprint
+        ) {
+            let sw = profile.fingerprint.screen_width.clamp(800, 3840);
+            let sh = profile.fingerprint.screen_height.clamp(600, 2160);
+            cmd.arg(format!("--window-size={sw},{sh}"));
+            if let Some(ua) = profile
+                .fingerprint
+                .user_agent
+                .as_deref()
+                .map(|s| s.chars().filter(|c| !c.is_control()).collect::<String>())
+            {
+                let trimmed = ua.trim();
+                if !trimmed.is_empty() {
+                    cmd.arg(format!("--user-agent={trimmed}"));
+                }
+            }
         }
 
         cmd.arg(target_url);
 
         let child = cmd
             .spawn()
-            .map_err(|e| format!("启动专属浏览器失败: {e}"))?;
+            .map_err(|e| format!("启动浏览器环境 [{}] 失败: {e}", profile.name))?;
         self.assign_to_job(&child);
-        self.browser_child = Some(child);
+        self.browser_children.insert(profile.id.clone(), child);
 
+        let mode_label = match profile.fingerprint_mode {
+            BrowserFingerprintMode::CleanAlign => "纯净对齐",
+            BrowserFingerprintMode::IsolatedFingerprint => "完整独立指纹",
+        };
         logs.push(format!(
-            "已启动专属防泄漏浏览器 -> {target_url} (SOCKS5 127.0.0.1:{})",
-            cfg.browser_port
+            "已启动浏览器环境 [{}] ({mode_label}, 出口: {node_label}, SOCKS5 127.0.0.1:{socks_port}) -> {target_url}",
+            profile.name
         ));
-        Ok("专属防泄漏浏览器已启动".into())
+        Ok(format!(
+            "已启动 [{}] -> {node_label} (:{socks_port})",
+            profile.name
+        ))
     }
 
     pub fn is_desktop_running(&mut self) -> bool {
@@ -931,15 +1038,58 @@ fn sanitize_claude_preferences_file(pref_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+pub fn sanitize_profile_id(id: &str) -> Result<String, String> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return Err("浏览器环境 ID 长度必须为 1-64 个字符".into());
+    }
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(format!(
+            "非法的浏览器环境 ID（仅允许英文、数字、- 与 _）: {trimmed}"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+pub fn profile_storage_dirs(profile_id: &str) -> Result<(PathBuf, PathBuf), String> {
+    let safe_id = sanitize_profile_id(profile_id)?;
+    if safe_id == "default" {
+        Ok((
+            app_data_dir().join("browser-profile"),
+            app_data_dir().join("fingerprint-ext"),
+        ))
+    } else {
+        Ok((
+            app_data_dir().join("browser-profiles").join(&safe_id),
+            app_data_dir().join("fingerprint-exts").join(&safe_id),
+        ))
+    }
+}
+
+#[cfg(test)]
 fn ensure_fingerprint_extension(timezone: &str, locale: &str) -> Result<PathBuf, String> {
-    let ext_dir = app_data_dir().join("fingerprint-ext");
+    let mut profile = default_browser_profiles().into_iter().next().unwrap();
+    profile.id = "default".into();
+    profile.fingerprint_mode = BrowserFingerprintMode::CleanAlign;
+    ensure_profile_fingerprint_extension(&profile, timezone, locale)
+}
+
+pub fn ensure_profile_fingerprint_extension(
+    profile: &BrowserProfile,
+    timezone: &str,
+    locale: &str,
+) -> Result<PathBuf, String> {
+    let (_, ext_dir) = profile_storage_dirs(&profile.id)?;
     fs::create_dir_all(&ext_dir).map_err(|e| e.to_string())?;
 
     let manifest = json!({
         "manifest_version": 3,
-        "name": "AI NetGuard Timezone & Locale Alignment",
-        "version": "1.0.0",
-        "description": "Aligns Intl timezone and navigator languages with the protected exit node",
+        "name": format!("AI NetGuard Profile Alignment ({})", profile.id),
+        "version": "1.1.0",
+        "description": "Aligns Intl timezone, navigator languages, and optional isolated browser fingerprint",
         "content_scripts": [{
             "matches": ["<all_urls>"],
             "js": ["align.js"],
@@ -970,7 +1120,7 @@ fn ensure_fingerprint_extension(timezone: &str, locale: &str) -> Result<PathBuf,
     let loc_json = serde_json::to_string(locale).map_err(|e| e.to_string())?;
     let langs_json = serde_json::to_string(&langs_vec).map_err(|e| e.to_string())?;
 
-    let script = format!(
+    let mut script = format!(
         r#"(() => {{
   const TARGET_TZ = {tz_json};
   const TARGET_LOCALE = {loc_json};
@@ -1058,6 +1208,192 @@ fn ensure_fingerprint_extension(timezone: &str, locale: &str) -> Result<PathBuf,
 "#
     );
 
+    if matches!(
+        profile.fingerprint_mode,
+        BrowserFingerprintMode::IsolatedFingerprint
+    ) {
+        let sw = profile.fingerprint.screen_width.clamp(800, 3840);
+        let sh = profile.fingerprint.screen_height.clamp(600, 2160);
+        let avail_h = sh.saturating_sub(40).max(200);
+        let dpr = if profile.fingerprint.device_pixel_ratio.is_finite() {
+            profile.fingerprint.device_pixel_ratio.clamp(1.0, 3.0)
+        } else {
+            1.0
+        };
+        let hw = profile.fingerprint.hardware_concurrency.clamp(2, 64);
+        let mem = profile.fingerprint.device_memory.clamp(2, 64);
+        let vendor = profile.fingerprint.webgl_vendor.trim();
+        let vendor_str = if vendor.is_empty() {
+            "Google Inc. (NVIDIA)"
+        } else {
+            vendor
+        };
+        let renderer = profile.fingerprint.webgl_renderer.trim();
+        let renderer_str = if renderer.is_empty() {
+            "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"
+        } else {
+            renderer
+        };
+        let raw_seed = profile.fingerprint.noise_seed.trim();
+        let seed_str = if raw_seed.is_empty() {
+            profile.id.as_str()
+        } else {
+            raw_seed
+        };
+
+        let fp_cfg = json!({
+            "sw": sw,
+            "sh": sh,
+            "ah": avail_h,
+            "dpr": dpr,
+            "hw": hw,
+            "mem": mem,
+            "vendor": vendor_str,
+            "renderer": renderer_str,
+            "seed": seed_str,
+        });
+        let fp_cfg_json = serde_json::to_string(&fp_cfg).map_err(|e| e.to_string())?;
+        let isolated_js = format!(
+            r#"(() => {{
+  const FP = {fp_cfg_json};
+  if (globalThis.__aiNetguardIsolatedFp) return;
+  Object.defineProperty(globalThis, "__aiNetguardIsolatedFp", {{ value: true }});
+
+  function fnv1a32(str) {{
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {{
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }}
+    return h >>> 0;
+  }}
+
+  function mulberry32(a) {{
+    return function() {{
+      let t = (a += 0x6d2b79f5);
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    }};
+  }}
+
+  const defProp = (proto, key, getter) => {{
+    try {{
+      Object.defineProperty(proto, key, {{ get: getter, configurable: true }});
+    }} catch {{}}
+  }};
+
+  defProp(Screen.prototype, "width", () => FP.sw);
+  defProp(Screen.prototype, "height", () => FP.sh);
+  defProp(Screen.prototype, "availWidth", () => FP.sw);
+  defProp(Screen.prototype, "availHeight", () => FP.ah);
+  defProp(Screen.prototype, "colorDepth", () => 24);
+  defProp(Screen.prototype, "pixelDepth", () => 24);
+  defProp(window, "devicePixelRatio", () => FP.dpr);
+  defProp(Navigator.prototype, "hardwareConcurrency", () => FP.hw);
+  defProp(Navigator.prototype, "deviceMemory", () => FP.mem);
+
+  const patchWebGL = (Ctor) => {{
+    if (!Ctor || !Ctor.prototype || !Ctor.prototype.getParameter) return;
+    const origGetParam = Ctor.prototype.getParameter;
+    Ctor.prototype.getParameter = function getParameter(pname) {{
+      if (pname === 37445) return FP.vendor;
+      if (pname === 37446) return FP.renderer;
+      return origGetParam.call(this, pname);
+    }};
+  }};
+  patchWebGL(globalThis.WebGLRenderingContext);
+  patchWebGL(globalThis.WebGL2RenderingContext);
+
+  function perturbPixelData(data, w, h) {{
+    if (!data || !data.length || w <= 0 || h <= 0) return;
+    const rng = mulberry32(fnv1a32(FP.seed + ":" + w + "x" + h));
+    const pixelCount = Math.floor(data.length / 4);
+    const hits = Math.min(8, Math.max(2, Math.floor(pixelCount / 64)));
+    let applied = 0;
+    for (let i = 0; i < pixelCount && applied < hits; i++) {{
+      const p = Math.floor(rng() * pixelCount);
+      const base = p * 4;
+      if (data[base + 3] > 0) {{
+        const chan = Math.floor(rng() * 3);
+        data[base + chan] = data[base + chan] ^ 1;
+        applied++;
+      }}
+    }}
+  }}
+
+  const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+  CanvasRenderingContext2D.prototype.getImageData = function getImageData(sx, sy, sw, sh, settings) {{
+    const img = origGetImageData.call(this, sx, sy, sw, sh, settings);
+    try {{
+      perturbPixelData(img.data, img.width, img.height);
+    }} catch {{}}
+    return img;
+  }};
+
+  const makePatchedCanvasClone = (src) => {{
+    const w = src.width | 0;
+    const h = src.height | 0;
+    if (w <= 0 || h <= 0 || w * h > 4000000) return null;
+    const clone = document.createElement("canvas");
+    clone.width = w;
+    clone.height = h;
+    const ctx = clone.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(src, 0, 0);
+    const img = origGetImageData.call(ctx, 0, 0, w, h);
+    perturbPixelData(img.data, w, h);
+    ctx.putImageData(img, 0, 0);
+    return clone;
+  }};
+
+  const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+  HTMLCanvasElement.prototype.toDataURL = function toDataURL(...args) {{
+    try {{
+      if (this.getContext("2d")) {{
+        const clone = makePatchedCanvasClone(this);
+        if (clone) return origToDataURL.apply(clone, args);
+      }}
+    }} catch {{}}
+    return origToDataURL.apply(this, args);
+  }};
+
+  const origToBlob = HTMLCanvasElement.prototype.toBlob;
+  HTMLCanvasElement.prototype.toBlob = function toBlob(callback, ...args) {{
+    try {{
+      if (this.getContext("2d")) {{
+        const clone = makePatchedCanvasClone(this);
+        if (clone) return origToBlob.apply(clone, [callback, ...args]);
+      }}
+    }} catch {{}}
+    return origToBlob.apply(this, [callback, ...args]);
+  }};
+
+  if (globalThis.AudioBuffer && AudioBuffer.prototype.getChannelData) {{
+    const patchedBuffers = new WeakSet();
+    const origGetChannelData = AudioBuffer.prototype.getChannelData;
+    AudioBuffer.prototype.getChannelData = function getChannelData(channel) {{
+      const buf = origGetChannelData.call(this, channel);
+      try {{
+        if (!patchedBuffers.has(buf)) {{
+          patchedBuffers.add(buf);
+          const rng = mulberry32(fnv1a32(FP.seed + ":audio:" + channel + ":" + buf.length));
+          const step = Math.max(1, Math.floor(buf.length / 64));
+          for (let i = 0; i < buf.length; i += step) {{
+            buf[i] += (rng() - 0.5) * 1e-7;
+          }}
+        }}
+      }} catch {{}}
+      return buf;
+    }};
+  }}
+}})();
+"#
+        );
+        script.push('\n');
+        script.push_str(&isolated_js);
+    }
+
     fs::write(ext_dir.join("align.js"), script).map_err(|e| e.to_string())?;
     Ok(ext_dir)
 }
@@ -1075,6 +1411,38 @@ mod tests {
         assert!(manifest.contains("\"manifest_version\": 3"));
         assert!(js.contains("Asia/Seoul"));
         assert!(js.contains("ko-KR"));
+        assert!(!js.contains("__aiNetguardIsolatedFp"));
+        assert!(!js.contains("webgl_renderer"));
+    }
+
+    #[test]
+    fn sanitize_profile_id_and_isolated_fingerprint_mv3() {
+        assert!(sanitize_profile_id("").is_err());
+        assert!(sanitize_profile_id("../escape").is_err());
+        assert!(sanitize_profile_id("a/b").is_err());
+        assert!(sanitize_profile_id("jp-kawasaki_01").is_ok());
+
+        let mut profile = default_browser_profiles().into_iter().next().unwrap();
+        profile.id = "test-iso-jp".into();
+        profile.fingerprint_mode = BrowserFingerprintMode::IsolatedFingerprint;
+        profile.fingerprint.screen_width = 1440;
+        profile.fingerprint.screen_height = 900;
+        profile.fingerprint.hardware_concurrency = 12;
+        profile.fingerprint.device_memory = 16;
+        profile.fingerprint.webgl_vendor = "Google Inc. (AMD)".into();
+        profile.fingerprint.webgl_renderer = "ANGLE (AMD, Radeon RX 6700 XT Direct3D11)".into();
+        profile.fingerprint.noise_seed = "seed-abc-123".into();
+
+        let dir = ensure_profile_fingerprint_extension(&profile, "Asia/Tokyo", "ja-JP").unwrap();
+        let js = fs::read_to_string(dir.join("align.js")).unwrap();
+        assert!(js.contains("Asia/Tokyo"));
+        assert!(js.contains("ja-JP"));
+        assert!(js.contains("__aiNetguardIsolatedFp"));
+        assert!(js.contains("seed-abc-123"));
+        assert!(js.contains("Radeon RX 6700 XT"));
+        assert!(js.contains("getChannelData"));
+        assert!(js.contains("toDataURL"));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

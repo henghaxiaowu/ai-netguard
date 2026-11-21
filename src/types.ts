@@ -48,6 +48,34 @@ export interface NodeProfile {
   expectedCountry?: string;
   timezone?: string;
   locale?: string;
+  outboundMode?: OutboundMode | null;
+}
+
+export type BrowserFingerprintMode = "clean_align" | "isolated_fingerprint";
+
+export interface BrowserFingerprintConfig {
+  timezone?: string | null;
+  locale?: string | null;
+  screenWidth: number;
+  screenHeight: number;
+  devicePixelRatio: number;
+  hardwareConcurrency: number;
+  deviceMemory: number;
+  webglVendor: string;
+  webglRenderer: string;
+  userAgent?: string | null;
+  noiseSeed: string;
+}
+
+export interface BrowserProfile {
+  id: string;
+  name: string;
+  builtin?: boolean;
+  nodeId?: string | null;
+  homepage: string;
+  fingerprintMode: BrowserFingerprintMode;
+  fingerprint: BrowserFingerprintConfig;
+  notes?: string | null;
 }
 
 export interface UpstreamProxyConfig {
@@ -78,6 +106,7 @@ export interface AppConfig {
   requireNetguardForClaude: boolean;
   aiDomains: string[];
   managedApps: ManagedAppConfig[];
+  browserProfiles?: BrowserProfile[];
 }
 
 export type CheckSeverity = "pass" | "warn" | "fail" | "pending";
@@ -130,6 +159,8 @@ export interface GatewayStatus {
   detectedPhysicalGateway?: string;
   detectedConflicts: string[];
   exitIp?: ExitIpInfo;
+  runningBrowserProfiles?: string[];
+  secondaryNodePorts?: Record<string, number>;
   logs: string[];
 }
 

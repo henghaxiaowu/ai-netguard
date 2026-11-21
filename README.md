@@ -21,11 +21,11 @@ https://github.com/user-attachments/assets/cf2bd7ea-e3fa-4140-a59b-066bf845f924
 ## ✨ 核心能力
 
 - **WFP 内核级硬锁**：提权守护进程 `netguard-guard` 在驱动层封死受保护进程直连、QUIC (UDP 443)、WebRTC STUN 与公网明文 DNS，支持 **Fail-Closed 紧急熔断** 与 **Claude Desktop 持久化离线硬锁**。
-- **不改系统代理，共存不冲突**：通过 **Physical Bypass** 绑定物理网卡直接绕过 Clash Verge / Tailscale 虚拟网卡，也可通过 **Upstream Detour** 走前置链式代理。
-- **全客户端隔离工作区**：自动下载并启动独立便携版 **Ungoogled-Chromium**（带 MV3 时区/语言对齐扩展）、PAC 接管 **Claude Desktop**、环境变量/严格 WFP 启动 **Claude Code CLI**。
-- **AI 应用启动环境管家（PEB 扫描）**：内置 `Claude Desktop` / `Antigravity` / `ChatGPT` / `Cockpit Tools` 及自定义 `.exe` 管理，实时读取活跃进程内存 (PEB) 代理变量与端口活体，精准揪出脏继承死端口并一键干净重启。
+- **不改系统代理，共存不冲突（支持单节点覆盖 + Clash Meta 识别）**：通过 **Physical Bypass** 绑定真实物理网卡（自动过滤 `Meta` / `Meta Tunnel` / `utun` 等虚拟 TUN 网卡）并注入多目标 `/32` 旁路路由，支持针对单个节点覆盖出站模式（例如「首尔 VPS」强制直连绕过 Clash 全局/TUN，「备用住宅节点」按需直连或上游串联）。
+- **多出口独立指纹浏览器并发多开**：在同一 `sing-box` 内核中为主出口之外的备用节点分配独立回环 SOCKS5 端口（`17901+`），WFP 仅放行 `chrome.exe`（绝不开放给 `claude.exe` 与 CLI 沙盒）；每套浏览器环境（`BrowserProfile`）拥有独立 `--user-data-dir` 与持久化一致性指纹，并支持 **`clean_align` 纯净对齐**（对 Claude / hCaptcha 最安全）与 **`isolated_fingerprint` 完整独立指纹**（持久化屏幕、CPU/内存、Direct3D11 WebGL 与固定种子 Canvas/Audio 微扰动）。
+- **AI 应用启动环境管家（PEB 扫描）**：内置 `Claude Desktop` / `Antigravity` / `ChatGPT` / `Cockpit Tools` 及自定义 `.exe` 管理，实时读取活跃进程内存 (PEB) 代理变量与端口活体，支持识别跟随在线系统代理的 `CustomProxy` 策略，精准揪出失效环境变量并一键干净重启。
 - **账号与环境库（Windows DPAPI 本地加密）**：集中管理 Google 等平台账号凭据、离线 RFC 6238 2FA 动态验证码（支持 Base32 与 `otpauth://`）及备用恢复码；支持固定分栏对齐展示与 **拖拽手柄 / 上下按钮自由调序（持久化至 `accounts.vault`）**、自由增删自定义启动环境预设（`指纹浏览器`/`本地`/`自定义`，可留空），以及按来源绑定 `AI NetGuard` 节点、自动读取本地 `Clash Verge` 策略组与节点（支持搜索）或自定义/直连代理，配合用途标签、状态标记（`正常`/`备用`/`受限`/`已封禁`）、批量清理封禁号及 JSON 备份导入导出。
-- **实时防泄漏体检**：内置 8 项实时核验（出口 IP、VPN 共存、DNS、IPv6、WebRTC/QUIC、WFP、熔断、CLI 链路）与每 4 秒出口巡检。
+- **防误熔断实时巡检**：内置 8 项实时核验（出口 IP、VPN 共存、DNS、IPv6、WebRTC/QUIC、WFP、熔断、CLI 链路）；后台每 4 秒核验 Guard/WFP 护盾，每 12 秒使用轻量纯 IP 探针（`ipify` / `checkip` / `ifconfig`）并在每 5 分钟或 IP 漂移时刷新全量 GeoIP（4 路兜底），避免公共 GeoIP 限流引发误熔断，同时对 IP 漂移、国家不符及未知国家严格保持 Fail-Closed 阻断。
 
 ---
 
@@ -57,21 +57,23 @@ https://github.com/user-attachments/assets/cf2bd7ea-e3fa-4140-a59b-066bf845f924
 
 ## 🚀 3 步快速上手
 
-1. **下载安装**：从 [Releases](https://github.com/henghaxiaowu/ai-netguard/releases/latest) 下载 `AI.NetGuard_0.1.6_x64-setup.exe` 安装（升级前先彻底退出托盘中的旧进程）。
-2. **配置节点**：进入 **「出口与共存路由」**，粘贴 `vless://`、`hy2://`、`ss://`、`trojan://` 或 `socks5://` 链接（或用内置向导生成独享 VPS 一键脚本），填好预期国家与时区语言并保存。
-3. **启动使用**：回到 **「总览与安全启动」** 点击 **「启动安全网关」**（首次需 UAC 提权），随后按需打开 **防泄漏浏览器**、**Claude Desktop** 或 **Claude Code 终端** 即可。
+1. **下载安装**：从 [Releases](https://github.com/henghaxiaowu/ai-netguard/releases/latest) 下载 `AI.NetGuard_0.1.7_x64-setup.exe` 安装（升级前先彻底退出托盘中的旧进程）。
+2. **配置节点**：进入 **「出口与共存路由」**，粘贴 `vless://`、`hy2://`、`ss://`、`trojan://` 或 `socks5://` 链接（或用内置向导生成独享 VPS 一键脚本），填好预期国家与时区语言，按需设置单节点出站覆盖并保存。
+3. **启动使用**：回到 **「总览与安全启动」** 点击 **「启动安全网关」**（首次需 UAC 提权），随后可打开默认 **防泄漏浏览器**、**Claude Desktop**、**Claude Code 终端**，或在 **「指纹浏览器」** 中按不同节点与独立指纹并发多开浏览器窗口。
 
 ---
 
 ## 🧭 架构与端口速览
 
 ```text
-[受保护浏览器 / Claude Desktop / Claude Code CLI]
-   │  WFP 内核锁仅放行受控回环端口 (17890 / 17891 / 17898)
+[主安全浏览器 / Claude Desktop / Claude Code CLI] ──▶ [主安全出口]
+[独立指纹浏览器环境 #1..N (17901+)]                 ──▶ [对应绑定出口节点]
+   │  WFP 内核锁严格分级隔离：claude.exe 仅限 17890/17891/17898，备用浏览器端口仅放行 chrome.exe
    ▼
-[sing-box 本地核心]  ──▶  [Physical Bypass 物理网卡直通 / Upstream Detour]  ──▶  [独享静态节点]
-   ├─ 127.0.0.1:17890   CLI 混合代理入站 (HTTP / SOCKS5)
-   ├─ 127.0.0.1:17891   浏览器 / PAC 专用 SOCKS5 入站
+[sing-box 本地核心]  ──▶  [单节点独立 Physical Bypass (/32) / Upstream Detour]
+   ├─ 127.0.0.1:17890   CLI 混合代理入站 (HTTP / SOCKS5 -> 主安全出口)
+   ├─ 127.0.0.1:17891   主安全浏览器 / PAC 专用 SOCKS5 入站 (主安全出口)
+   ├─ 127.0.0.1:17901+  多出口指纹浏览器并发 SOCKS5 入站 (独立节点直达)
    └─ 127.0.0.1:17898   Claude Desktop 本地 PAC 服务 (/proxy.pac)
 ```
 

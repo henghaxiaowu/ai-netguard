@@ -1,4 +1,4 @@
-use crate::models::{app_data_dir, AppConfig, DiagnosticCheck, GatewayStatus};
+use crate::models::{app_data_dir, effective_outbound_mode, AppConfig, DiagnosticCheck, GatewayStatus};
 use crate::network::check_anthropic_via_http_proxy;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -87,6 +87,9 @@ pub async fn run_eight_checks(cfg: &AppConfig, status: &GatewayStatus) -> Vec<Di
     };
 
     // 2. Coexistence bypass / detour check
+    let active_eff_mode = active_node
+        .map(|n| effective_outbound_mode(cfg, n))
+        .unwrap_or_else(|| cfg.outbound_mode.clone());
     let c2 = if status.detected_conflicts.is_empty() {
         DiagnosticCheck {
             id: "coexistence".into(),
@@ -103,7 +106,7 @@ pub async fn run_eight_checks(cfg: &AppConfig, status: &GatewayStatus) -> Vec<Di
             fix_action: None,
         }
     } else if status.bypass_route_active
-        || matches!(cfg.outbound_mode, crate::models::OutboundMode::UpstreamDetour)
+        || matches!(active_eff_mode, crate::models::OutboundMode::UpstreamDetour)
     {
         DiagnosticCheck {
             id: "coexistence".into(),
@@ -239,7 +242,7 @@ pub async fn run_eight_checks(cfg: &AppConfig, status: &GatewayStatus) -> Vec<Di
         } else {
             "当前为仅告警模式，异常时不自动阻断".into()
         },
-        detail: "后台每 4 秒核验一次隧道可达性与出口 IP".into(),
+        detail: "后台每 4 秒核验 WFP 护盾，每 12 秒核验出口 IP（5 分钟自动刷新 GeoIP）".into(),
         fixable: false,
         fix_action: None,
     };

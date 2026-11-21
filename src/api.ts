@@ -8,6 +8,7 @@ import type {
   ClashVergeNodesSnapshot,
   DiagnosticCheck,
   DownloadProgress,
+  ExitIpInfo,
   GatewayStatus,
   NodeProfile,
 } from "./types";
@@ -29,6 +30,15 @@ export const api = {
   launchBrowser: () => invoke<string>("launch_browser"),
   launchBrowserUrl: (url: string) =>
     invoke<string>("launch_browser_url", { url }),
+  launchBrowserProfile: (profileId: string, url?: string) =>
+    invoke<string>("launch_browser_profile", {
+      profileId,
+      url: url ?? null,
+    }),
+  closeBrowserProfile: (profileId: string) =>
+    invoke<GatewayStatus>("close_browser_profile", { profileId }),
+  probeNodeExit: (nodeId: string) =>
+    invoke<ExitIpInfo>("probe_node_exit", { nodeId }),
   launchClaudeDesktop: () => invoke<string>("launch_claude_desktop"),
   launchClaudeTerminal: (workDir: string, strictWfp: boolean) =>
     invoke<string>("launch_claude_terminal", { workDir, strictWfp }),

@@ -35,6 +35,11 @@ pub enum GuardRequest {
         gateway_ip: String,
         interface_index: u32,
     },
+    SetBypassRoutes {
+        target_ips: Vec<String>,
+        gateway_ip: String,
+        interface_index: u32,
+    },
     ClearBypassRoute,
     Shutdown,
 }

@@ -124,6 +124,18 @@ fn handle_request(
                 msg = format!("Bypass route active for {target_ip}/32 via {gateway_ip}");
             }
         }
+        GuardRequest::SetBypassRoutes {
+            target_ips,
+            gateway_ip,
+            interface_index,
+        } => {
+            let count = target_ips.len();
+            if let Err(e) = routes.set_bypass_routes(&target_ips, &gateway_ip, interface_index) {
+                err_msg = Some(e);
+            } else {
+                msg = format!("Bypass routes active for {count} targets via {gateway_ip}");
+            }
+        }
         GuardRequest::ClearBypassRoute => {
             routes.clear_bypass_route();
             msg = "Bypass route cleared".into();

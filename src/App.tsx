@@ -37,6 +37,7 @@ import {
 import { api } from "./api";
 import { AccountsView } from "./components/AccountsView";
 import { AppsEnvView } from "./components/AppsEnvView";
+import { BrowserProfilesView } from "./components/BrowserProfilesView";
 import { NodeEditor } from "./components/NodeEditor";
 import { ClaudeStarburst } from "./components/ClaudeMotifs";
 import { ExitIpMap } from "./components/ExitIpMap";
@@ -63,14 +64,17 @@ import type {
   AccountRecord,
   AppConfig,
   AppEnvSnapshot,
+  BrowserProfile,
   ClashVergeNodesSnapshot,
   DiagnosticCheck,
   DownloadProgress,
   GatewayStatus,
+  NodeProfile,
 } from "./types";
 
 type TabKey =
   | "dashboard"
+  | "browsers"
   | "apps"
   | "accounts"
   | "verify"
@@ -87,6 +91,7 @@ const NAV_GROUPS: {
     group: "网关",
     items: [
       { key: "dashboard", label: "总览与安全启动", crumb: "总览", icon: Monitor },
+      { key: "browsers", label: "指纹浏览器", crumb: "指纹浏览器", icon: Globe },
       { key: "apps", label: "AI 应用与环境", crumb: "AI 应用与环境", icon: AppWindow },
       { key: "accounts", label: "账号与环境库", crumb: "账号与环境库", icon: KeyRound },
       { key: "verify", label: "IP 与指纹体检", crumb: "IP 与指纹体检", icon: Fingerprint },
@@ -217,6 +222,11 @@ export default function App() {
   ]);
   const [clashNodes, setClashNodes] = useState<ClashVergeNodesSnapshot | null>(null);
   const [loadingClashNodes, setLoadingClashNodes] = useState(false);
+  const [quickProfileId, setQuickProfileId] = useState("default");
+  const [preselectedBrowserNode, setPreselectedBrowserNode] = useState<{
+    nodeId: string;
+    nonce: number;
+  } | null>(null);
 
   const didAutoStartRef = useRef(false);
   const toastRef = useRef<HTMLDivElement>(null);
@@ -521,6 +531,88 @@ export default function App() {
     }
   };
 
+  const handleLaunchBrowserProfile = async (profileId: string, url?: string) => {
+    try {
+      const msg = await api.launchBrowserProfile(profileId, url);
+      notify(msg);
+      setStatus(await api.getStatus());
+    } catch (err) {
+      notify(`启动浏览器环境失败: ${String(err)}`);
+    }
+  };
+
+  const handleCloseBrowserProfile = async (profileId: string) => {
+    try {
+      const st = await api.closeBrowserProfile(profileId);
+      setStatus(st);
+      notify("已关闭该浏览器窗口");
+    } catch (err) {
+      notify(`关闭失败: ${String(err)}`);
+    }
+  };
+
+  const handleSaveBrowserProfiles = async (profiles: BrowserProfile[]) => {
+    if (!config) return;
+    const nextConfig: AppConfig = { ...config, browserProfiles: profiles };
+    try {
+      const saved = await api.saveConfig(nextConfig);
+      setConfig(saved);
+      setDirty(false);
+    } catch (err) {
+      if (!isTauriEnv()) {
+        setConfig(nextConfig);
+        setDirty(false);
+        return;
+      }
+      throw err;
+    }
+  };
+
+  const handleRestartGateway = async () => {
+    setBusy(true);
+    try {
+      if (dirty && config) {
+        await handleSaveConfig(config);
+      }
+      await api.stopGateway();
+      const started = await api.startGateway();
+      setStatus(started);
+      setChecks(await api.runDiagnostics());
+      notify("网关已重启并刷新多出口监听端口");
+    } catch (err) {
+      notify(`重启网关失败: ${String(err)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleQuickLaunchNodeBrowser = async (node: NodeProfile) => {
+    if (!config) return;
+    if (dirty) {
+      await handleSaveConfig(config);
+    }
+    const isPrimary = node.id === config.activeNodeId;
+    const matching = (config.browserProfiles ?? []).find((p) =>
+      isPrimary ? p.id === "default" || p.nodeId === node.id : p.nodeId === node.id,
+    );
+    const portReady = isPrimary
+      ? gatewayReady
+      : !!status?.running && status?.secondaryNodePorts?.[node.id] !== undefined;
+
+    if (matching && portReady && status?.browserInstalled) {
+      await handleLaunchBrowserProfile(matching.id);
+      return;
+    }
+    if (!matching) {
+      setPreselectedBrowserNode({ nodeId: node.id, nonce: Date.now() });
+    } else if (!status?.running) {
+      notify("请先点击右上角或总览中的「启动网关」，即可用该环境启动浏览器");
+    } else if (!portReady) {
+      notify("该节点本地端口尚未激活，请在「指纹浏览器」点击重启激活后启动");
+    }
+    switchTab("browsers");
+  };
+
   const handleOpenAllAudits = async () => {
     try {
       await api.launchBrowserUrl("https://ip.net.coffee/");
@@ -755,6 +847,16 @@ export default function App() {
 
   const activeNode = config?.nodes.find((n) => n.id === config.activeNodeId);
   const gatewayReady = !!status?.running && !status?.blockedByKillSwitch && !busy;
+  const browserProfiles = config?.browserProfiles ?? [];
+  const selectedQuickProfileId = browserProfiles.some((p) => p.id === quickProfileId)
+    ? quickProfileId
+    : browserProfiles[0]?.id || "default";
+  const dirtyInheritedEnvApps = (appEnv?.apps ?? []).filter(
+    (a) =>
+      a.health === "dead_proxy" ||
+      (a.health === "mismatch" &&
+        a.envVars.some((v) => !v.key.toUpperCase().includes("NO_PROXY"))),
+  );
 
   const diagnosticItems: DiagnosticCheck[] = useMemo(() => {
     if (checks.length > 0) return checks;
@@ -858,6 +960,11 @@ export default function App() {
                           aria-hidden="true"
                         />
                         <span className="truncate">{item.label}</span>
+                        {item.key === "browsers" && (status?.runningBrowserProfiles?.length ?? 0) > 0 && (
+                          <span className="mono-num ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[#16a34a] px-1 text-[0.65rem] font-semibold text-white">
+                            {status?.runningBrowserProfiles?.length}
+                          </span>
+                        )}
                         {item.key === "apps" && (appEnv?.pollutedCount ?? 0) > 0 && (
                           <span className="mono-num ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[#dc2626] px-1 text-[0.65rem] font-semibold text-white">
                             {appEnv?.pollutedCount}
@@ -960,9 +1067,11 @@ export default function App() {
                   <AlertTriangle className="h-4 w-4 shrink-0 text-[#dc2626]" aria-hidden="true" />
                   <span className="font-medium">
                     检测到 {appEnv?.pollutedCount} 个运行中的 AI 进程存在失效或冲突代理环境
-                    {appEnv?.systemProxy.enabled && appEnv.systemProxy.alive
+                    {dirtyInheritedEnvApps.length > 0 &&
+                    appEnv?.systemProxy.enabled &&
+                    appEnv.systemProxy.alive
                       ? `（系统代理 ${appEnv.systemProxy.hostPort || ""} 实际正常，属于继承脏环境变量）`
-                      : ""}
+                      : "（运行环境与所选代理策略不一致）"}
                   </span>
                 </div>
                 <Button
@@ -1234,17 +1343,58 @@ export default function App() {
                               安装 (~200MB)
                             </Button>
                           ) : (
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              disabled={!gatewayReady}
-                              onClick={() => handleOpenInSafeBrowser("https://claude.ai")}
-                            >
-                              <ExternalLink className="h-3.5 w-3.5 text-[#7c8495]" aria-hidden="true" />
-                              打开
-                            </Button>
+                            <div className="flex shrink-0 items-center gap-1.5">
+                              <Button
+                                variant="ghost"
+                                size="xs"
+                                onClick={() => switchTab("browsers")}
+                              >
+                                多环境
+                              </Button>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={!gatewayReady}
+                                onClick={() => handleOpenInSafeBrowser("https://claude.ai")}
+                              >
+                                <ExternalLink className="h-3.5 w-3.5 text-[#7c8495]" aria-hidden="true" />
+                                打开
+                              </Button>
+                            </div>
                           )}
                         </div>
+                        {status?.browserInstalled && browserProfiles.length > 1 && (
+                          <div className="flex items-center gap-1.5 pl-9">
+                            <label htmlFor={fid("dashQuickBp")} className="visually-hidden">
+                              快速启动独立指纹浏览器环境
+                            </label>
+                            <select
+                              id={fid("dashQuickBp")}
+                              value={selectedQuickProfileId}
+                              onChange={(e) => setQuickProfileId(e.target.value)}
+                              className="h-7 min-w-0 flex-1 rounded-md border border-[#dce0e6] bg-[#f8f9fb] px-2 text-[0.7rem] text-[#111827] cursor-pointer"
+                            >
+                              {browserProfiles.map((bp) => {
+                                const nid = bp.nodeId || config?.activeNodeId;
+                                const nodeName =
+                                  config?.nodes.find((n) => n.id === nid)?.name || "主出口";
+                                return (
+                                  <option key={bp.id} value={bp.id}>
+                                    {bp.name} ({nodeName})
+                                  </option>
+                                );
+                              })}
+                            </select>
+                            <Button
+                              variant="soft"
+                              size="xs"
+                              disabled={!status?.running || busy}
+                              onClick={() => void handleLaunchBrowserProfile(selectedQuickProfileId)}
+                            >
+                              启动
+                            </Button>
+                          </div>
+                        )}
                         {dlProgress && dlProgress.stage !== "done" && (
                           <div className="flex flex-col gap-1 pl-9">
                             <progress
@@ -1765,6 +1915,23 @@ export default function App() {
               </div>
             )}
 
+            {/* ======================= VIEW 01A: FINGERPRINT BROWSERS ======================= */}
+            {tab === "browsers" && config && (
+              <BrowserProfilesView
+                config={config}
+                status={status}
+                gatewayReady={gatewayReady}
+                preselectedNodeRequest={preselectedBrowserNode}
+                onSaveProfiles={handleSaveBrowserProfiles}
+                onLaunchProfile={handleLaunchBrowserProfile}
+                onCloseProfile={handleCloseBrowserProfile}
+                onProbeNodeExit={(nodeId) => api.probeNodeExit(nodeId)}
+                onInstallBrowser={handleInstallBrowser}
+                onRestartGateway={handleRestartGateway}
+                onNotify={notify}
+              />
+            )}
+
             {/* ======================= VIEW 01B: AI APPS & LAUNCH ENV ======================= */}
             {tab === "apps" && config && (
               <AppsEnvView
@@ -1813,12 +1980,14 @@ export default function App() {
               <NodeEditor
                 config={config}
                 dirty={dirty}
+                secondaryNodePorts={status?.secondaryNodePorts}
                 onUpdateConfig={(next) => {
                   setConfig(next);
                   setDirty(true);
                 }}
                 onSave={() => handleSaveConfig()}
                 onNotify={notify}
+                onQuickLaunchNodeBrowser={handleQuickLaunchNodeBrowser}
               />
             )}
 

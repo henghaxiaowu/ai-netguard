@@ -154,6 +154,127 @@ pub struct NodeProfile {
     pub timezone: Option<String>,
     #[serde(default)]
     pub locale: Option<String>,
+    #[serde(default)]
+    pub outbound_mode: Option<OutboundMode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserFingerprintMode {
+    #[default]
+    CleanAlign,
+    IsolatedFingerprint,
+}
+
+fn default_screen_width() -> u32 {
+    1920
+}
+fn default_screen_height() -> u32 {
+    1080
+}
+fn default_dpr() -> f64 {
+    1.0
+}
+fn default_hw_concurrency() -> u32 {
+    8
+}
+fn default_device_mem() -> u32 {
+    8
+}
+fn default_webgl_vendor() -> String {
+    "Google Inc. (NVIDIA)".into()
+}
+fn default_webgl_renderer() -> String {
+    "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)".into()
+}
+fn default_noise_seed() -> String {
+    "ng-default-seed".into()
+}
+pub fn default_browser_homepage() -> String {
+    "https://claude.ai".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserFingerprintConfig {
+    #[serde(default)]
+    pub timezone: Option<String>,
+    #[serde(default)]
+    pub locale: Option<String>,
+    #[serde(default = "default_screen_width")]
+    pub screen_width: u32,
+    #[serde(default = "default_screen_height")]
+    pub screen_height: u32,
+    #[serde(default = "default_dpr")]
+    pub device_pixel_ratio: f64,
+    #[serde(default = "default_hw_concurrency")]
+    pub hardware_concurrency: u32,
+    #[serde(default = "default_device_mem")]
+    pub device_memory: u32,
+    #[serde(default = "default_webgl_vendor")]
+    pub webgl_vendor: String,
+    #[serde(default = "default_webgl_renderer")]
+    pub webgl_renderer: String,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    #[serde(default = "default_noise_seed")]
+    pub noise_seed: String,
+}
+
+impl Default for BrowserFingerprintConfig {
+    fn default() -> Self {
+        Self {
+            timezone: None,
+            locale: None,
+            screen_width: default_screen_width(),
+            screen_height: default_screen_height(),
+            device_pixel_ratio: default_dpr(),
+            hardware_concurrency: default_hw_concurrency(),
+            device_memory: default_device_mem(),
+            webgl_vendor: default_webgl_vendor(),
+            webgl_renderer: default_webgl_renderer(),
+            user_agent: None,
+            noise_seed: default_noise_seed(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserProfile {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub builtin: bool,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    #[serde(default = "default_browser_homepage")]
+    pub homepage: String,
+    #[serde(default)]
+    pub fingerprint_mode: BrowserFingerprintMode,
+    #[serde(default)]
+    pub fingerprint: BrowserFingerprintConfig,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+pub fn default_browser_profiles() -> Vec<BrowserProfile> {
+    vec![BrowserProfile {
+        id: "default".into(),
+        name: "默认安全浏览器 (主出口)".into(),
+        builtin: true,
+        node_id: None,
+        homepage: default_browser_homepage(),
+        fingerprint_mode: BrowserFingerprintMode::CleanAlign,
+        fingerprint: BrowserFingerprintConfig::default(),
+        notes: Some("默认跟随活跃主出口节点，使用纯净时区与语言对齐（对 Claude / hCaptcha 最安全）".into()),
+    }]
+}
+
+pub fn effective_outbound_mode(cfg: &AppConfig, node: &NodeProfile) -> OutboundMode {
+    node.outbound_mode
+        .clone()
+        .unwrap_or_else(|| cfg.outbound_mode.clone())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +321,8 @@ pub struct AppConfig {
     pub ai_domains: Vec<String>,
     #[serde(default = "default_managed_apps")]
     pub managed_apps: Vec<ManagedAppConfig>,
+    #[serde(default = "default_browser_profiles")]
+    pub browser_profiles: Vec<BrowserProfile>,
 }
 
 impl Default for AppConfig {
@@ -230,6 +353,7 @@ impl Default for AppConfig {
                 expected_country: Some("KR".into()),
                 timezone: Some("Asia/Seoul".into()),
                 locale: Some("ko-KR".into()),
+                outbound_mode: None,
             }],
             outbound_mode: OutboundMode::PhysicalBypass,
             physical_interface_name: None,
@@ -268,6 +392,7 @@ impl Default for AppConfig {
                 "fuck-claude.vercel.app".into(),
             ],
             managed_apps: default_managed_apps(),
+            browser_profiles: default_browser_profiles(),
         }
     }
 }
@@ -344,6 +469,10 @@ pub struct GatewayStatus {
     pub detected_conflicts: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_ip: Option<ExitIpInfo>,
+    #[serde(default)]
+    pub running_browser_profiles: Vec<String>,
+    #[serde(default)]
+    pub secondary_node_ports: std::collections::BTreeMap<String, u16>,
     pub logs: Vec<String>,
 }
 

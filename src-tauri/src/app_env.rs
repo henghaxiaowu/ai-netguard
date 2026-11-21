@@ -796,6 +796,19 @@ fn classify_app_health(
                 .custom_proxy_url
                 .as_deref()
                 .and_then(extract_proxy_host_port);
+            if active_proxies.is_empty() && sys_proxy.enabled && sys_proxy.alive {
+                if let (Some(exp), Some(sys_hp)) = (expected_hp.as_deref(), sys_proxy.host_port.as_deref()) {
+                    if exp == sys_hp {
+                        return (
+                            "clean".into(),
+                            format!(
+                                "运行正常：进程环境干净，正通过在线系统代理 ({sys_hp}) 访问自定义目标"
+                            ),
+                            false,
+                        );
+                    }
+                }
+            }
             let matches = expected_hp.as_deref().is_some_and(|exp| {
                 active_proxies
                     .iter()
@@ -1440,5 +1453,33 @@ mod tests {
             classify_app_health(&app, true, &env_vars, &cfg, true, &sys);
         assert_eq!(health, "clean");
         assert!(!needs_relaunch);
+    }
+
+    #[test]
+    fn classify_treats_clean_env_matching_live_system_proxy_as_clean_in_custom_proxy_mode() {
+        let cfg = AppConfig::default();
+        let app = ManagedAppConfig {
+            id: "antigravity".into(),
+            name: "Antigravity".into(),
+            builtin: true,
+            exe_path: None,
+            process_names: vec!["Antigravity.exe".into()],
+            proxy_mode: AppProxyMode::CustomProxy,
+            custom_proxy_url: Some("http://127.0.0.1:7897".into()),
+            wfp_lock: false,
+            extra_args: Vec::new(),
+        };
+        let sys = SystemProxyStatus {
+            enabled: true,
+            server: Some("127.0.0.1:7897".into()),
+            host_port: Some("127.0.0.1:7897".into()),
+            alive: true,
+            auto_config_url: None,
+        };
+        let (health, diag, needs_relaunch) =
+            classify_app_health(&app, true, &[], &cfg, true, &sys);
+        assert_eq!(health, "clean");
+        assert!(!needs_relaunch);
+        assert!(diag.contains("127.0.0.1:7897"));
     }
 }
