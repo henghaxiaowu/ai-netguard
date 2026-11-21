@@ -52,6 +52,8 @@ export const api = {
     invoke<AccountEnvPreset[]>("save_account_environments", { presets }),
   listClashVergeNodes: () =>
     invoke<ClashVergeNodesSnapshot>("list_clash_verge_nodes"),
+  reorderAccounts: (orderedIds: string[]) =>
+    invoke<AccountRecord[]>("reorder_accounts", { orderedIds }),
   connectGuard: () => invoke<GatewayStatus>("connect_guard"),
   clearLogs: () => invoke<void>("clear_logs"),
   generateVpsScript: (protocol: "vless-reality" | "hysteria2", port: number) =>

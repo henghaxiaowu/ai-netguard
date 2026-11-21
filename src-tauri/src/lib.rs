@@ -11,8 +11,8 @@ mod uri_parser;
 
 use accounts::{
     default_env_presets, discover_clash_verge_nodes, load_accounts, load_env_presets,
-    normalize_account, normalize_env_presets, save_accounts, save_env_presets, AccountEnvPreset,
-    AccountRecord, ClashVergeNodesSnapshot,
+    normalize_account, normalize_env_presets, reorder_account_list, save_accounts,
+    save_env_presets, AccountEnvPreset, AccountRecord, ClashVergeNodesSnapshot,
 };
 
 use guard_protocol::{GuardRequest, ProtectedTarget};
@@ -951,6 +951,21 @@ fn list_clash_verge_nodes() -> ClashVergeNodesSnapshot {
     discover_clash_verge_nodes()
 }
 
+#[tauri::command]
+fn reorder_accounts(
+    state: State<'_, Arc<AppState>>,
+    ordered_ids: Vec<String>,
+) -> Result<Vec<AccountRecord>, String> {
+    let mut guard = state
+        .accounts
+        .lock()
+        .map_err(|_| "账号库状态锁定失败".to_string())?;
+    let next = reorder_account_list(&guard, &ordered_ids);
+    save_accounts(&next)?;
+    *guard = next.clone();
+    Ok(next)
+}
+
 fn check_node_expectation(node: &NodeProfile, exit: &ExitIpInfo) -> Option<String> {
     if let Some(exp_ip) = node.expected_ip.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         if exp_ip != exit.ip {
@@ -1265,6 +1280,7 @@ pub fn run() {
             list_account_environments,
             save_account_environments,
             list_clash_verge_nodes,
+            reorder_accounts,
             clear_logs,
         ])
         .run(tauri::generate_context!())

@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Check,
@@ -9,6 +9,7 @@ import {
   Eye,
   EyeOff,
   FileUp,
+  GripVertical,
   KeyRound,
   Layers,
   Pencil,
@@ -54,6 +55,7 @@ interface AccountsViewProps {
   onImport: (records: AccountRecord[], replace: boolean) => Promise<void>;
   onSaveEnvPresets: (presets: AccountEnvPreset[]) => Promise<void>;
   onRefreshClashNodes: () => Promise<void>;
+  onReorder: (orderedIds: string[]) => Promise<void>;
   onNotify: (msg: string) => void;
 }
 
@@ -314,6 +316,7 @@ export function AccountsView({
   onImport,
   onSaveEnvPresets,
   onRefreshClashNodes,
+  onReorder,
   onNotify,
 }: AccountsViewProps) {
   const uid = useId();
@@ -341,12 +344,25 @@ export function AccountsView({
   const [clashSearch, setClashSearch] = useState("");
 
   const [confirmTarget, setConfirmTarget] = useState<ConfirmTarget | null>(null);
+  const [reorderAnnouncement, setReorderAnnouncement] = useState("");
 
   const editorDialogRef = useRef<HTMLDialogElement>(null);
   const confirmDialogRef = useRef<HTMLDialogElement>(null);
   const emailInputRef = useRef<HTMLInputElement>(null);
   const confirmCancelRef = useRef<HTMLButtonElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const activeCleanupRef = useRef<(() => void) | null>(null);
+  const pendingFlipRef = useRef<{
+    rects: Map<string, DOMRect>;
+    scrollItemId?: string;
+    focusTarget?: {
+      id: string;
+      dir: "up" | "down";
+      nextIndex: number;
+      total: number;
+    };
+  } | null>(null);
 
   const hasTotpTargets = useMemo(
     () => editorOpen || accounts.some((a) => Boolean(a.totpSecret?.trim())),
@@ -366,8 +382,82 @@ export function AccountsView({
     return () => {
       cleanEditor();
       cleanConfirm();
+      activeCleanupRef.current?.();
     };
   }, []);
+
+  const isFiltered = Boolean(
+    search.trim() || envFilter !== "__all__" || statusFilter !== "all",
+  );
+  const reorderDisabled = isFiltered || accounts.length < 2;
+
+  const captureRowRects = (overrideDrag?: { id: string; rect: DOMRect }) => {
+    const map = new Map<string, DOMRect>();
+    const listEl = listRef.current;
+    if (!listEl) return map;
+    for (const row of listEl.querySelectorAll<HTMLElement>("[data-account-id]")) {
+      const id = row.dataset.accountId;
+      if (!id) continue;
+      if (overrideDrag && overrideDrag.id === id) {
+        map.set(id, overrideDrag.rect);
+        continue;
+      }
+      for (const anim of row.getAnimations()) {
+        anim.finish();
+      }
+      map.set(id, row.getBoundingClientRect());
+    }
+    return map;
+  };
+
+  useLayoutEffect(() => {
+    const pending = pendingFlipRef.current;
+    if (!pending) return;
+    pendingFlipRef.current = null;
+    const listEl = listRef.current;
+    if (!listEl) return;
+
+    if (pending.scrollItemId) {
+      const targetRow = Array.from(
+        listEl.querySelectorAll<HTMLElement>("[data-account-id]"),
+      ).find((el) => el.dataset.accountId === pending.scrollItemId);
+      targetRow?.scrollIntoView({ block: "nearest", inline: "nearest" });
+
+      if (pending.focusTarget && targetRow) {
+        const { dir, nextIndex, total } = pending.focusTarget;
+        const nextBtnDir =
+          dir === "up" && nextIndex === 0
+            ? "down"
+            : dir === "down" && nextIndex === total - 1
+              ? "up"
+              : dir;
+        const btn = targetRow.querySelector<HTMLButtonElement>(
+          `button[data-move="${nextBtnDir}"]`,
+        );
+        btn?.focus({ preventScroll: true });
+      }
+    }
+
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      return;
+    }
+
+    for (const row of listEl.querySelectorAll<HTMLElement>("[data-account-id]")) {
+      const id = row.dataset.accountId;
+      if (!id) continue;
+      const oldRect = pending.rects.get(id);
+      if (!oldRect) continue;
+      const newRect = row.getBoundingClientRect();
+      const dx = oldRect.left - newRect.left;
+      const dy = oldRect.top - newRect.top;
+      if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
+        row.animate(
+          [{ translate: `${dx}px ${dy}px` }, { translate: "0px 0px" }],
+          { duration: 190, easing: "cubic-bezier(0.22, 1, 0.36, 1)" },
+        );
+      }
+    }
+  }, [accounts]);
 
   const nodeById = useMemo(() => {
     const map = new Map<string, NodeProfile>();
@@ -828,6 +918,268 @@ export function AccountsView({
     setExpandedIds((prev) => ({ ...prev, [id]: !prev[id] }));
   };
 
+  const handleMoveAccount = (index: number, delta: -1 | 1) => {
+    if (reorderDisabled) return;
+    const targetIndex = index + delta;
+    if (targetIndex < 0 || targetIndex >= accounts.length) return;
+    const moved = accounts[index];
+    const rects = captureRowRects();
+    const nextIds = accounts.map((a) => a.id);
+    const [removed] = nextIds.splice(index, 1);
+    nextIds.splice(targetIndex, 0, removed);
+
+    const dir = delta < 0 ? "up" : "down";
+    pendingFlipRef.current = {
+      rects,
+      scrollItemId: moved.id,
+      focusTarget: {
+        id: moved.id,
+        dir,
+        nextIndex: targetIndex,
+        total: nextIds.length,
+      },
+    };
+    void onReorder(nextIds);
+    setReorderAnnouncement(
+      `已将「${moved.label || moved.email}」${dir === "up" ? "上移" : "下移"}至第 ${targetIndex + 1} 位，共 ${nextIds.length} 项`,
+    );
+  };
+
+  const handleDragPointerDown = (
+    e: React.PointerEvent<HTMLButtonElement>,
+    accountId: string,
+    sourceIndex: number,
+  ) => {
+    if (e.button !== 0 || reorderDisabled) return;
+    if (activeCleanupRef.current) return;
+
+    const handleEl = e.currentTarget;
+    const itemEl = handleEl.closest<HTMLElement>("[data-account-id]");
+    const listEl = listRef.current;
+    if (!itemEl || !listEl) return;
+
+    e.preventDefault();
+    const pointerId = e.pointerId;
+    const scrollEl = listEl.closest("main") as HTMLElement | null;
+    const startY = e.clientY;
+    const startScrollTop = scrollEl?.scrollTop ?? 0;
+    const itemHeight = itemEl.offsetHeight;
+    let lastY = e.clientY;
+    let currentDropIndex = sourceIndex;
+    let rafId = 0;
+    let lastFrameTime = performance.now();
+    let ended = false;
+
+    const getRows = () =>
+      Array.from(listEl.children).filter(
+        (el): el is HTMLElement =>
+          el instanceof HTMLElement && Boolean(el.dataset.accountId),
+      );
+
+    const clearDropMarker = () => {
+      listEl.removeAttribute("data-drop");
+      listEl.style.removeProperty("--drop-x");
+      listEl.style.removeProperty("--drop-y");
+      listEl.style.removeProperty("--drop-w");
+    };
+
+    const updateDragAndDropSpot = (clientY: number) => {
+      lastY = clientY;
+      const scrollDelta = (scrollEl?.scrollTop ?? 0) - startScrollTop;
+      const dy = clientY - startY + scrollDelta;
+      itemEl.style.translate = `0px ${dy}px`;
+
+      const rows = getRows();
+      if (rows.length === 0) return;
+
+      const listRect = listEl.getBoundingClientRect();
+      const scrollRect = scrollEl ? scrollEl.getBoundingClientRect() : null;
+      const clampedClientY = scrollRect
+        ? Math.max(scrollRect.top, Math.min(scrollRect.bottom, clientY))
+        : clientY;
+      const pointerInList = clampedClientY - listRect.top - listEl.clientTop;
+
+      let dropIdx = rows.length;
+      for (let i = 0; i < rows.length; i += 1) {
+        const mid = rows[i].offsetTop + rows[i].offsetHeight / 2;
+        if (pointerInList < mid) {
+          dropIdx = i;
+          break;
+        }
+      }
+      currentDropIndex = dropIdx;
+
+      if (dropIdx === sourceIndex || dropIdx === sourceIndex + 1) {
+        clearDropMarker();
+        return;
+      }
+
+      let dropY: number;
+      if (dropIdx <= 0) {
+        dropY = rows[0].getBoundingClientRect().top;
+      } else if (dropIdx >= rows.length) {
+        dropY = rows[rows.length - 1].getBoundingClientRect().bottom;
+      } else {
+        const prevR = rows[dropIdx - 1].getBoundingClientRect();
+        const nextR = rows[dropIdx].getBoundingClientRect();
+        dropY = (prevR.bottom + nextR.top) / 2;
+      }
+      const refRect = rows[0].getBoundingClientRect();
+      listEl.style.setProperty("--drop-x", `${refRect.left + 12}px`);
+      listEl.style.setProperty("--drop-y", `${dropY}px`);
+      listEl.style.setProperty("--drop-w", `${Math.max(0, refRect.width - 24)}px`);
+      listEl.setAttribute("data-drop", "true");
+    };
+
+    const cleanup = () => {
+      if (ended) return;
+      ended = true;
+      if (rafId) {
+        window.cancelAnimationFrame(rafId);
+        rafId = 0;
+      }
+      window.removeEventListener("keydown", onKeyDown, true);
+      handleEl.removeEventListener("pointermove", onPointerMove);
+      handleEl.removeEventListener("pointerup", onPointerUp);
+      handleEl.removeEventListener("pointercancel", onPointerCancel);
+      handleEl.removeEventListener("lostpointercapture", onLostCapture);
+      document.documentElement.classList.remove("ng-dragging-reorder");
+      itemEl.removeAttribute("data-dragging");
+      clearDropMarker();
+      if (handleEl.hasPointerCapture(pointerId)) {
+        try {
+          handleEl.releasePointerCapture(pointerId);
+        } catch {
+          // Ignore if capture already released
+        }
+      }
+      activeCleanupRef.current = null;
+    };
+
+    const cancelDrag = (animateBack: boolean, announceCancel: boolean) => {
+      const releasedRect = itemEl.getBoundingClientRect();
+      cleanup();
+      itemEl.style.translate = "";
+      if (announceCancel) {
+        itemEl.scrollIntoView({ block: "nearest", inline: "nearest" });
+        setReorderAnnouncement("已取消调整账号顺序");
+      }
+      if (
+        animateBack &&
+        !window.matchMedia("(prefers-reduced-motion: reduce)").matches
+      ) {
+        const finalRect = itemEl.getBoundingClientRect();
+        const dx = releasedRect.left - finalRect.left;
+        const dy = releasedRect.top - finalRect.top;
+        if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
+          itemEl.animate(
+            [{ translate: `${dx}px ${dy}px` }, { translate: "0px 0px" }],
+            { duration: 180, easing: "cubic-bezier(0.22, 1, 0.36, 1)" },
+          );
+        }
+      }
+    };
+
+    const onPointerMove = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId || ended) return;
+      updateDragAndDropSpot(ev.clientY);
+    };
+
+    const onPointerUp = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId || ended) return;
+      const isNoOp =
+        currentDropIndex === sourceIndex || currentDropIndex === sourceIndex + 1;
+      if (isNoOp) {
+        cancelDrag(true, false);
+        return;
+      }
+      for (const anim of itemEl.getAnimations()) {
+        anim.finish();
+      }
+      const releasedRect = itemEl.getBoundingClientRect();
+      cleanup();
+      itemEl.style.translate = "";
+
+      const rects = captureRowRects({ id: accountId, rect: releasedRect });
+      const nextIds = accounts.map((a) => a.id);
+      const targetIndex =
+        currentDropIndex > sourceIndex ? currentDropIndex - 1 : currentDropIndex;
+      const [removed] = nextIds.splice(sourceIndex, 1);
+      nextIds.splice(targetIndex, 0, removed);
+
+      const movedAcc = accounts[sourceIndex];
+      pendingFlipRef.current = { rects, scrollItemId: accountId };
+      void onReorder(nextIds);
+      if (movedAcc) {
+        setReorderAnnouncement(
+          `已将「${movedAcc.label || movedAcc.email}」移至第 ${targetIndex + 1} 位，共 ${nextIds.length} 项`,
+        );
+      }
+    };
+
+    const onPointerCancel = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId || ended) return;
+      cancelDrag(true, false);
+    };
+
+    const onLostCapture = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId || ended) return;
+      cancelDrag(true, false);
+    };
+
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape" && !ended) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        cancelDrag(true, true);
+      }
+    };
+
+    const tickAutoScroll = (now: number) => {
+      if (ended) return;
+      const dt = Math.max(8, Math.min(50, now - lastFrameTime));
+      lastFrameTime = now;
+
+      if (scrollEl && scrollEl.scrollHeight > scrollEl.clientHeight) {
+        const sr = scrollEl.getBoundingClientRect();
+        const zone = Math.min(itemHeight, scrollEl.clientHeight / 3);
+        let velocity = 0;
+        if (lastY < sr.top + zone) {
+          const ratio = Math.min(1.5, (sr.top + zone - lastY) / Math.max(1, zone));
+          velocity = -720 * ratio;
+        } else if (lastY > sr.bottom - zone) {
+          const ratio = Math.min(1.5, (lastY - (sr.bottom - zone)) / Math.max(1, zone));
+          velocity = 720 * ratio;
+        }
+        if (velocity !== 0) {
+          const prevScroll = scrollEl.scrollTop;
+          scrollEl.scrollTop += (velocity * dt) / 1000;
+          if (scrollEl.scrollTop !== prevScroll) {
+            updateDragAndDropSpot(lastY);
+          }
+        }
+      }
+      rafId = window.requestAnimationFrame(tickAutoScroll);
+    };
+
+    document.documentElement.classList.add("ng-dragging-reorder");
+    itemEl.setAttribute("data-dragging", "true");
+    try {
+      handleEl.setPointerCapture(pointerId);
+    } catch {
+      // Ignore if synthetic event lacks active pointer
+    }
+
+    activeCleanupRef.current = cleanup;
+    window.addEventListener("keydown", onKeyDown, true);
+    handleEl.addEventListener("pointermove", onPointerMove);
+    handleEl.addEventListener("pointerup", onPointerUp);
+    handleEl.addEventListener("pointercancel", onPointerCancel);
+    handleEl.addEventListener("lostpointercapture", onLostCapture);
+    updateDragAndDropSpot(e.clientY);
+    rafId = window.requestAnimationFrame(tickAutoScroll);
+  };
+
   return (
     <div className="bento-sheet flex flex-col divide-y divide-[#eaecef] rounded-2xl border border-[#eaecef] bg-white shadow-[0_1px_3px_rgba(15,23,42,0.03)]">
       {/* Header */}
@@ -1028,14 +1380,38 @@ export function AccountsView({
             })}
           </div>
 
-          <span className="mono-num text-[0.71rem] text-[#7c8495]">
-            显示 {filteredAccounts.length} / {accounts.length} 条
-          </span>
+          <div className="flex items-center gap-2">
+            {isFiltered && accounts.length > 1 && (
+              <span className="rounded-md border border-[#eaecef] bg-white px-2 py-0.5 text-[0.68rem] text-[#7c8495]">
+                筛选中已暂停拖拽调序
+              </span>
+            )}
+            <span className="mono-num text-[0.71rem] text-[#7c8495]">
+              显示 {filteredAccounts.length} / {accounts.length} 条
+            </span>
+          </div>
         </div>
       </section>
 
+      <p role="status" className="visually-hidden">
+        {reorderAnnouncement}
+      </p>
+
+      {/* Fixed Column Header Strip */}
+      {filteredAccounts.length > 0 && (
+        <div
+          aria-hidden="true"
+          className="grid grid-cols-[2rem_minmax(0,1.25fr)_minmax(0,1fr)_12.5rem] items-center gap-3 border-b border-[#eaecef] bg-[#f9fafb] px-5 py-2 text-[0.7rem] font-medium text-[#7c8495]"
+        >
+          <span className="text-center">排序</span>
+          <span>账号与用途</span>
+          <span>启动环境与节点</span>
+          <span>密码与 2FA</span>
+        </div>
+      )}
+
       {/* Accounts List */}
-      <section className="flex flex-col divide-y divide-[#eaecef]">
+      <section className="flex flex-col">
         {accounts.length === 0 ? (
           <div className="flex flex-col items-center justify-center gap-3 px-6 py-12 text-center">
             <span className="inline-grid h-11 w-11 place-items-center rounded-2xl bg-[#f0edfc] text-[#6d5bd0]">
@@ -1082,221 +1458,354 @@ export function AccountsView({
             </Button>
           </div>
         ) : (
-          filteredAccounts.map((acc) => {
-            const avatar = providerAvatar(acc.provider);
-            const statusMeta = STATUS_META[acc.status] || STATUS_META.active;
-            const envType = normalizeEnvType(acc.envType);
-            const envMeta = ENV_TYPE_META[envType];
-            const envNameTrimmed = acc.environmentName.trim();
-            const envProfileTrimmed = acc.environmentProfile?.trim() || "";
-            const nodeDisplay = resolveAccountNodeDisplay(acc, nodeById);
-            const isExpanded = Boolean(expandedIds[acc.id]);
-            const isPassShown = Boolean(revealedPasswords[acc.id]);
-            const isSecretShown = Boolean(revealedSecrets[acc.id]);
-            const rawSecret = acc.totpSecret?.trim() || "";
-            const totp = rawSecret ? generateTotp(rawSecret, nowMs) : null;
-            const isBanned = acc.status === "banned";
-            const isRestricted = acc.status === "restricted";
+          <div ref={listRef} className="ng-account-list flex flex-col divide-y divide-[#eaecef]">
+            {filteredAccounts.map((acc, rowIndex) => {
+              const avatar = providerAvatar(acc.provider);
+              const statusMeta = STATUS_META[acc.status] || STATUS_META.active;
+              const envType = normalizeEnvType(acc.envType);
+              const envMeta = ENV_TYPE_META[envType];
+              const envNameTrimmed = acc.environmentName.trim();
+              const envProfileTrimmed = acc.environmentProfile?.trim() || "";
+              const nodeDisplay = resolveAccountNodeDisplay(acc, nodeById);
+              const isExpanded = Boolean(expandedIds[acc.id]);
+              const isPassShown = Boolean(revealedPasswords[acc.id]);
+              const isSecretShown = Boolean(revealedSecrets[acc.id]);
+              const rawSecret = acc.totpSecret?.trim() || "";
+              const totp = rawSecret ? generateTotp(rawSecret, nowMs) : null;
+              const isBanned = acc.status === "banned";
+              const isRestricted = acc.status === "restricted";
+              const titleText = acc.label.trim() || acc.email;
+              const visibleTags = acc.tags.slice(0, 2);
+              const extraTagCount = acc.tags.length - visibleTags.length;
 
-            return (
-              <article
-                key={acc.id}
-                className={`flex flex-col gap-3 px-6 py-4 transition-colors ${
-                  isBanned
-                    ? "bg-[#fef2f2]/35"
-                    : isRestricted
-                      ? "bg-[#fffbeb]/35"
-                      : "hover:bg-[#fafbfc]/70"
-                }`}
-              >
-                <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-                  {/* Left: Identity + Environment + Purpose */}
-                  <div className="flex min-w-0 flex-1 items-start gap-3">
-                    <span
-                      className={`mt-0.5 inline-grid h-8 w-8 shrink-0 place-items-center rounded-xl border text-[0.76rem] font-bold ${avatar.classes}`}
-                      aria-hidden="true"
+              return (
+                <article
+                  key={acc.id}
+                  data-account-id={acc.id}
+                  className={`ng-account-row grid grid-cols-[2rem_minmax(0,1fr)] items-start gap-3 px-5 py-3.5 transition-colors ${
+                    isBanned
+                      ? "bg-[#fef2f2]/35"
+                      : isRestricted
+                        ? "bg-[#fffbeb]/35"
+                        : "hover:bg-[#fafbfc]/70"
+                  }`}
+                >
+                  {/* Left Sort Rail */}
+                  <div className="flex w-8 shrink-0 flex-col items-center gap-0.5 pt-0.5">
+                    <button
+                      type="button"
+                      className="ng-drag-handle inline-grid h-6 w-7 place-items-center rounded-md text-[#7c8495] transition-colors disabled:opacity-35"
+                      disabled={reorderDisabled}
+                      aria-label={`拖动调整 ${titleText} 的顺序`}
+                      title={
+                        isFiltered
+                          ? "清空搜索和筛选条件后即可拖拽排序"
+                          : "按住上下拖动调整顺序（Esc 取消）"
+                      }
+                      onPointerDown={(e) =>
+                        handleDragPointerDown(e, acc.id, rowIndex)
+                      }
                     >
-                      {avatar.code}
-                    </span>
+                      <GripVertical className="h-3.5 w-3.5" aria-hidden="true" />
+                    </button>
+                    <button
+                      type="button"
+                      data-move="up"
+                      disabled={reorderDisabled || rowIndex === 0}
+                      onClick={() => handleMoveAccount(rowIndex, -1)}
+                      aria-label={`上移 ${titleText}`}
+                      title="上移一位"
+                      className="inline-grid h-5 w-7 place-items-center rounded text-[#7c8495] transition-colors hover:bg-[#f3f4f6] hover:text-[#111827] disabled:pointer-events-none disabled:opacity-30 cursor-pointer"
+                    >
+                      <ChevronUp className="h-3 w-3" aria-hidden="true" />
+                    </button>
+                    <button
+                      type="button"
+                      data-move="down"
+                      disabled={
+                        reorderDisabled || rowIndex === filteredAccounts.length - 1
+                      }
+                      onClick={() => handleMoveAccount(rowIndex, 1)}
+                      aria-label={`下移 ${titleText}`}
+                      title="下移一位"
+                      className="inline-grid h-5 w-7 place-items-center rounded text-[#7c8495] transition-colors hover:bg-[#f3f4f6] hover:text-[#111827] disabled:pointer-events-none disabled:opacity-30 cursor-pointer"
+                    >
+                      <ChevronDown className="h-3 w-3" aria-hidden="true" />
+                    </button>
+                  </div>
 
-                    <div className="min-w-0 flex-1 space-y-1">
-                      <div className="flex flex-wrap items-center gap-1.5">
+                  {/* Right Fixed Content */}
+                  <div className="flex min-w-0 flex-col gap-2">
+                    {/* Band 1: Fixed 1-Line Identity + Row Actions */}
+                    <div className="flex h-7 items-center justify-between gap-2">
+                      <div className="flex min-w-0 flex-1 items-center gap-2">
                         <span
-                          className={`truncate text-[0.88rem] font-semibold ${
+                          className={`inline-grid h-6 w-6 shrink-0 place-items-center rounded-lg border text-[0.69rem] font-bold ${avatar.classes}`}
+                          aria-hidden="true"
+                        >
+                          {avatar.code}
+                        </span>
+                        <span
+                          title={titleText}
+                          className={`min-w-0 truncate text-[0.86rem] font-semibold ${
                             isBanned
                               ? "text-[#7c8495] line-through"
                               : "text-[#111827]"
                           }`}
                         >
-                          {acc.label || acc.email}
+                          {titleText}
                         </span>
-                        <Badge variant={statusMeta.variant}>{statusMeta.label}</Badge>
-                        <Badge variant="neutral">{acc.provider}</Badge>
-                        {envNameTrimmed ? (
-                          <Badge variant={envMeta.badgeVariant}>
-                            [{envMeta.short}] {envNameTrimmed}
-                            {envProfileTrimmed ? ` · ${envProfileTrimmed}` : ""}
-                          </Badge>
-                        ) : envProfileTrimmed ? (
-                          <Badge variant="neutral">环境标识 · {envProfileTrimmed}</Badge>
-                        ) : null}
-                        {nodeDisplay && (
-                          <Badge variant={nodeDisplay.variant}>
-                            {nodeDisplay.badgeText}
-                          </Badge>
-                        )}
-                      </div>
-
-                      {/* Email row */}
-                      <div className="flex flex-wrap items-center gap-2 text-[0.76rem]">
-                        <span className="mono-num truncate font-medium text-[#374151]">
-                          {acc.email}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => handleCopy(acc.email, "账号邮箱")}
-                          className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[0.68rem] text-[#5b48c4] hover:bg-[#f0edfc] cursor-pointer"
-                          aria-label={`复制账号 ${acc.email}`}
+                        <Badge variant={statusMeta.variant} className="shrink-0">
+                          {statusMeta.label}
+                        </Badge>
+                        <Badge
+                          variant="neutral"
+                          className="max-w-[6.5rem] shrink-0 overflow-hidden"
+                          title={acc.provider}
                         >
-                          <Copy className="h-3 w-3" aria-hidden="true" />
-                          复制账号
-                        </button>
+                          <span className="truncate">{acc.provider}</span>
+                        </Badge>
                       </div>
 
-                      {/* Purpose & Tags */}
-                      {(acc.purpose || acc.tags.length > 0) && (
-                        <div className="flex flex-wrap items-center gap-1.5 text-[0.72rem] text-[#525866]">
-                          {acc.purpose && (
-                            <span className="truncate">用途: {acc.purpose}</span>
+                      <div className="flex shrink-0 items-center gap-1">
+                        <Button
+                          variant="ghost"
+                          size="xs"
+                          onClick={() => toggleExpanded(acc.id)}
+                          aria-expanded={isExpanded}
+                        >
+                          详情
+                          {isExpanded ? (
+                            <ChevronUp className="h-3.5 w-3.5" aria-hidden="true" />
+                          ) : (
+                            <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
                           )}
-                          {acc.tags.map((tag) => (
-                            <span
-                              key={tag}
-                              className="inline-flex items-center rounded-md border border-[#eaecef] bg-[#f8f9fb] px-1.5 py-0.5 text-[0.66rem] text-[#525866]"
-                            >
-                              #{tag}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Right: Credentials + Live 2FA + Row Actions */}
-                  <div className="flex flex-wrap items-center gap-2 lg:shrink-0">
-                    {/* Password Box */}
-                    <div className="flex items-center gap-1 rounded-lg border border-[#eaecef] bg-[#f8f9fb] px-2 py-1">
-                      <span className="text-[0.67rem] text-[#7c8495]">密码</span>
-                      <span className="mono-num max-w-[8.5rem] truncate text-[0.74rem] font-medium text-[#111827]">
-                        {acc.password
-                          ? isPassShown
-                            ? acc.password
-                            : "••••••••••"
-                          : "未设置"}
-                      </span>
-                      {acc.password && (
-                        <>
-                          <button
-                            type="button"
-                            onClick={() => toggleRevealPassword(acc.id)}
-                            className="inline-grid h-5 w-5 place-items-center rounded text-[#7c8495] hover:bg-white hover:text-[#111827] cursor-pointer"
-                            aria-label={isPassShown ? "隐藏密码" : "显示密码"}
-                          >
-                            {isPassShown ? (
-                              <EyeOff className="h-3 w-3" aria-hidden="true" />
-                            ) : (
-                              <Eye className="h-3 w-3" aria-hidden="true" />
-                            )}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleCopy(acc.password, "登录密码")}
-                            className="inline-grid h-5 w-5 place-items-center rounded text-[#5b48c4] hover:bg-white cursor-pointer"
-                            aria-label="复制登录密码"
-                          >
-                            <Copy className="h-3 w-3" aria-hidden="true" />
-                          </button>
-                        </>
-                      )}
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="xs"
+                          onClick={() => openEditor(acc)}
+                        >
+                          <Pencil className="h-3 w-3 text-[#525866]" aria-hidden="true" />
+                          编辑
+                        </Button>
+                        <Button
+                          variant="destructive-outline"
+                          size="xs"
+                          onClick={() => openConfirmDelete({ kind: "single", account: acc })}
+                          aria-label={`删除 ${acc.email}`}
+                        >
+                          <Trash2 className="h-3 w-3" aria-hidden="true" />
+                        </Button>
+                      </div>
                     </div>
 
-                    {/* Live 2FA Box */}
-                    {rawSecret ? (
-                      totp ? (
-                        <div className="flex items-center gap-1.5 rounded-lg border border-[#dcd4fb] bg-[#f0edfc]/65 px-2.5 py-1">
-                          <span className="text-[0.67rem] font-medium text-[#5b48c4]">
-                            2FA
-                          </span>
-                          <span className="mono-num text-[0.82rem] font-semibold tracking-wider text-[#111827]">
-                            {totp.formatted}
+                    {/* Band 2: Fixed 3-Column Alignment Grid */}
+                    <div className="grid grid-cols-[minmax(0,1.25fr)_minmax(0,1fr)_12.5rem] items-center gap-3">
+                      {/* Col 1: Account Email + Purpose/Tags */}
+                      <div className="flex min-w-0 flex-col gap-1.5">
+                        <div className="flex h-5 min-w-0 items-center gap-1.5">
+                          <span className="w-7 shrink-0 text-[0.68rem] text-[#9ca3af]">
+                            账号
                           </span>
                           <span
-                            className={`mono-num rounded px-1 py-0.5 text-[0.66rem] font-semibold ${
-                              totp.remaining <= 5
-                                ? "bg-[#fffbeb] text-[#d97706]"
-                                : "bg-white text-[#5b48c4]"
-                            }`}
+                            title={acc.email}
+                            className="mono-num min-w-0 truncate text-[0.75rem] font-medium text-[#374151]"
                           >
-                            {totp.remaining}s
+                            {acc.email}
                           </span>
                           <button
                             type="button"
-                            onClick={() => handleCopy(totp.code, "2FA 验证码")}
-                            className="inline-grid h-5 w-5 place-items-center rounded text-[#5b48c4] hover:bg-white cursor-pointer"
-                            aria-label="复制当前 2FA 动态码"
+                            onClick={() => handleCopy(acc.email, "账号邮箱")}
+                            className="inline-grid h-5 w-5 shrink-0 place-items-center rounded text-[#5b48c4] hover:bg-[#f0edfc] cursor-pointer"
+                            aria-label={`复制账号 ${acc.email}`}
+                            title="复制账号"
                           >
                             <Copy className="h-3 w-3" aria-hidden="true" />
                           </button>
                         </div>
-                      ) : (
-                        <Badge variant="warning">2FA 密钥格式无效</Badge>
-                      )
-                    ) : acc.recoveryCodes ? (
-                      <Badge variant="neutral">含备用恢复码</Badge>
-                    ) : (
-                      <span className="rounded-lg border border-dashed border-[#dce0e6] px-2 py-1 text-[0.69rem] text-[#9ca3af]">
-                        无 2FA
-                      </span>
-                    )}
 
-                    {/* Action Buttons */}
-                    <div className="flex items-center gap-1">
-                      <Button
-                        variant="ghost"
-                        size="xs"
-                        onClick={() => toggleExpanded(acc.id)}
-                        aria-expanded={isExpanded}
-                      >
-                        详情
-                        {isExpanded ? (
-                          <ChevronUp className="h-3.5 w-3.5" aria-hidden="true" />
+                        <div className="flex h-5 min-w-0 items-center gap-1.5">
+                          <span className="w-7 shrink-0 text-[0.68rem] text-[#9ca3af]">
+                            用途
+                          </span>
+                          {acc.purpose ? (
+                            <span
+                              title={acc.purpose}
+                              className="min-w-0 flex-1 truncate text-[0.72rem] text-[#525866]"
+                            >
+                              {acc.purpose}
+                            </span>
+                          ) : (
+                            <span className="min-w-0 flex-1 truncate text-[0.72rem] text-[#9ca3af]">
+                              未填写
+                            </span>
+                          )}
+                          {visibleTags.length > 0 && (
+                            <div
+                              className="flex shrink-0 items-center gap-1"
+                              title={acc.tags.map((t) => `#${t}`).join(" ")}
+                            >
+                              {visibleTags.map((tag) => (
+                                <span
+                                  key={tag}
+                                  className="inline-flex max-w-[4.75rem] items-center truncate rounded-md border border-[#eaecef] bg-[#f8f9fb] px-1.5 py-0.5 text-[0.64rem] text-[#525866]"
+                                >
+                                  #{tag}
+                                </span>
+                              ))}
+                              {extraTagCount > 0 && (
+                                <span className="mono-num inline-flex items-center rounded-md border border-[#eaecef] bg-[#f8f9fb] px-1 py-0.5 text-[0.64rem] text-[#7c8495]">
+                                  +{extraTagCount}
+                                </span>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Col 2: Fixed Environment Slot + Fixed Node Slot */}
+                      <div className="flex min-w-0 flex-col gap-1.5">
+                        <div className="flex h-5 min-w-0 items-center gap-1.5">
+                          <span className="w-7 shrink-0 text-[0.68rem] text-[#9ca3af]">
+                            环境
+                          </span>
+                          <div className="flex min-w-0 flex-1 items-center">
+                            {envNameTrimmed ? (
+                              <Badge
+                                variant={envMeta.badgeVariant}
+                                className="max-w-full overflow-hidden"
+                                title={`[${envMeta.short}] ${envNameTrimmed}${envProfileTrimmed ? ` · ${envProfileTrimmed}` : ""}`}
+                              >
+                                <span className="truncate">
+                                  [{envMeta.short}] {envNameTrimmed}
+                                  {envProfileTrimmed ? ` · ${envProfileTrimmed}` : ""}
+                                </span>
+                              </Badge>
+                            ) : envProfileTrimmed ? (
+                              <Badge
+                                variant="neutral"
+                                className="max-w-full overflow-hidden"
+                                title={`标识 · ${envProfileTrimmed}`}
+                              >
+                                <span className="truncate">标识 · {envProfileTrimmed}</span>
+                              </Badge>
+                            ) : (
+                              <span className="truncate text-[0.72rem] text-[#9ca3af]">
+                                未设置
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex h-5 min-w-0 items-center gap-1.5">
+                          <span className="w-7 shrink-0 text-[0.68rem] text-[#9ca3af]">
+                            节点
+                          </span>
+                          <div className="flex min-w-0 flex-1 items-center">
+                            {nodeDisplay ? (
+                              <Badge
+                                variant={nodeDisplay.variant}
+                                className="max-w-full overflow-hidden"
+                                title={nodeDisplay.badgeText}
+                              >
+                                <span className="truncate">{nodeDisplay.badgeText}</span>
+                              </Badge>
+                            ) : (
+                              <span className="truncate text-[0.72rem] text-[#9ca3af]">
+                                未绑定
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Col 3: Fixed-Width Password + 2FA Column */}
+                      <div className="flex w-[12.5rem] flex-col gap-1.5">
+                        <div className="flex h-6 w-full items-center gap-1.5 rounded-md border border-[#eaecef] bg-[#f8f9fb] px-2">
+                          <span className="shrink-0 text-[0.66rem] text-[#7c8495]">
+                            密码
+                          </span>
+                          <span className="mono-num min-w-0 flex-1 truncate text-[0.73rem] font-medium text-[#111827]">
+                            {acc.password
+                              ? isPassShown
+                                ? acc.password
+                                : "••••••••••"
+                              : "未设置"}
+                          </span>
+                          {acc.password && (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => toggleRevealPassword(acc.id)}
+                                className="inline-grid h-4 w-4 shrink-0 place-items-center rounded text-[#7c8495] hover:bg-white hover:text-[#111827] cursor-pointer"
+                                aria-label={isPassShown ? "隐藏密码" : "显示密码"}
+                              >
+                                {isPassShown ? (
+                                  <EyeOff className="h-3 w-3" aria-hidden="true" />
+                                ) : (
+                                  <Eye className="h-3 w-3" aria-hidden="true" />
+                                )}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleCopy(acc.password, "登录密码")}
+                                className="inline-grid h-4 w-4 shrink-0 place-items-center rounded text-[#5b48c4] hover:bg-white cursor-pointer"
+                                aria-label="复制登录密码"
+                              >
+                                <Copy className="h-3 w-3" aria-hidden="true" />
+                              </button>
+                            </>
+                          )}
+                        </div>
+
+                        {rawSecret ? (
+                          totp ? (
+                            <div className="flex h-6 w-full items-center justify-between gap-1 rounded-md border border-[#dcd4fb] bg-[#f0edfc]/65 px-2">
+                              <span className="shrink-0 text-[0.66rem] font-medium text-[#5b48c4]">
+                                2FA
+                              </span>
+                              <span className="mono-num text-[0.78rem] font-semibold tracking-wider text-[#111827]">
+                                {totp.formatted}
+                              </span>
+                              <span
+                                className={`mono-num shrink-0 rounded px-1 py-0.5 text-[0.64rem] font-semibold leading-none ${
+                                  totp.remaining <= 5
+                                    ? "bg-[#fffbeb] text-[#d97706]"
+                                    : "bg-white text-[#5b48c4]"
+                                }`}
+                              >
+                                {totp.remaining}s
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => handleCopy(totp.code, "2FA 验证码")}
+                                className="inline-grid h-4 w-4 shrink-0 place-items-center rounded text-[#5b48c4] hover:bg-white cursor-pointer"
+                                aria-label="复制当前 2FA 动态码"
+                              >
+                                <Copy className="h-3 w-3" aria-hidden="true" />
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="flex h-6 w-full items-center rounded-md border border-[#fde68a] bg-[#fffbeb] px-2 text-[0.69rem] font-medium text-[#92400e]">
+                              2FA 密钥格式无效
+                            </div>
+                          )
+                        ) : acc.recoveryCodes ? (
+                          <div className="flex h-6 w-full items-center rounded-md border border-[#e5e7eb] bg-[#f3f4f6] px-2 text-[0.69rem] font-medium text-[#4b5563]">
+                            含备用恢复码
+                          </div>
                         ) : (
-                          <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+                          <div className="flex h-6 w-full items-center rounded-md border border-dashed border-[#dce0e6] px-2 text-[0.69rem] text-[#9ca3af]">
+                            未配置 2FA
+                          </div>
                         )}
-                      </Button>
-                      <Button
-                        variant="outline"
-                        size="xs"
-                        onClick={() => openEditor(acc)}
-                      >
-                        <Pencil className="h-3 w-3 text-[#525866]" aria-hidden="true" />
-                        编辑
-                      </Button>
-                      <Button
-                        variant="destructive-outline"
-                        size="xs"
-                        onClick={() => openConfirmDelete({ kind: "single", account: acc })}
-                        aria-label={`删除 ${acc.email}`}
-                      >
-                        <Trash2 className="h-3 w-3" aria-hidden="true" />
-                      </Button>
+                      </div>
                     </div>
-                  </div>
-                </div>
 
-                {/* Inline Expanded Details */}
-                {isExpanded && (
-                  <div className="space-y-3 rounded-xl border border-[#eaecef] bg-[#fafbfc] p-4">
+                    {/* Inline Expanded Details */}
+                    {isExpanded && (
+                      <div className="space-y-3 rounded-xl border border-[#eaecef] bg-[#fafbfc] p-4">
                     <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#eaecef] pb-2.5">
                       <div className="flex flex-wrap items-center gap-1.5">
                         <span className="text-[0.72rem] font-medium text-[#525866]">
@@ -1464,9 +1973,11 @@ export function AccountsView({
                     </div>
                   </div>
                 )}
-              </article>
-            );
-          })
+                  </div>
+                </article>
+              );
+            })}
+          </div>
         )}
       </section>
 

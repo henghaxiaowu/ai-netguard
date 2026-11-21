@@ -283,3 +283,87 @@ dialog.ng-dialog::backdrop {
   overflow: hidden;
   overscroll-behavior: contain;
 }
+
+/* Account list drag-and-drop reordering */
+html.ng-dragging-reorder,
+html.ng-dragging-reorder * {
+  cursor: grabbing !important;
+}
+
+.ng-drag-handle {
+  cursor: grab;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.ng-drag-handle:active {
+  cursor: grabbing;
+}
+
+.ng-drag-handle:disabled {
+  cursor: not-allowed;
+  touch-action: auto;
+}
+
+.ng-drag-handle:is(:hover, :focus-visible):not(:disabled) {
+  background-color: #f0edfc;
+  color: #5b48c4;
+}
+
+.ng-account-row {
+  scroll-margin: 1rem;
+}
+
+.ng-account-row:has(.ng-drag-handle:focus-visible) {
+  background-color: #f8f7fe;
+  box-shadow: inset 2px 0 0 #6d5bd0;
+}
+
+.ng-account-row[data-dragging="true"] {
+  position: relative;
+  z-index: 20;
+  pointer-events: none;
+  background-color: #ffffff;
+  border-radius: 0.75rem;
+  box-shadow: 0 14px 32px -8px rgba(15, 23, 42, 0.22), 0 0 0 1px #c4b5fd;
+  scale: 1.008;
+}
+
+.ng-account-list {
+  position: relative;
+  --drop-marker-color: #6d5bd0;
+}
+
+.ng-account-list[data-drop="true"]::before,
+.ng-account-list[data-drop="true"]::after {
+  content: "";
+  position: fixed;
+  pointer-events: none;
+  z-index: 30;
+}
+
+.ng-account-list[data-drop="true"]::before {
+  left: calc(var(--drop-x, 0px) - 4px);
+  top: calc(var(--drop-y, 0px) - 4px);
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  border: 2px solid var(--drop-marker-color);
+  background-color: #ffffff;
+}
+
+.ng-account-list[data-drop="true"]::after {
+  left: var(--drop-x, 0px);
+  top: calc(var(--drop-y, 0px) - 1px);
+  width: var(--drop-w, 0px);
+  height: 2px;
+  border-radius: 9999px;
+  background-color: var(--drop-marker-color);
+}
+
+@media (forced-colors: active) {
+  .ng-account-list[data-drop="true"] {
+    --drop-marker-color: Highlight;
+  }
+}

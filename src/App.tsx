@@ -709,6 +709,37 @@ export default function App() {
     }
   };
 
+  const handleReorderAccounts = async (orderedIds: string[]) => {
+    const prevSnapshot = accounts;
+    const byId = new Map(accounts.map((a) => [a.id, a]));
+    const nextLocal: AccountRecord[] = [];
+    const seen = new Set<string>();
+    for (const id of orderedIds) {
+      const rec = byId.get(id);
+      if (rec && !seen.has(id)) {
+        seen.add(id);
+        nextLocal.push(rec);
+      }
+    }
+    for (const rec of accounts) {
+      if (!seen.has(rec.id)) {
+        nextLocal.push(rec);
+      }
+    }
+    setAccounts(nextLocal);
+
+    try {
+      const persisted = await api.reorderAccounts(orderedIds);
+      setAccounts(persisted);
+    } catch (err) {
+      if (!isTauriEnv()) {
+        return;
+      }
+      setAccounts(prevSnapshot);
+      notify(`调整账号顺序失败: ${String(err)}`);
+    }
+  };
+
   const handlePasteOAuth = async () => {
     try {
       const clip = (await navigator.clipboard.readText()).trim();
@@ -1772,6 +1803,7 @@ export default function App() {
                 onImport={handleImportAccounts}
                 onSaveEnvPresets={handleSaveEnvPresets}
                 onRefreshClashNodes={refreshClashNodes}
+                onReorder={handleReorderAccounts}
                 onNotify={notify}
               />
             )}

@@ -259,6 +259,36 @@ pub fn normalize_account(
     Ok(record)
 }
 
+/// Reorder `current` according to `ordered_ids`, ignoring unknown/duplicate IDs and appending any
+/// unlisted records at the end in their original order so no account is ever lost.
+pub fn reorder_account_list(current: &[AccountRecord], ordered_ids: &[String]) -> Vec<AccountRecord> {
+    let mut used = vec![false; current.len()];
+    let mut out = Vec::with_capacity(current.len());
+
+    for raw_id in ordered_ids {
+        let target = raw_id.trim();
+        if target.is_empty() {
+            continue;
+        }
+        if let Some(idx) = current
+            .iter()
+            .enumerate()
+            .position(|(i, rec)| !used[i] && rec.id == target)
+        {
+            used[idx] = true;
+            out.push(current[idx].clone());
+        }
+    }
+
+    for (i, rec) in current.iter().enumerate() {
+        if !used[i] {
+            out.push(rec.clone());
+        }
+    }
+
+    out
+}
+
 pub fn normalize_env_presets(presets: Vec<AccountEnvPreset>) -> Vec<AccountEnvPreset> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -1041,5 +1071,25 @@ rules:
                 },
             ]
         );
+    }
+
+    #[test]
+    fn reorder_account_list_preserves_order_and_unlisted_records() {
+        let a = sample_record("acc-a", "a@gmail.com");
+        let b = sample_record("acc-b", "b@gmail.com");
+        let c = sample_record("acc-c", "c@gmail.com");
+        let list = vec![a.clone(), b.clone(), c.clone()];
+
+        let reordered = reorder_account_list(
+            &list,
+            &[
+                "acc-c".into(),
+                "missing-id".into(),
+                "acc-a".into(),
+                "acc-c".into(),
+            ],
+        );
+        let ids: Vec<&str> = reordered.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["acc-c", "acc-a", "acc-b"]);
     }
 }
