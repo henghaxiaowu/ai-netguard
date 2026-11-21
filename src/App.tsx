@@ -31,9 +31,11 @@ import {
   Trash2,
   ChevronDown,
   ClipboardPaste,
+  KeyRound,
   X,
 } from "lucide-react";
 import { api } from "./api";
+import { AccountsView } from "./components/AccountsView";
 import { AppsEnvView } from "./components/AppsEnvView";
 import { NodeEditor } from "./components/NodeEditor";
 import { ClaudeStarburst } from "./components/ClaudeMotifs";
@@ -57,6 +59,7 @@ import {
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type {
+  AccountRecord,
   AppConfig,
   AppEnvSnapshot,
   DiagnosticCheck,
@@ -64,7 +67,14 @@ import type {
   GatewayStatus,
 } from "./types";
 
-type TabKey = "dashboard" | "apps" | "verify" | "nodes" | "hardening" | "logs";
+type TabKey =
+  | "dashboard"
+  | "apps"
+  | "accounts"
+  | "verify"
+  | "nodes"
+  | "hardening"
+  | "logs";
 type CheckFilter = "all" | "core" | "security" | "coexistence" | "cli";
 
 const NAV_GROUPS: {
@@ -76,6 +86,7 @@ const NAV_GROUPS: {
     items: [
       { key: "dashboard", label: "总览与安全启动", crumb: "总览", icon: Monitor },
       { key: "apps", label: "AI 应用与环境", crumb: "AI 应用与环境", icon: AppWindow },
+      { key: "accounts", label: "账号与环境库", crumb: "账号与环境库", icon: KeyRound },
       { key: "verify", label: "IP 与指纹体检", crumb: "IP 与指纹体检", icon: Fingerprint },
       { key: "nodes", label: "出口与共存路由", crumb: "出口与共存路由", icon: GitFork },
     ],
@@ -196,6 +207,8 @@ export default function App() {
   const [latencyHistory, setLatencyHistory] = useState<number[]>([]);
   const [appEnv, setAppEnv] = useState<AppEnvSnapshot | null>(null);
   const [scanningApps, setScanningApps] = useState(false);
+  const [accounts, setAccounts] = useState<AccountRecord[]>([]);
+  const [loadingAccounts, setLoadingAccounts] = useState(true);
 
   const didAutoStartRef = useRef(false);
   const toastRef = useRef<HTMLDivElement>(null);
@@ -312,11 +325,24 @@ export default function App() {
     }
   }, []);
 
+  const refreshAccounts = useCallback(async () => {
+    setLoadingAccounts(true);
+    try {
+      const list = await api.listAccounts();
+      setAccounts(list);
+    } catch {
+      // Ignore if running outside Tauri runtime during Vite preview
+    } finally {
+      setLoadingAccounts(false);
+    }
+  }, []);
+
   const refreshAll = async () => {
+    void refreshAppEnv();
+    void refreshAccounts();
     const [cfg, st] = await Promise.all([api.getConfig(), api.getStatus()]);
     setConfig(cfg);
     setStatus(st);
-    void refreshAppEnv();
     return { cfg, st };
   };
 
@@ -532,6 +558,118 @@ export default function App() {
     }
   };
 
+  const isTauriEnv = () =>
+    typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+  const formatPreviewNow = () => {
+    const d = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  };
+
+  const handleUpsertAccount = async (record: AccountRecord) => {
+    try {
+      const next = await api.upsertAccount(record);
+      setAccounts(next);
+      notify(`已加密保存账号: ${record.email}`);
+    } catch (err) {
+      if (!isTauriEnv()) {
+        const now = formatPreviewNow();
+        const id = record.id.trim() || `acc-${Date.now()}`;
+        const normalized: AccountRecord = {
+          ...record,
+          id,
+          provider: record.provider.trim() || "Google",
+          environmentName: record.environmentName.trim() || "AdsPower",
+          createdAt: record.createdAt || now,
+          updatedAt: now,
+        };
+        setAccounts((prev) => {
+          const idx = prev.findIndex((a) => a.id === id);
+          if (idx >= 0) {
+            const copy = [...prev];
+            copy[idx] = normalized;
+            return copy;
+          }
+          return [normalized, ...prev];
+        });
+        notify(`已保存账号 (预览模式): ${record.email}`);
+        return;
+      }
+      notify(`保存账号失败: ${String(err)}`);
+      throw err;
+    }
+  };
+
+  const handleDeleteAccount = async (id: string) => {
+    try {
+      const next = await api.deleteAccount(id);
+      setAccounts(next);
+      notify("已删除账号记录");
+    } catch (err) {
+      if (!isTauriEnv()) {
+        setAccounts((prev) => prev.filter((a) => a.id !== id));
+        notify("已删除账号记录 (预览模式)");
+        return;
+      }
+      notify(`删除账号失败: ${String(err)}`);
+    }
+  };
+
+  const handleBulkDeleteAccounts = async (ids: string[]) => {
+    try {
+      const next = await api.deleteAccounts(ids);
+      setAccounts(next);
+      notify(`已清理 ${ids.length} 条账号记录`);
+    } catch (err) {
+      if (!isTauriEnv()) {
+        const set = new Set(ids);
+        setAccounts((prev) => prev.filter((a) => !set.has(a.id)));
+        notify(`已清理 ${ids.length} 条账号记录 (预览模式)`);
+        return;
+      }
+      notify(`批量删除失败: ${String(err)}`);
+    }
+  };
+
+  const handleImportAccounts = async (records: AccountRecord[], replace: boolean) => {
+    try {
+      const next = await api.importAccounts(records, replace);
+      setAccounts(next);
+      notify(`已导入 ${records.length} 条账号记录`);
+    } catch (err) {
+      if (!isTauriEnv()) {
+        const now = formatPreviewNow();
+        setAccounts((prev) => {
+          const base = replace ? [] : [...prev];
+          for (const rec of records) {
+            const id = rec.id.trim() || `acc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+            const normalized: AccountRecord = {
+              ...rec,
+              id,
+              provider: rec.provider.trim() || "Google",
+              environmentName: rec.environmentName.trim() || "AdsPower",
+              createdAt: rec.createdAt || now,
+              updatedAt: now,
+            };
+            const idx = base.findIndex(
+              (x) =>
+                x.id === id ||
+                (x.email.toLowerCase() === normalized.email.toLowerCase() &&
+                  x.provider.toLowerCase() === normalized.provider.toLowerCase()),
+            );
+            if (idx >= 0) base[idx] = normalized;
+            else base.push(normalized);
+          }
+          return base;
+        });
+        notify(`已导入 ${records.length} 条账号记录 (预览模式)`);
+        return;
+      }
+      notify(`导入账号失败: ${String(err)}`);
+    }
+  };
+
   const handlePasteOAuth = async () => {
     try {
       const clip = (await navigator.clipboard.readText()).trim();
@@ -732,7 +870,11 @@ export default function App() {
                   共存旁路: {status.detectedConflicts.join(" / ")}
                 </Badge>
               ) : null}
-              {dirty && tab !== "nodes" && tab !== "hardening" && tab !== "apps" && (
+              {dirty &&
+                tab !== "nodes" &&
+                tab !== "hardening" &&
+                tab !== "apps" &&
+                tab !== "accounts" && (
                 <Button variant="solid" size="xs" onClick={() => handleSaveConfig()}>
                   保存未提交更改
                 </Button>
@@ -1573,6 +1715,20 @@ export default function App() {
                 onLaunchApp={handleLaunchManagedApp}
                 onCleanRegistryEnv={handleCleanRegistryEnv}
                 onCreateShortcut={handleCreateAppShortcut}
+              />
+            )}
+
+            {/* ======================= VIEW 01C: ACCOUNTS & ENVIRONMENTS ======================= */}
+            {tab === "accounts" && (
+              <AccountsView
+                accounts={accounts}
+                nodes={config?.nodes ?? []}
+                loading={loadingAccounts}
+                onUpsert={handleUpsertAccount}
+                onDelete={handleDeleteAccount}
+                onBulkDelete={handleBulkDeleteAccounts}
+                onImport={handleImportAccounts}
+                onNotify={notify}
               />
             )}
 

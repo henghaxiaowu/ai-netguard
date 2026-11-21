@@ -1,3 +1,4 @@
+mod accounts;
 mod app_env;
 mod healthcheck;
 mod ipc_client;
@@ -7,6 +8,8 @@ mod network;
 mod pac;
 mod singbox;
 mod uri_parser;
+
+use accounts::{load_accounts, normalize_account, save_accounts, AccountRecord};
 
 use guard_protocol::{GuardRequest, ProtectedTarget};
 use ipc_client::GuardClient;
@@ -54,6 +57,7 @@ impl Drop for StartingResetGuard {
 
 pub struct AppState {
     inner: Mutex<InnerState>,
+    accounts: Mutex<Vec<AccountRecord>>,
     logs: Arc<LogBuffer>,
 }
 
@@ -61,6 +65,14 @@ impl AppState {
     fn new() -> Self {
         let cfg = load_config();
         let browser_port = cfg.browser_port;
+        let logs = Arc::new(LogBuffer::new());
+        let accounts = match load_accounts() {
+            Ok(list) => list,
+            Err(err) => {
+                logs.push(format!("[账号库] 读取加密库失败: {err}"));
+                Vec::new()
+            }
+        };
         Self {
             inner: Mutex::new(InnerState {
                 config: cfg,
@@ -75,7 +87,8 @@ impl AppState {
                 active_nic_name: None,
                 active_gateway_ip: None,
             }),
-            logs: Arc::new(LogBuffer::new()),
+            accounts: Mutex::new(accounts),
+            logs,
         }
     }
 
@@ -754,6 +767,146 @@ fn create_managed_app_shortcut(
     Ok(msg)
 }
 
+#[tauri::command]
+fn list_accounts(state: State<'_, Arc<AppState>>) -> Result<Vec<AccountRecord>, String> {
+    let list = state
+        .accounts
+        .lock()
+        .map_err(|_| "账号库状态锁定失败".to_string())?;
+    Ok(list.clone())
+}
+
+#[tauri::command]
+fn upsert_account(
+    state: State<'_, Arc<AppState>>,
+    account: AccountRecord,
+) -> Result<Vec<AccountRecord>, String> {
+    let mut guard = state
+        .accounts
+        .lock()
+        .map_err(|_| "账号库状态锁定失败".to_string())?;
+    let existing_idx = (!account.id.trim().is_empty())
+        .then(|| guard.iter().position(|a| a.id == account.id.trim()))
+        .flatten();
+    let existing = existing_idx.and_then(|idx| guard.get(idx));
+    let normalized = normalize_account(account, existing)?;
+    let summary_email = normalized.email.clone();
+
+    let mut next = guard.clone();
+    if let Some(idx) = existing_idx {
+        next[idx] = normalized;
+    } else {
+        next.insert(0, normalized);
+    }
+    save_accounts(&next)?;
+    *guard = next.clone();
+    state.logs.push(format!("[账号库] 已保存账号记录: {summary_email}"));
+    Ok(next)
+}
+
+#[tauri::command]
+fn delete_account(state: State<'_, Arc<AppState>>, id: String) -> Result<Vec<AccountRecord>, String> {
+    let mut guard = state
+        .accounts
+        .lock()
+        .map_err(|_| "账号库状态锁定失败".to_string())?;
+    let target_id = id.trim();
+    let mut next = guard.clone();
+    let before = next.len();
+    next.retain(|a| a.id != target_id);
+    let removed = before.saturating_sub(next.len());
+    if removed > 0 {
+        save_accounts(&next)?;
+        *guard = next.clone();
+        state.logs.push(format!("[账号库] 已删除 {removed} 条账号记录"));
+    }
+    Ok(next)
+}
+
+#[tauri::command]
+fn delete_accounts(
+    state: State<'_, Arc<AppState>>,
+    ids: Vec<String>,
+) -> Result<Vec<AccountRecord>, String> {
+    let id_set: std::collections::HashSet<String> = ids
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut guard = state
+        .accounts
+        .lock()
+        .map_err(|_| "账号库状态锁定失败".to_string())?;
+    if id_set.is_empty() {
+        return Ok(guard.clone());
+    }
+    let mut next = guard.clone();
+    let before = next.len();
+    next.retain(|a| !id_set.contains(&a.id));
+    let removed = before.saturating_sub(next.len());
+    if removed > 0 {
+        save_accounts(&next)?;
+        *guard = next.clone();
+        state.logs.push(format!("[账号库] 已批量删除 {removed} 条账号记录"));
+    }
+    Ok(next)
+}
+
+#[tauri::command]
+fn import_accounts(
+    state: State<'_, Arc<AppState>>,
+    accounts: Vec<AccountRecord>,
+    replace: bool,
+) -> Result<Vec<AccountRecord>, String> {
+    let mut guard = state
+        .accounts
+        .lock()
+        .map_err(|_| "账号库状态锁定失败".to_string())?;
+    let imported_count = accounts.len();
+    let mut next: Vec<AccountRecord> = if replace {
+        Vec::new()
+    } else {
+        guard.clone()
+    };
+
+    for item in accounts {
+        let trimmed_id = item.id.trim().to_string();
+        let trimmed_email = item.email.trim().to_lowercase();
+        let trimmed_provider = {
+            let p = item.provider.trim();
+            if p.is_empty() { "google".to_string() } else { p.to_lowercase() }
+        };
+
+        let match_idx = next.iter().position(|existing| {
+            (!trimmed_id.is_empty() && existing.id == trimmed_id)
+                || (existing.email.trim().to_lowercase() == trimmed_email
+                    && existing.provider.trim().to_lowercase() == trimmed_provider)
+        });
+
+        let existing = match_idx.and_then(|idx| next.get(idx));
+        let mut normalized = normalize_account(item, existing)?;
+        if let Some(prev) = existing {
+            if !prev.id.trim().is_empty() {
+                normalized.id = prev.id.clone();
+            }
+        }
+        if let Some(idx) = match_idx {
+            next[idx] = normalized;
+        } else {
+            next.push(normalized);
+        }
+    }
+
+    save_accounts(&next)?;
+    *guard = next.clone();
+    state.logs.push(format!(
+        "[账号库] 已{}导入 {imported_count} 条账号记录（当前共 {} 条）",
+        if replace { "覆盖" } else { "合并" },
+        next.len()
+    ));
+    Ok(next)
+}
+
 fn check_node_expectation(node: &NodeProfile, exit: &ExitIpInfo) -> Option<String> {
     if let Some(exp_ip) = node.expected_ip.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         if exp_ip != exit.ip {
@@ -1060,6 +1213,11 @@ pub fn run() {
             launch_managed_app,
             clean_registry_proxy_env,
             create_managed_app_shortcut,
+            list_accounts,
+            upsert_account,
+            delete_account,
+            delete_accounts,
+            import_accounts,
             clear_logs,
         ])
         .run(tauri::generate_context!())

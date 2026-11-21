@@ -179,3 +179,34 @@ export interface AppEnvSnapshot {
   pollutedCount: number;
   scannedAt: string;
 }
+
+export type AccountStatus = "active" | "standby" | "restricted" | "banned";
+
+export type AccountEnvType =
+  | "adspower"
+  | "claude_code"
+  | "netguard_browser"
+  | "local"
+  | "fingerprint_other"
+  | "custom";
+
+export interface AccountRecord {
+  id: string;
+  label: string;
+  provider: string;
+  email: string;
+  password: string;
+  totpSecret?: string | null;
+  recoveryCodes?: string | null;
+  recoveryEmail?: string | null;
+  envType: AccountEnvType;
+  environmentName: string;
+  environmentProfile?: string | null;
+  linkedNodeId?: string | null;
+  purpose: string;
+  tags: string[];
+  status: AccountStatus;
+  notes?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}

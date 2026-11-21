@@ -271,3 +271,15 @@
     outline: 2px solid Highlight !important;
   }
 }
+
+/* Native top-layer modal <dialog> scroll containment & backdrop */
+dialog.ng-dialog:modal {
+  overscroll-behavior: contain;
+}
+
+dialog.ng-dialog::backdrop {
+  background-color: rgba(15, 23, 42, 0.42);
+  backdrop-filter: blur(2px);
+  overflow: hidden;
+  overscroll-behavior: contain;
+}

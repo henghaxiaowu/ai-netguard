@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AccountRecord,
   AppConfig,
   AppEnvSnapshot,
   DiagnosticCheck,
@@ -35,6 +36,14 @@ export const api = {
   cleanRegistryProxyEnv: () => invoke<string>("clean_registry_proxy_env"),
   createManagedAppShortcut: (appId: string) =>
     invoke<string>("create_managed_app_shortcut", { appId }),
+  listAccounts: () => invoke<AccountRecord[]>("list_accounts"),
+  upsertAccount: (account: AccountRecord) =>
+    invoke<AccountRecord[]>("upsert_account", { account }),
+  deleteAccount: (id: string) => invoke<AccountRecord[]>("delete_account", { id }),
+  deleteAccounts: (ids: string[]) =>
+    invoke<AccountRecord[]>("delete_accounts", { ids }),
+  importAccounts: (accounts: AccountRecord[], replace: boolean) =>
+    invoke<AccountRecord[]>("import_accounts", { accounts, replace }),
   connectGuard: () => invoke<GatewayStatus>("connect_guard"),
   clearLogs: () => invoke<void>("clear_logs"),
   generateVpsScript: (protocol: "vless-reality" | "hysteria2", port: number) =>
