@@ -33,6 +33,8 @@ export const api = {
   launchManagedApp: (appId: string, relaunch: boolean) =>
     invoke<string>("launch_managed_app", { appId, relaunch }),
   cleanRegistryProxyEnv: () => invoke<string>("clean_registry_proxy_env"),
+  createManagedAppShortcut: (appId: string) =>
+    invoke<string>("create_managed_app_shortcut", { appId }),
   connectGuard: () => invoke<GatewayStatus>("connect_guard"),
   clearLogs: () => invoke<void>("clear_logs"),
   generateVpsScript: (protocol: "vless-reality" | "hysteria2", port: number) =>

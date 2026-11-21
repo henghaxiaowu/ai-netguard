@@ -56,7 +56,7 @@ https://github.com/user-attachments/assets/cf2bd7ea-e3fa-4140-a59b-066bf845f924
 
 ## 🚀 3 步快速上手
 
-1. **下载安装**：从 [Releases](https://github.com/henghaxiaowu/ai-netguard/releases/latest) 下载 `AI.NetGuard_0.1.2_x64-setup.exe` 安装（升级前先彻底退出托盘中的旧进程）。
+1. **下载安装**：从 [Releases](https://github.com/henghaxiaowu/ai-netguard/releases/latest) 下载 `AI.NetGuard_0.1.3_x64-setup.exe` 安装（升级前先彻底退出托盘中的旧进程）。
 2. **配置节点**：进入 **「出口与共存路由」**，粘贴 `vless://`、`hy2://`、`ss://`、`trojan://` 或 `socks5://` 链接（或用内置向导生成独享 VPS 一键脚本），填好预期国家与时区语言并保存。
 3. **启动使用**：回到 **「总览与安全启动」** 点击 **「启动安全网关」**（首次需 UAC 提权），随后按需打开 **防泄漏浏览器**、**Claude Desktop** 或 **Claude Code 终端** 即可。
 

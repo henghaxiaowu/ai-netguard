@@ -736,6 +736,24 @@ fn clean_registry_proxy_env(state: State<'_, Arc<AppState>>) -> Result<String, S
     Ok(msg)
 }
 
+#[tauri::command]
+fn create_managed_app_shortcut(
+    state: State<'_, Arc<AppState>>,
+    app_id: String,
+) -> Result<String, String> {
+    let inner = state.inner.lock().unwrap();
+    let app = inner
+        .config
+        .managed_apps
+        .iter()
+        .find(|a| a.id == app_id)
+        .cloned()
+        .ok_or_else(|| format!("未找到受控应用配置: {app_id}"))?;
+    let msg = app_env::create_desktop_shortcut_for_app(&app, &inner.config, &inner.launcher)?;
+    state.logs.push(format!("[应用环境] {msg}"));
+    Ok(msg)
+}
+
 fn check_node_expectation(node: &NodeProfile, exit: &ExitIpInfo) -> Option<String> {
     if let Some(exp_ip) = node.expected_ip.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         if exp_ip != exit.ip {
@@ -932,6 +950,11 @@ fn spawn_monitor_loop(app: AppHandle, state: Arc<AppState>) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Headless fast-path for desktop shortcuts: `ai-netguard.exe --launch-app <app_id>`
+    if let Some(exit_code) = app_env::try_handle_cli_launch() {
+        std::process::exit(exit_code);
+    }
+
     let _single_instance = unsafe {
         use windows::core::w;
         use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
@@ -1036,6 +1059,7 @@ pub fn run() {
             inspect_apps_env,
             launch_managed_app,
             clean_registry_proxy_env,
+            create_managed_app_shortcut,
             clear_logs,
         ])
         .run(tauri::generate_context!())

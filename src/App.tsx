@@ -188,7 +188,7 @@ export default function App() {
   const [checking, setChecking] = useState(false);
   const [toast, setToast] = useState<string>("");
   const [toastPaused, setToastPaused] = useState(false);
-  const [workDir, setWorkDir] = useState("D:\\TAKT-Work");
+  const [workDir, setWorkDir] = useState("C:\\Projects");
   const [strictCliWfp, setStrictCliWfp] = useState(false);
   const [dlProgress, setDlProgress] = useState<DownloadProgress | null>(null);
   const [logFilter, setLogFilter] = useState("");
@@ -520,6 +520,15 @@ export default function App() {
       await refreshAppEnv();
     } catch (err) {
       notify(`清理失败: ${String(err)}`);
+    }
+  };
+
+  const handleCreateAppShortcut = async (appId: string) => {
+    try {
+      const msg = await api.createManagedAppShortcut(appId);
+      notify(msg);
+    } catch (err) {
+      notify(`创建快捷方式失败: ${String(err)}`);
     }
   };
 
@@ -1563,6 +1572,7 @@ export default function App() {
                 onRescan={refreshAppEnv}
                 onLaunchApp={handleLaunchManagedApp}
                 onCleanRegistryEnv={handleCleanRegistryEnv}
+                onCreateShortcut={handleCreateAppShortcut}
               />
             )}
 

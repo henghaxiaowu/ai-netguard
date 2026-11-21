@@ -27,6 +27,7 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     PROCESS_VM_READ,
 };
+use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -740,7 +741,23 @@ fn classify_app_health(
                 };
                 return ("clean".into(), detail, false);
             }
-            // Running process has live proxy env vars (e.g. still pointing to 17890 while gateway is on)
+            // If every active proxy env var matches the live Windows System Proxy (e.g. Cockpit Tools
+            // explicitly propagating 127.0.0.1:7897), treat it as clean instead of a false warning.
+            if sys_proxy.enabled && sys_proxy.alive {
+                if let Some(ref sys_hp) = sys_proxy.host_port {
+                    let all_match_sys = active_proxies
+                        .iter()
+                        .all(|v| v.host_port.as_deref() == Some(sys_hp.as_str()));
+                    if all_match_sys {
+                        return (
+                            "clean".into(),
+                            format!("运行正常：进程环境变量与当前在线系统代理 ({sys_hp}) 一致"),
+                            false,
+                        );
+                    }
+                }
+            }
+            // Running process has live proxy env vars pointing elsewhere (e.g. still pointing to 17890)
             let vars_str: Vec<String> = active_proxies
                 .iter()
                 .map(|v| format!("{}={}", v.key, v.value))
@@ -1124,6 +1141,156 @@ pub fn launch_managed_app_with_clean_env(
     Ok(msg)
 }
 
+fn sanitize_filename_part(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || c.is_control() {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.');
+    if trimmed.is_empty() {
+        "AI-App".into()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Create a Windows Desktop `.lnk` shortcut pointing to `ai-netguard.exe --launch-app <app_id>`
+/// while preserving the target AI application's native icon.
+pub fn create_desktop_shortcut_for_app(
+    app: &ManagedAppConfig,
+    cfg: &AppConfig,
+    launcher: &ProcessLauncher,
+) -> Result<String, String> {
+    let self_exe =
+        std::env::current_exe().map_err(|e| format!("无法获取 AI NetGuard 程序路径: {e}"))?;
+    let resolved_target = resolve_managed_app_exe(app, cfg, launcher)
+        .ok_or_else(|| format!("未检测到 {} 的可执行文件，请先在卡片中指定路径", app.name))?;
+
+    let user_profile = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .ok_or("无法读取 USERPROFILE 目录")?;
+    let desktop_dir = user_profile.join("Desktop");
+    if !desktop_dir.exists() {
+        return Err(format!("桌面目录不存在: {}", desktop_dir.display()));
+    }
+
+    let safe_name = sanitize_filename_part(&app.name);
+    let lnk_path = desktop_dir.join(format!("{safe_name} (NetGuard).lnk"));
+    let args = format!("--launch-app {}", app.id);
+    let icon_loc = format!("{},0", resolved_target.to_string_lossy());
+    let desc = format!("通过 AI NetGuard 干净环境启动 {}", app.name);
+
+    // Static PowerShell script reading strictly from process env vars (zero command interpolation).
+    let ps_static = "$ws = New-Object -ComObject WScript.Shell; \
+        $sc = $ws.CreateShortcut($env:NG_SC_LNK); \
+        $sc.TargetPath = $env:NG_SC_TARGET; \
+        $sc.Arguments = $env:NG_SC_ARGS; \
+        $sc.WorkingDirectory = $env:NG_SC_WORKDIR; \
+        $sc.IconLocation = $env:NG_SC_ICON; \
+        $sc.Description = $env:NG_SC_DESC; \
+        $sc.Save()";
+
+    let work_dir = self_exe
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let out = Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-Command", ps_static])
+        .env("NG_SC_LNK", &lnk_path)
+        .env("NG_SC_TARGET", &self_exe)
+        .env("NG_SC_ARGS", &args)
+        .env("NG_SC_WORKDIR", &work_dir)
+        .env("NG_SC_ICON", &icon_loc)
+        .env("NG_SC_DESC", &desc)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("创建桌面快捷方式失败: {e}"))?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("创建桌面快捷方式失败: {}", stderr.trim()));
+    }
+
+    Ok(format!(
+        "已在桌面创建快捷方式：{}（双击即可按当前配置启动，无需打开 AI NetGuard 窗口）",
+        lnk_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+    ))
+}
+
+fn show_native_warning_box(title: &str, message: &str) {
+    let title_w = to_wide(title);
+    let msg_w = to_wide(message);
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(msg_w.as_ptr()),
+            PCWSTR(title_w.as_ptr()),
+            MB_OK | MB_ICONWARNING,
+        );
+    }
+}
+
+/// Fast headless CLI entrypoint: `ai-netguard.exe --launch-app <app_id>`.
+/// Returns `Some(exit_code)` when handled, or `None` for normal GUI startup.
+pub fn try_handle_cli_launch() -> Option<i32> {
+    let mut args = std::env::args().skip(1);
+    let mut target_app_id: Option<String> = None;
+    let mut relaunch = false;
+    while let Some(arg) = args.next() {
+        if arg == "--launch-app" {
+            target_app_id = args.next();
+        } else if arg == "--relaunch" {
+            relaunch = true;
+        }
+    }
+    let app_id = target_app_id?;
+
+    let cfg = crate::models::load_config();
+    let Some(app) = cfg
+        .managed_apps
+        .iter()
+        .find(|a| a.id == app_id)
+        .cloned()
+    else {
+        show_native_warning_box(
+            "AI NetGuard 启动失败",
+            &format!("未在配置中找到应用 ID：{app_id}"),
+        );
+        return Some(1);
+    };
+
+    let mut tcp_cache = HashMap::new();
+    let gateway_running = probe_tcp_alive(&format!("127.0.0.1:{}", cfg.cli_port), &mut tcp_cache);
+    let mut launcher = ProcessLauncher::new();
+    let logs = Arc::new(LogBuffer::new());
+
+    match launch_managed_app_with_clean_env(
+        &app,
+        &cfg,
+        &mut launcher,
+        crate::pac::PAC_PORT,
+        gateway_running,
+        relaunch,
+        logs,
+    ) {
+        Ok(_) => Some(0),
+        Err(err) => {
+            show_native_warning_box("AI NetGuard 启动失败", &err);
+            Some(1)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1230,5 +1397,48 @@ mod tests {
                 "clean base env must not contain proxy key {k}"
             );
         }
+    }
+
+    #[test]
+    fn classify_treats_live_system_proxy_env_as_clean_in_system_proxy_mode() {
+        let cfg = AppConfig::default();
+        let app = ManagedAppConfig {
+            id: "cockpit-tools".into(),
+            name: "Cockpit Tools".into(),
+            builtin: true,
+            exe_path: None,
+            process_names: vec!["cockpit-tools.exe".into()],
+            proxy_mode: AppProxyMode::SystemProxy,
+            custom_proxy_url: None,
+            wfp_lock: false,
+            extra_args: Vec::new(),
+        };
+        let sys = SystemProxyStatus {
+            enabled: true,
+            server: Some("127.0.0.1:7897".into()),
+            host_port: Some("127.0.0.1:7897".into()),
+            alive: true,
+            auto_config_url: None,
+        };
+        let env_vars = vec![
+            EnvVarHealth {
+                scope: "process".into(),
+                key: "HTTP_PROXY".into(),
+                value: "http://127.0.0.1:7897".into(),
+                host_port: Some("127.0.0.1:7897".into()),
+                alive: Some(true),
+            },
+            EnvVarHealth {
+                scope: "process".into(),
+                key: "HTTPS_PROXY".into(),
+                value: "http://127.0.0.1:7897".into(),
+                host_port: Some("127.0.0.1:7897".into()),
+                alive: Some(true),
+            },
+        ];
+        let (health, _diag, needs_relaunch) =
+            classify_app_health(&app, true, &env_vars, &cfg, true, &sys);
+        assert_eq!(health, "clean");
+        assert!(!needs_relaunch);
     }
 }

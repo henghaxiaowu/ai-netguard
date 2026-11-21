@@ -5,6 +5,7 @@ import {
   CheckCircle2,
   Cpu,
   Globe,
+  Link2,
   Play,
   Plus,
   RefreshCw,
@@ -45,6 +46,7 @@ interface AppsEnvViewProps {
   onRescan: () => Promise<void>;
   onLaunchApp: (appId: string, relaunch: boolean) => Promise<void>;
   onCleanRegistryEnv: () => Promise<void>;
+  onCreateShortcut: (appId: string) => Promise<void>;
 }
 
 const MODE_LABELS: Record<AppProxyMode, string> = {
@@ -94,6 +96,7 @@ export function AppsEnvView({
   onRescan,
   onLaunchApp,
   onCleanRegistryEnv,
+  onCreateShortcut,
 }: AppsEnvViewProps) {
   const uid = useId();
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -501,6 +504,25 @@ export function AppsEnvView({
                       {isBusy ? "启动中..." : "干净启动"}
                     </Button>
                   )}
+
+                  <Button
+                    variant="ghost"
+                    size="xs"
+                    title={`在桌面创建 ${app.name} 托管快捷方式（双击直接按当前策略启动，无需打开 AI NetGuard）`}
+                    aria-label={`为 ${app.name} 创建桌面快捷方式`}
+                    disabled={isBusy}
+                    onClick={async () => {
+                      setBusyAppId(app.id);
+                      try {
+                        if (dirty) await onSave();
+                        await onCreateShortcut(app.id);
+                      } finally {
+                        setBusyAppId(null);
+                      }
+                    }}
+                  >
+                    <Link2 className="h-3.5 w-3.5" aria-hidden="true" />
+                  </Button>
 
                   <Button
                     variant="ghost"
