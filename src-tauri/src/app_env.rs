@@ -1,3 +1,4 @@
+use crate::accounts::{discover_clash_verge_nodes, ClashVergeNodesSnapshot};
 use crate::launcher::ProcessLauncher;
 use crate::models::{
     AppConfig, AppEnvSnapshot, AppProxyMode, EnvVarHealth, LogBuffer, ManagedAppConfig,
@@ -629,6 +630,25 @@ fn resolve_managed_app_path(
     }
 }
 
+fn describe_clash_port(host_port: &str, clash: &ClashVergeNodesSnapshot) -> Option<String> {
+    let (host, port_str) = host_port.trim().rsplit_once(':')?;
+    let host_clean = host.trim_matches(|c| c == '[' || c == ']');
+    if !host_clean.eq_ignore_ascii_case("127.0.0.1")
+        && !host_clean.eq_ignore_ascii_case("localhost")
+        && host_clean != "::1"
+    {
+        return None;
+    }
+    let port: u16 = port_str.parse().ok()?;
+    if let Some(listener) = clash.listeners.iter().find(|l| l.port == port) {
+        return Some(listener.name.clone());
+    }
+    if clash.mixed_port == Some(port) {
+        return Some("Clash 混合端口".to_string());
+    }
+    None
+}
+
 fn classify_app_health(
     app: &ManagedAppConfig,
     running: bool,
@@ -636,8 +656,18 @@ fn classify_app_health(
     cfg: &AppConfig,
     gateway_running: bool,
     sys_proxy: &SystemProxyStatus,
+    clash: &ClashVergeNodesSnapshot,
 ) -> (String, String, bool) {
+    let is_external = matches!(app.proxy_mode, AppProxyMode::ExternalManaged);
     if !running {
+        if is_external {
+            let msg = if app.id == "antigravity" {
+                "未运行；由 Cockpit Tools 按账号代理托管启动，AI NetGuard 仅执行 PEB 巡检"
+            } else {
+                "未运行；由外部工具托管启动，AI NetGuard 仅执行 PEB 巡检"
+            };
+            return ("stopped".into(), msg.into(), false);
+        }
         return (
             "stopped".into(),
             "未运行；点击“干净启动”将以无污染环境拉起".into(),
@@ -667,8 +697,10 @@ fn classify_app_health(
         } else {
             "（目标代理端口无人监听，会导致该应用及子服务全部请求失败）".into()
         };
-        let parent_hint = if app.id == "cockpit-tools" {
-            " —— 建议先干净重启 Cockpit Tools，避免它继续把死代理传给 Antigravity"
+        let parent_hint = if is_external {
+            "（请通过外部托管工具如 Cockpit Tools 重新切号/重启）"
+        } else if app.id == "cockpit-tools" {
+            " —— 建议先检查 Clash 端口状态或重启 Cockpit Tools（Antigravity 已走独立账号隔离环境）"
         } else {
             ""
         };
@@ -680,7 +712,7 @@ fn classify_app_health(
                 sys_note,
                 parent_hint
             ),
-            true,
+            !is_external,
         );
     }
 
@@ -718,6 +750,101 @@ fn classify_app_health(
                     "mismatch".into(),
                     "当前运行实例未携带 AI NetGuard 隔离代理变量，建议“干净重启”重新接管".into(),
                     true,
+                )
+            }
+        }
+        AppProxyMode::ExternalManaged => {
+            let owner = if app.id == "antigravity" {
+                "Cockpit Tools"
+            } else {
+                "外部托管工具"
+            };
+            if let Some(ng_hp) = active_proxies.iter().find_map(|v| {
+                let hp = v.host_port.as_deref()?;
+                (hp == ng_cli_hp || hp == ng_browser_hp).then_some(hp)
+            }) {
+                return (
+                    "mismatch".into(),
+                    format!(
+                        "进程误挂在 AI NetGuard 专属端口 ({ng_hp})，关掉 AI NetGuard 后会断网；请通过 {owner} 重新启动"
+                    ),
+                    false,
+                );
+            }
+
+            if !active_proxies.is_empty() {
+                let mut seen: HashSet<String> = HashSet::new();
+                let mut targets: Vec<String> = Vec::new();
+                for v in &active_proxies {
+                    let raw_target = v.host_port.as_deref().unwrap_or(v.value.as_str());
+                    if seen.insert(raw_target.to_string()) {
+                        let annotated = match v
+                            .host_port
+                            .as_deref()
+                            .and_then(|hp| describe_clash_port(hp, clash))
+                        {
+                            Some(tag) => format!("{raw_target} ({tag})"),
+                            None => raw_target.to_string(),
+                        };
+                        targets.push(annotated);
+                    }
+                }
+                return (
+                    "clean".into(),
+                    format!(
+                        "外部托管正常：当前代理 {} 在线（由 {owner} 托管，AI NetGuard 仅巡检不接管重启）",
+                        targets.join(", ")
+                    ),
+                    false,
+                );
+            }
+
+            let sys_hp = sys_proxy
+                .host_port
+                .as_deref()
+                .or(sys_proxy.server.as_deref())
+                .unwrap_or("系统代理");
+            if app.id == "antigravity" {
+                if !sys_proxy.enabled {
+                    (
+                        "mismatch".into(),
+                        "未检测到进程代理变量且 Windows 系统代理未启用（当前处于直连状态，存在跨号直连风险）；建议通过 Cockpit Tools 按账号代理重启".into(),
+                        false,
+                    )
+                } else if sys_proxy.alive {
+                    (
+                        "mismatch".into(),
+                        format!(
+                            "未携带独立账号代理变量（正跟随系统代理 {sys_hp}）；若需按账号隔离出口，建议通过 Cockpit Tools 重启"
+                        ),
+                        false,
+                    )
+                } else {
+                    (
+                        "dead_proxy".into(),
+                        format!(
+                            "未携带进程代理变量，且系统代理 {sys_hp} 当前不可达；请通过 Cockpit Tools 重启并检查 Clash"
+                        ),
+                        false,
+                    )
+                }
+            } else if sys_proxy.enabled && !sys_proxy.alive {
+                (
+                    "dead_proxy".into(),
+                    format!("外部托管运行中，但系统代理 {sys_hp} 当前不可达"),
+                    false,
+                )
+            } else if sys_proxy.enabled && sys_proxy.alive {
+                (
+                    "clean".into(),
+                    format!("外部托管运行中：无进程代理变量，正跟随在线系统代理 ({sys_hp})"),
+                    false,
+                )
+            } else {
+                (
+                    "clean".into(),
+                    "外部托管运行中：无进程代理变量（跟随系统默认网络）".into(),
+                    false,
                 )
             }
         }
@@ -773,7 +900,7 @@ fn classify_app_health(
             {
                 "（当前仍挂在 17890，关掉 AI NetGuard 后会立即断网；建议“干净重启”剥离）"
             } else {
-                "（与“跟随系统代理”策略不一致，建议“干净重启”清洗继承环境）"
+                "（与“跟随系统网络（无环境变量）”策略不一致，建议“干净重启”或改用「指定代理 / 外部托管」）"
             };
             (
                 "mismatch".into(),
@@ -807,7 +934,7 @@ fn classify_app_health(
                         return (
                             "clean".into(),
                             format!(
-                                "运行正常：进程环境干净，正通过在线系统代理 ({sys_hp}) 访问自定义目标"
+                                "运行正常：进程环境干净，正通过在线系统代理 ({sys_hp}) 访问指定目标"
                             ),
                             false,
                         );
@@ -820,18 +947,22 @@ fn classify_app_health(
                     .any(|v| v.host_port.as_deref() == Some(exp))
             });
             if matches {
+                let exp_label = expected_hp
+                    .as_deref()
+                    .map(|hp| match describe_clash_port(hp, clash) {
+                        Some(tag) => format!("{hp} · {tag}"),
+                        None => hp.to_string(),
+                    })
+                    .unwrap_or_default();
                 (
                     "clean".into(),
-                    format!(
-                        "运行正常：已指向自定义代理 ({})",
-                        expected_hp.as_deref().unwrap_or("")
-                    ),
+                    format!("运行正常：已指向指定代理 ({exp_label})"),
                     false,
                 )
             } else {
                 (
                     "mismatch".into(),
-                    "进程当前代理环境变量与自定义代理配置不一致，建议“干净重启”".into(),
+                    "进程当前代理环境变量与指定代理配置不一致，建议“干净重启”".into(),
                     true,
                 )
             }
@@ -857,6 +988,7 @@ pub fn inspect_all_apps_env(
     let system_proxy = inspect_system_proxy(&mut tcp_cache);
     let registry_proxy_vars = inspect_registry_proxy_vars(&mut tcp_cache);
     let running_procs = snapshot_running_processes();
+    let clash_snapshot = discover_clash_verge_nodes();
 
     let mut apps = Vec::with_capacity(cfg.managed_apps.len());
     let mut polluted_count = 0usize;
@@ -912,8 +1044,15 @@ pub fn inspect_all_apps_env(
         }
 
         let running = !matching_pids.is_empty();
-        let (health, diagnosis, needs_clean_relaunch) =
-            classify_app_health(app, running, &env_vars, cfg, gateway_running, &system_proxy);
+        let (health, diagnosis, needs_clean_relaunch) = classify_app_health(
+            app,
+            running,
+            &env_vars,
+            cfg,
+            gateway_running,
+            &system_proxy,
+            &clash_snapshot,
+        );
         if health == "dead_proxy" || health == "mismatch" {
             polluted_count += 1;
         }
@@ -1037,6 +1176,12 @@ pub fn launch_managed_app_with_clean_env(
 ) -> Result<String, String> {
     // Pre-flight checks
     match app.proxy_mode {
+        AppProxyMode::ExternalManaged => {
+            return Err(format!(
+                "{} 当前为「外部托管 · 仅巡检」模式，请通过对应托管工具（如 Cockpit Tools）启动或重启",
+                app.name
+            ));
+        }
         AppProxyMode::Netguard => {
             if !gateway_running {
                 return Err(format!(
@@ -1111,7 +1256,13 @@ pub fn launch_managed_app_with_clean_env(
             clean_env.insert("HTTPS_PROXY".into(), url.clone());
             clean_env.insert("ALL_PROXY".into(), url.clone());
             clean_env.insert("NO_PROXY".into(), cfg.extra_no_proxy.clone());
-            format!("自定义代理 ({url})")
+            format!("指定代理 ({url})")
+        }
+        AppProxyMode::ExternalManaged => {
+            return Err(format!(
+                "{} 当前为「外部托管 · 仅巡检」模式",
+                app.name
+            ));
         }
     };
 
@@ -1126,7 +1277,9 @@ pub fn launch_managed_app_with_clean_env(
     if matches!(app.proxy_mode, AppProxyMode::Direct) && app.id != "claude-desktop" {
         cmd.arg("--no-proxy-server");
     }
-    if matches!(app.proxy_mode, AppProxyMode::CustomProxy) && app.id != "claude-desktop" {
+    if matches!(app.proxy_mode, AppProxyMode::CustomProxy)
+        && !matches!(app.id.as_str(), "claude-desktop" | "cockpit-tools")
+    {
         let already_has_proxy_arg = app
             .extra_args
             .iter()
@@ -1204,6 +1357,12 @@ pub fn create_desktop_shortcut_for_app(
     cfg: &AppConfig,
     launcher: &ProcessLauncher,
 ) -> Result<String, String> {
+    if matches!(app.proxy_mode, AppProxyMode::ExternalManaged) {
+        return Err(format!(
+            "{} 当前为「外部托管 · 仅巡检」模式，无需通过 AI NetGuard 创建启动快捷方式",
+            app.name
+        ));
+    }
     let self_exe =
         std::env::current_exe().map_err(|e| format!("无法获取 AI NetGuard 程序路径: {e}"))?;
     let resolved_target = resolve_managed_app_exe(app, cfg, launcher)
@@ -1417,8 +1576,9 @@ mod tests {
             host_port: Some("127.0.0.1:17890".into()),
             alive: Some(false),
         }];
+        let clash = ClashVergeNodesSnapshot::default();
         let (health, diag, needs_relaunch) =
-            classify_app_health(&app, true, &env_vars, &cfg, false, &sys);
+            classify_app_health(&app, true, &env_vars, &cfg, false, &sys, &clash);
         assert_eq!(health, "dead_proxy");
         assert!(needs_relaunch);
         assert!(diag.contains("127.0.0.1:7897"));
@@ -1473,8 +1633,9 @@ mod tests {
                 alive: Some(true),
             },
         ];
+        let clash = ClashVergeNodesSnapshot::default();
         let (health, _diag, needs_relaunch) =
-            classify_app_health(&app, true, &env_vars, &cfg, true, &sys);
+            classify_app_health(&app, true, &env_vars, &cfg, true, &sys, &clash);
         assert_eq!(health, "clean");
         assert!(!needs_relaunch);
     }
@@ -1500,10 +1661,103 @@ mod tests {
             alive: true,
             auto_config_url: None,
         };
+        let clash = ClashVergeNodesSnapshot::default();
         let (health, diag, needs_relaunch) =
-            classify_app_health(&app, true, &[], &cfg, true, &sys);
+            classify_app_health(&app, true, &[], &cfg, true, &sys, &clash);
         assert_eq!(health, "clean");
         assert!(!needs_relaunch);
         assert!(diag.contains("127.0.0.1:7897"));
+    }
+
+    #[test]
+    fn external_managed_antigravity_health_and_refusal_rules() {
+        let cfg = AppConfig::default();
+        let app = ManagedAppConfig {
+            id: "antigravity".into(),
+            name: "Antigravity".into(),
+            builtin: true,
+            exe_path: None,
+            process_names: vec!["Antigravity.exe".into()],
+            proxy_mode: AppProxyMode::ExternalManaged,
+            custom_proxy_url: None,
+            wfp_lock: false,
+            extra_args: Vec::new(),
+        };
+        let sys_off = SystemProxyStatus {
+            enabled: false,
+            server: None,
+            host_port: None,
+            alive: false,
+            auto_config_url: None,
+        };
+        let clash = ClashVergeNodesSnapshot {
+            detected: true,
+            source_path: None,
+            mixed_port: Some(7897),
+            listeners: vec![crate::accounts::ClashVergeListenerItem {
+                name: "adspower-japan".into(),
+                listener_type: "mixed".into(),
+                port: 10809,
+                proxy: "JP".into(),
+            }],
+            groups: Vec::new(),
+            proxies: Vec::new(),
+        };
+
+        // 1. Live Clash listener port -> clean + annotated listener name + no relaunch
+        let live_10809 = vec![EnvVarHealth {
+            scope: "process".into(),
+            key: "HTTPS_PROXY".into(),
+            value: "http://127.0.0.1:10809".into(),
+            host_port: Some("127.0.0.1:10809".into()),
+            alive: Some(true),
+        }];
+        let (h1, d1, r1) =
+            classify_app_health(&app, true, &live_10809, &cfg, false, &sys_off, &clash);
+        assert_eq!(h1, "clean");
+        assert!(!r1);
+        assert!(d1.contains("adspower-japan"), "diag={d1}");
+
+        // 2. Empty env + disabled system proxy -> mismatch warning (bare direct risk)
+        let (h2, d2, r2) = classify_app_health(&app, true, &[], &cfg, false, &sys_off, &clash);
+        assert_eq!(h2, "mismatch");
+        assert!(!r2);
+        assert!(d2.contains("直连"), "diag={d2}");
+
+        // 3. Accidentally pointing to AI NetGuard port 17890 -> mismatch warning
+        let live_17890 = vec![EnvVarHealth {
+            scope: "process".into(),
+            key: "HTTP_PROXY".into(),
+            value: "http://127.0.0.1:17890".into(),
+            host_port: Some("127.0.0.1:17890".into()),
+            alive: Some(true),
+        }];
+        let (h3, d3, r3) =
+            classify_app_health(&app, true, &live_17890, &cfg, true, &sys_off, &clash);
+        assert_eq!(h3, "mismatch");
+        assert!(!r3);
+        assert!(d3.contains("17890"), "diag={d3}");
+
+        // 4. Dead port :10810 -> dead_proxy alert, never takeover relaunch
+        let dead_10810 = vec![EnvVarHealth {
+            scope: "process".into(),
+            key: "ALL_PROXY".into(),
+            value: "http://127.0.0.1:10810".into(),
+            host_port: Some("127.0.0.1:10810".into()),
+            alive: Some(false),
+        }];
+        let (h4, _d4, r4) =
+            classify_app_health(&app, true, &dead_10810, &cfg, false, &sys_off, &clash);
+        assert_eq!(h4, "dead_proxy");
+        assert!(!r4);
+
+        // 5. Launch and shortcut creation must refuse ExternalManaged
+        let mut launcher = ProcessLauncher::new();
+        let logs = Arc::new(LogBuffer::new());
+        let launch_res =
+            launch_managed_app_with_clean_env(&app, &cfg, &mut launcher, 17898, false, false, logs);
+        assert!(launch_res.is_err());
+        let sc_res = create_desktop_shortcut_for_app(&app, &cfg, &launcher);
+        assert!(sc_res.is_err());
     }
 }

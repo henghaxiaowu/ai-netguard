@@ -56,10 +56,6 @@ pub enum AccountBrowserKind {
     None,
 }
 
-fn default_true() -> bool {
-    true
-}
-
 fn default_pct_100() -> u8 {
     100
 }
@@ -115,8 +111,6 @@ pub struct AccountRecord {
     pub environment_name: String,
     #[serde(default)]
     pub environment_profile: Option<String>,
-    #[serde(default = "default_true")]
-    pub enable_antigravity: bool,
     #[serde(default)]
     pub browser_kind: AccountBrowserKind,
     #[serde(default)]
@@ -1075,7 +1069,6 @@ mod tests {
             env_type: AccountEnvType::Fingerprint,
             environment_name: "AdsPower".into(),
             environment_profile: Some("Win-042".into()),
-            enable_antigravity: true,
             browser_kind: AccountBrowserKind::Netguard,
             adspower_user_id: None,
             adspower_serial_number: None,
@@ -1335,13 +1328,14 @@ proxies:
 
     #[test]
     fn normalize_account_sanitizes_quota_and_launcher_toggles() {
-        let legacy: AccountRecord =
-            serde_json::from_str(r#"{"email":"legacy@gmail.com"}"#).expect("legacy json deserializes");
-        assert!(legacy.enable_antigravity);
+        let legacy: AccountRecord = serde_json::from_str(
+            r#"{"email":"legacy@gmail.com","enableAntigravity":true}"#,
+        )
+        .expect("legacy json deserializes even with deprecated enableAntigravity");
+        assert_eq!(legacy.email, "legacy@gmail.com");
         assert_eq!(legacy.browser_kind, AccountBrowserKind::Netguard);
 
         let mut rec = sample_record("acc-q", "quota@gmail.com");
-        rec.enable_antigravity = false;
         rec.browser_kind = AccountBrowserKind::None;
         rec.quota = Some(AccountQuotaConfig {
             enabled: true,
@@ -1366,7 +1360,6 @@ proxies:
         });
 
         let norm = normalize_account(rec, None).expect("normalize should pass");
-        assert!(!norm.enable_antigravity);
         assert_eq!(norm.browser_kind, AccountBrowserKind::None);
         let q = norm.quota.expect("quota preserved");
         assert_eq!(q.plan_tier, "PRO");

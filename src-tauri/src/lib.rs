@@ -337,6 +337,9 @@ fn save_config(
     mut config: AppConfig,
 ) -> Result<AppConfig, String> {
     ensure_default_browser_profile(&mut config);
+    if config.managed_apps_schema_version < models::CURRENT_MANAGED_APPS_SCHEMA_VERSION {
+        config.managed_apps_schema_version = models::CURRENT_MANAGED_APPS_SCHEMA_VERSION;
+    }
     save_config_to_disk(&config)?;
     let mut inner = state.inner.lock().unwrap();
     inner.config = config.clone();
@@ -1241,138 +1244,6 @@ async fn resolve_and_verify_account_proxy(
     Ok((resolved, verified_exit))
 }
 
-#[tauri::command]
-async fn launch_account_antigravity(
-    state: State<'_, Arc<AppState>>,
-    account_id: String,
-) -> Result<AccountLaunchOutcome, String> {
-    let account = {
-        let guard = state
-            .accounts
-            .lock()
-            .map_err(|_| "账号库状态锁定失败".to_string())?;
-        guard
-            .iter()
-            .find(|a| a.id == account_id.trim())
-            .cloned()
-            .ok_or_else(|| "未找到指定账号记录".to_string())?
-    };
-
-    if !account.enable_antigravity {
-        return Err("该账号已关闭 Antigravity 一键启动，如需使用请在「编辑」中重新开启".into());
-    }
-
-    let (resolved, verified_exit) = resolve_and_verify_account_proxy(state.inner(), &account).await?;
-
-    let display_label = if account.label.trim().is_empty() {
-        account.email.clone()
-    } else {
-        account.label.clone()
-    };
-
-    let (msg, next_cfg, session) = {
-        let mut inner = state.inner.lock().unwrap();
-        if let Some(app) = inner
-            .config
-            .managed_apps
-            .iter_mut()
-            .find(|a| a.id == "antigravity")
-        {
-            app.proxy_mode = AppProxyMode::CustomProxy;
-            app.custom_proxy_url = Some(resolved.http_proxy_url.clone());
-        } else {
-            return Err("未找到 Antigravity 受控应用配置".into());
-        }
-        save_config_to_disk(&inner.config)?;
-
-        let app_cfg = inner
-            .config
-            .managed_apps
-            .iter()
-            .find(|a| a.id == "antigravity")
-            .cloned()
-            .unwrap();
-        let cfg_clone = inner.config.clone();
-        let gateway_ok = inner.singbox.is_running() && !inner.singbox.is_blocked();
-        let _ = inner.pac.ensure_started(cfg_clone.browser_port);
-        let launch_msg = app_env::launch_managed_app_with_clean_env(
-            &app_cfg,
-            &cfg_clone,
-            &mut inner.launcher,
-            PAC_PORT,
-            gateway_ok,
-            true,
-            state.logs.clone(),
-        )?;
-
-        let prev_same = inner
-            .active_account_session
-            .as_ref()
-            .filter(|s| s.account_id == account.id);
-        let existing_browser_id = prev_same
-            .and_then(|s| s.browser_profile_id.clone())
-            .or_else(|| account.linked_browser_profile_id.clone());
-        let (acc_uid, acc_sn, acc_adspower_label) = resolve_account_adspower_target(&account);
-        let effective_kind = prev_same
-            .map(|s| s.browser_kind.clone())
-            .unwrap_or_else(|| match account.browser_kind {
-                AccountBrowserKind::Adspower => "adspower".to_string(),
-                AccountBrowserKind::Netguard => "netguard".to_string(),
-                AccountBrowserKind::None => "none".to_string(),
-            });
-        let effective_adspower_uid = prev_same
-            .and_then(|s| s.adspower_user_id.clone())
-            .or(acc_uid)
-            .or(acc_sn);
-        let effective_adspower_label = prev_same
-            .and_then(|s| s.adspower_profile_label.clone())
-            .or(acc_adspower_label);
-
-        let sess = ActiveAccountSession {
-            account_id: account.id.clone(),
-            account_label: display_label.clone(),
-            email: account.email.clone(),
-            node_source: resolved.node_source.clone(),
-            node_name: resolved.node_name.clone(),
-            proxy_url: resolved.http_proxy_url.clone(),
-            local_port: resolved.local_port,
-            verified_exit_ip: Some(verified_exit.clone()),
-            antigravity_launched: true,
-            browser_kind: effective_kind,
-            browser_profile_id: existing_browser_id,
-            adspower_user_id: effective_adspower_uid,
-            adspower_profile_label: effective_adspower_label,
-            activated_at: chrono::Local::now().format("%H:%M:%S").to_string(),
-        };
-        inner.active_account_session = Some(sess.clone());
-        state.logs.push(format!(
-            "[账号切换] 已验证出口 {} ({}) 并以 [{}] 环境干净重启 Antigravity -> {}",
-            verified_exit.ip,
-            verified_exit.country_code.as_deref().unwrap_or("--"),
-            display_label,
-            resolved.http_proxy_url
-        ));
-        (launch_msg, cfg_clone, sess)
-    };
-
-    let accounts = state
-        .accounts
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default();
-    let status = state.snapshot_status();
-    Ok(AccountLaunchOutcome {
-        message: format!(
-            "已切换账号 [{display_label}] ({}, IP {}) -> {msg}",
-            resolved.node_name, verified_exit.ip
-        ),
-        config: next_cfg,
-        accounts,
-        status,
-        session,
-    })
-}
-
 fn resolve_account_adspower_target(
     account: &AccountRecord,
 ) -> (Option<String>, Option<String>, Option<String>) {
@@ -1482,11 +1353,6 @@ async fn launch_account_browser(
                 .map(|g| g.clone())
                 .unwrap_or_default();
             inner.running_adspower_ids.insert(track_key.clone());
-            let prev_antigravity = inner
-                .active_account_session
-                .as_ref()
-                .filter(|s| s.account_id == account.id)
-                .is_some_and(|s| s.antigravity_launched);
             let sess = ActiveAccountSession {
                 account_id: account.id.clone(),
                 account_label: display_label.clone(),
@@ -1496,7 +1362,6 @@ async fn launch_account_browser(
                 proxy_url,
                 local_port,
                 verified_exit_ip: verified_exit.clone(),
-                antigravity_launched: prev_antigravity,
                 browser_kind: "adspower".to_string(),
                 browser_profile_id: None,
                 adspower_user_id: Some(track_key.clone()),
@@ -1719,11 +1584,6 @@ async fn launch_account_browser(
             state.logs.clone(),
         )?;
 
-        let prev_antigravity = inner
-            .active_account_session
-            .as_ref()
-            .filter(|s| s.account_id == account.id)
-            .is_some_and(|s| s.antigravity_launched);
         let sess = ActiveAccountSession {
             account_id: account.id.clone(),
             account_label: display_label.clone(),
@@ -1733,7 +1593,6 @@ async fn launch_account_browser(
             proxy_url: resolved.browser_proxy_url.clone(),
             local_port: resolved.local_port,
             verified_exit_ip: Some(verified_exit.clone()),
-            antigravity_launched: prev_antigravity,
             browser_kind: "netguard".to_string(),
             browser_profile_id: Some(profile.id.clone()),
             adspower_user_id: None,
@@ -2693,7 +2552,6 @@ pub fn run() {
             launch_browser_profile,
             close_browser_profile,
             probe_node_exit,
-            launch_account_antigravity,
             launch_account_browser,
             clear_active_account_session,
             toggle_kill_switch,
@@ -2891,7 +2749,6 @@ mod tests {
             env_type: accounts::AccountEnvType::Custom,
             environment_name: String::new(),
             environment_profile: None,
-            enable_antigravity: true,
             browser_kind: AccountBrowserKind::Netguard,
             adspower_user_id: None,
             adspower_serial_number: None,

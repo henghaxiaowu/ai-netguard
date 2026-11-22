@@ -67,8 +67,6 @@ export const api = {
     invoke<ClashVergeNodesSnapshot>("list_clash_verge_nodes"),
   reorderAccounts: (orderedIds: string[]) =>
     invoke<AccountRecord[]>("reorder_accounts", { orderedIds }),
-  launchAccountAntigravity: (accountId: string) =>
-    invoke<AccountLaunchOutcome>("launch_account_antigravity", { accountId }),
   launchAccountBrowser: (accountId: string, url?: string | null) =>
     invoke<AccountLaunchOutcome>("launch_account_browser", {
       accountId,

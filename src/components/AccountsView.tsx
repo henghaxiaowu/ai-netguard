@@ -23,7 +23,6 @@ import {
   Square,
   Trash2,
   X,
-  Zap,
 } from "lucide-react";
 import type {
   AccountBrowserKind,
@@ -76,7 +75,6 @@ interface AccountsViewProps {
   gatewayRunning: boolean;
   gatewayBrowserPort: number;
   gatewayActiveNodeId: string;
-  antigravityRunning: boolean;
   adspowerConfig: AdsPowerConfigStatus | null;
   adspowerProfiles: AdsPowerProfilesSnapshot | null;
   loading: boolean;
@@ -89,7 +87,6 @@ interface AccountsViewProps {
   onSaveEnvPresets: (presets: AccountEnvPreset[]) => Promise<void>;
   onRefreshClashNodes: () => Promise<void>;
   onReorder: (orderedIds: string[]) => Promise<void>;
-  onLaunchAntigravity: (accountId: string) => Promise<void>;
   onLaunchBrowser: (accountId: string) => Promise<void>;
   onCloseBrowserProfile: (profileId: string) => Promise<void>;
   onCloseAdsPowerProfile: (
@@ -121,7 +118,6 @@ interface AccountFormState {
   envType: AccountEnvType;
   environmentName: string;
   environmentProfile: string;
-  enableAntigravity: boolean;
   browserKind: AccountBrowserKind;
   adspowerUserId: string;
   adspowerSerialNumber: string;
@@ -226,7 +222,6 @@ function emptyFormState(): AccountFormState {
     envType: "fingerprint",
     environmentName: "",
     environmentProfile: "",
-    enableAntigravity: true,
     browserKind: "netguard",
     adspowerUserId: "",
     adspowerSerialNumber: "",
@@ -272,7 +267,6 @@ function recordToFormState(acc: AccountRecord): AccountFormState {
     envType: normalizeEnvType(acc.envType),
     environmentName: acc.environmentName || "",
     environmentProfile: acc.environmentProfile || "",
-    enableAntigravity: acc.enableAntigravity !== false,
     browserKind,
     adspowerUserId: acc.adspowerUserId || "",
     adspowerSerialNumber: acc.adspowerSerialNumber || "",
@@ -475,7 +469,6 @@ export function AccountsView({
   gatewayRunning,
   gatewayBrowserPort,
   gatewayActiveNodeId,
-  antigravityRunning,
   adspowerConfig,
   adspowerProfiles,
   loading,
@@ -488,7 +481,6 @@ export function AccountsView({
   onSaveEnvPresets,
   onRefreshClashNodes,
   onReorder,
-  onLaunchAntigravity,
   onLaunchBrowser,
   onCloseBrowserProfile,
   onCloseAdsPowerProfile,
@@ -513,7 +505,6 @@ export function AccountsView({
   const [revealedSecrets, setRevealedSecrets] = useState<Record<string, boolean>>({});
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [saving, setSaving] = useState(false);
-  const [launchingAgId, setLaunchingAgId] = useState<string | null>(null);
   const [launchingBrowserId, setLaunchingBrowserId] = useState<string | null>(null);
   const [clearingSession, setClearingSession] = useState(false);
 
@@ -696,23 +687,6 @@ export function AccountsView({
     }
     return map;
   }, [accounts, nowMs]);
-
-  const handleRowLaunchAntigravity = async (acc: AccountRecord) => {
-    const q = quotaByAccountId.get(acc.id);
-    if (q?.enabled) {
-      if (q.expiry?.state === "expired") {
-        onNotify(`提示：账号「${acc.label || acc.email}」订阅已到期，仍继续尝试拉起 Antigravity`);
-      } else if (q.allExhausted) {
-        onNotify(`提示：账号「${acc.label || acc.email}」所有模型分组均处于冷却中，仍继续尝试拉起`);
-      }
-    }
-    setLaunchingAgId(acc.id);
-    try {
-      await onLaunchAntigravity(acc.id);
-    } finally {
-      setLaunchingAgId(null);
-    }
-  };
 
   const handleUpdateQuotaPools = async (
     acc: AccountRecord,
@@ -1204,7 +1178,6 @@ export function AccountsView({
       envType: form.envType,
       environmentName: form.environmentName.trim(),
       environmentProfile: form.environmentProfile.trim() || null,
-      enableAntigravity: form.enableAntigravity,
       browserKind: form.browserKind,
       adspowerUserId: form.adspowerUserId.trim() || null,
       adspowerSerialNumber:
@@ -1326,10 +1299,6 @@ export function AccountsView({
               typeof item.environmentProfile === "string"
                 ? item.environmentProfile
                 : null,
-            enableAntigravity:
-              typeof item.enableAntigravity === "boolean"
-                ? item.enableAntigravity
-                : true,
             browserKind:
               item.browserKind === "none"
                 ? "none"
@@ -1845,11 +1814,6 @@ export function AccountsView({
                     : ""}
                 </Badge>
               )}
-              {activeSession.antigravityLaunched && (
-                <Badge variant={antigravityRunning ? "iris" : "neutral"}>
-                  Antigravity {antigravityRunning ? "运行中" : "已按此端口拉起"}
-                </Badge>
-              )}
               {activeSession.browserKind === "adspower" ? (
                 <Badge
                   variant={
@@ -1960,7 +1924,7 @@ export function AccountsView({
             />
             <span className="font-medium text-[#525866]">当前激活环境：待机</span>
             <span>
-              点击下方任意已绑定节点的账号「⚡ Antigravity」或「🌐 浏览器」，将先完成外部真实出口 IP 强校验再纯净拉起
+              点击下方任意已绑定节点的账号「🌐 浏览器」或「AdsPower」，将先完成外部真实出口 IP 强校验再纯净拉起（Antigravity 账号与代理启动已统一交由 Cockpit Tools 管理）
             </span>
           </div>
         )}
@@ -2165,7 +2129,6 @@ export function AccountsView({
               const isUnbound =
                 normalizeNodeSource(acc.linkedNodeSource, acc.linkedNodeId) === "none" ||
                 !nodeDisplay;
-              const showAntigravityBtn = acc.enableAntigravity !== false;
               const showBrowserBtn = acc.browserKind !== "none";
               const rowQuota = quotaByAccountId.get(acc.id);
               const isAdspower = acc.browserKind === "adspower";
@@ -2176,8 +2139,7 @@ export function AccountsView({
                 "";
               const hasAdspowerTarget = Boolean(adsUidTrimmed || adsSnTrimmed);
               const canLaunchBrowser = isAdspower ? hasAdspowerTarget : !isUnbound;
-              const isBusyRow =
-                launchingAgId === acc.id || launchingBrowserId === acc.id;
+              const isBusyRow = launchingBrowserId === acc.id;
               const isAccBrowserRunning = isAdspower
                 ? Boolean(
                     (adsUidTrimmed && runningAdspowerSet.has(adsUidTrimmed)) ||
@@ -2291,36 +2253,6 @@ export function AccountsView({
                       </div>
 
                       <div className="flex shrink-0 items-center gap-1">
-                        {showAntigravityBtn && (
-                          <Button
-                            variant={
-                              isActiveSessionAccount && activeSession?.antigravityLaunched
-                                ? "solid"
-                                : "soft"
-                            }
-                            size="xs"
-                            disabled={isBusyRow || isUnbound}
-                            title={
-                              isUnbound
-                                ? "未绑定节点（禁止裸连），请先在「编辑」中绑定节点"
-                                : previewPort.port
-                                  ? `按「${nodeDisplay?.name}」(:${previewPort.port}) 切换代理并纯净重启 Antigravity`
-                                  : previewPort.reason ||
-                                    `按「${nodeDisplay?.name}」纯净重启 Antigravity`
-                            }
-                            onClick={() => void handleRowLaunchAntigravity(acc)}
-                          >
-                            {launchingAgId === acc.id ? (
-                              <Loader2
-                                className="h-3 w-3 animate-spin"
-                                aria-hidden="true"
-                              />
-                            ) : (
-                              <Zap className="h-3 w-3" aria-hidden="true" />
-                            )}
-                            Antigravity
-                          </Button>
-                        )}
                         {showBrowserBtn && (
                           <Button
                             variant={isAccBrowserRunning ? "solid" : "outline"}
@@ -3483,49 +3415,8 @@ export function AccountsView({
                 </div>
               </div>
 
-              {/* Launcher Visibility & Browser Engine */}
+              {/* Browser Engine */}
               <div className="space-y-3 rounded-xl border border-[#eaecef] bg-[#fafbfc] p-3">
-                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#eaecef] pb-2.5">
-                  <div>
-                    <div className="text-[0.73rem] font-medium text-[#525866]">
-                      Antigravity 一键启动按钮
-                    </div>
-                    <div className="text-[0.68rem] text-[#7c8495]">
-                      不用此账号跑 Antigravity 时可关闭，列表行将隐藏「⚡ Antigravity」
-                    </div>
-                  </div>
-                  <div className="flex gap-1" role="group" aria-label="Antigravity 启动开关">
-                    {(
-                      [
-                        { value: true, label: "启用" },
-                        { value: false, label: "不启用" },
-                      ] as const
-                    ).map((opt) => {
-                      const active = form.enableAntigravity === opt.value;
-                      return (
-                        <button
-                          key={String(opt.value)}
-                          type="button"
-                          aria-pressed={active}
-                          onClick={() =>
-                            setForm((prev) => ({
-                              ...prev,
-                              enableAntigravity: opt.value,
-                            }))
-                          }
-                          className={`rounded-md border px-2.5 py-0.5 text-[0.69rem] font-medium transition-colors cursor-pointer ${
-                            active
-                              ? "border-[#dcd4fb] bg-[#6d5bd0] text-white"
-                              : "border-[#dce0e6] bg-white text-[#525866] hover:bg-[#f3f4f6]"
-                          }`}
-                        >
-                          {opt.label}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-[0.73rem] font-medium text-[#525866]">
                     浏览器启动引擎（不需要专用浏览器时选「不启用」）

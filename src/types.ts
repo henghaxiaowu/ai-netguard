@@ -10,7 +10,12 @@ export type OutboundMode = "physical_bypass" | "upstream_detour" | "default_rout
 
 export type KillSwitchMode = "fail_closed" | "monitor_only";
 
-export type AppProxyMode = "netguard" | "system_proxy" | "direct" | "custom_proxy";
+export type AppProxyMode =
+  | "netguard"
+  | "external_managed"
+  | "system_proxy"
+  | "direct"
+  | "custom_proxy";
 
 export interface ManagedAppConfig {
   id: string;
@@ -106,6 +111,7 @@ export interface AppConfig {
   autoLaunchClaudeDesktop: boolean;
   requireNetguardForClaude: boolean;
   aiDomains: string[];
+  managedAppsSchemaVersion?: number;
   managedApps: ManagedAppConfig[];
   browserProfiles?: BrowserProfile[];
 }
@@ -298,7 +304,6 @@ export interface AccountRecord {
   envType: AccountEnvType;
   environmentName: string;
   environmentProfile?: string | null;
-  enableAntigravity?: boolean;
   browserKind?: AccountBrowserKind;
   adspowerUserId?: string | null;
   adspowerSerialNumber?: string | null;
@@ -326,7 +331,6 @@ export interface ActiveAccountSession {
   proxyUrl: string;
   localPort: number;
   verifiedExitIp?: ExitIpInfo | null;
-  antigravityLaunched: boolean;
   browserKind?: AccountBrowserKind | string;
   browserProfileId?: string | null;
   adspowerUserId?: string | null;

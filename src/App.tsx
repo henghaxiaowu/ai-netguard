@@ -847,32 +847,6 @@ export default function App() {
     }
   };
 
-  const handleLaunchAccountAntigravity = async (accountId: string) => {
-    try {
-      if (dirty && config) {
-        await handleSaveConfig(config);
-      }
-      const res = await api.launchAccountAntigravity(accountId);
-      setConfig(res.config);
-      setAccounts(res.accounts);
-      setStatus(res.status);
-      setDirty(false);
-      notify(res.message);
-      setTimeout(() => {
-        void refreshAppEnv();
-      }, 900);
-    } catch (err) {
-      if (!isTauriEnv()) {
-        const acc = accounts.find((a) => a.id === accountId);
-        notify(
-          `预览模式：已模拟按账号「${acc?.label || acc?.email || accountId}」切换代理并拉起 Antigravity`,
-        );
-        return;
-      }
-      notify(`拉起 Antigravity 失败: ${String(err)}`);
-    }
-  };
-
   const handleLaunchAccountBrowser = async (accountId: string) => {
     try {
       if (dirty && config) {
@@ -2115,7 +2089,9 @@ export default function App() {
               <AppsEnvView
                 config={config}
                 snapshot={appEnv}
+                clashNodes={clashNodes}
                 scanning={scanningApps}
+                loadingClashNodes={loadingClashNodes}
                 gatewayRunning={Boolean(status?.running && !status?.blockedByKillSwitch)}
                 dirty={dirty}
                 onConfigChange={(next) => {
@@ -2127,6 +2103,7 @@ export default function App() {
                   await refreshAppEnv();
                 }}
                 onRescan={refreshAppEnv}
+                onRefreshClashNodes={refreshClashNodes}
                 onLaunchApp={handleLaunchManagedApp}
                 onCleanRegistryEnv={handleCleanRegistryEnv}
                 onCreateShortcut={handleCreateAppShortcut}
@@ -2148,9 +2125,6 @@ export default function App() {
                 gatewayRunning={Boolean(status?.running && !status?.blockedByKillSwitch)}
                 gatewayBrowserPort={config?.browserPort ?? 17891}
                 gatewayActiveNodeId={config?.activeNodeId ?? ""}
-                antigravityRunning={Boolean(
-                  appEnv?.apps?.find((a) => a.id === "antigravity")?.running,
-                )}
                 adspowerConfig={adspowerConfig}
                 adspowerProfiles={adspowerProfiles}
                 loading={loadingAccounts}
@@ -2163,7 +2137,6 @@ export default function App() {
                 onSaveEnvPresets={handleSaveEnvPresets}
                 onRefreshClashNodes={refreshClashNodes}
                 onReorder={handleReorderAccounts}
-                onLaunchAntigravity={handleLaunchAccountAntigravity}
                 onLaunchBrowser={handleLaunchAccountBrowser}
                 onCloseBrowserProfile={handleCloseBrowserProfile}
                 onCloseAdsPowerProfile={handleCloseAdsPowerProfile}

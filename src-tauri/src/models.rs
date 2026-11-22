@@ -33,10 +33,13 @@ pub enum KillSwitchMode {
 #[serde(rename_all = "snake_case")]
 pub enum AppProxyMode {
     Netguard,
+    ExternalManaged,
     SystemProxy,
     Direct,
     CustomProxy,
 }
+
+pub const CURRENT_MANAGED_APPS_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -80,7 +83,7 @@ pub fn default_managed_apps() -> Vec<ManagedAppConfig> {
                 "Antigravity.exe".into(),
                 "language_server_windows_x64.exe".into(),
             ],
-            proxy_mode: AppProxyMode::SystemProxy,
+            proxy_mode: AppProxyMode::ExternalManaged,
             custom_proxy_url: None,
             wfp_lock: false,
             extra_args: Vec::new(),
@@ -102,8 +105,8 @@ pub fn default_managed_apps() -> Vec<ManagedAppConfig> {
             builtin: true,
             exe_path: None,
             process_names: vec!["cockpit-tools.exe".into()],
-            proxy_mode: AppProxyMode::SystemProxy,
-            custom_proxy_url: None,
+            proxy_mode: AppProxyMode::CustomProxy,
+            custom_proxy_url: Some("http://127.0.0.1:7897".into()),
             wfp_lock: false,
             extra_args: Vec::new(),
         },
@@ -290,7 +293,6 @@ pub struct ActiveAccountSession {
     pub local_port: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified_exit_ip: Option<ExitIpInfo>,
-    pub antigravity_launched: bool,
     #[serde(default = "default_browser_kind_str")]
     pub browser_kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -369,6 +371,8 @@ pub struct AppConfig {
     #[serde(default = "default_true")]
     pub require_netguard_for_claude: bool,
     pub ai_domains: Vec<String>,
+    #[serde(default)]
+    pub managed_apps_schema_version: u32,
     #[serde(default = "default_managed_apps")]
     pub managed_apps: Vec<ManagedAppConfig>,
     #[serde(default = "default_browser_profiles")]
@@ -441,6 +445,7 @@ impl Default for AppConfig {
                 "ip.net.coffee".into(),
                 "fuck-claude.vercel.app".into(),
             ],
+            managed_apps_schema_version: CURRENT_MANAGED_APPS_SCHEMA_VERSION,
             managed_apps: default_managed_apps(),
             browser_profiles: default_browser_profiles(),
         }
@@ -602,10 +607,79 @@ pub fn app_data_dir() -> PathBuf {
     dir
 }
 
+pub fn detect_cockpit_global_proxy_url() -> Option<String> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)?;
+    let raw = std::fs::read_to_string(home.join(".antigravity_cockpit").join("config.json")).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    if val.get("global_proxy_enabled").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    let url = val
+        .get("global_proxy_url")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    Some(url.to_string())
+}
+
+pub fn migrate_config_with_cockpit_proxy(
+    cfg: &mut AppConfig,
+    cockpit_proxy_url: Option<&str>,
+) -> bool {
+    if cfg.managed_apps_schema_version >= CURRENT_MANAGED_APPS_SCHEMA_VERSION {
+        return false;
+    }
+    let trimmed_cockpit = cockpit_proxy_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    for app in &mut cfg.managed_apps {
+        if app.id == "antigravity"
+            && matches!(
+                app.proxy_mode,
+                AppProxyMode::SystemProxy | AppProxyMode::CustomProxy
+            )
+        {
+            app.proxy_mode = AppProxyMode::ExternalManaged;
+            app.custom_proxy_url = None;
+            app.wfp_lock = false;
+        } else if app.id == "cockpit-tools"
+            && matches!(app.proxy_mode, AppProxyMode::SystemProxy)
+        {
+            if let Some(ref url) = trimmed_cockpit {
+                app.proxy_mode = AppProxyMode::CustomProxy;
+                app.custom_proxy_url = Some(url.clone());
+                app.wfp_lock = false;
+            } else {
+                app.proxy_mode = AppProxyMode::ExternalManaged;
+                app.custom_proxy_url = None;
+                app.wfp_lock = false;
+            }
+        }
+    }
+
+    cfg.managed_apps_schema_version = CURRENT_MANAGED_APPS_SCHEMA_VERSION;
+    true
+}
+
+pub fn migrate_config_in_place(cfg: &mut AppConfig) -> bool {
+    if cfg.managed_apps_schema_version >= CURRENT_MANAGED_APPS_SCHEMA_VERSION {
+        return false;
+    }
+    let cockpit_proxy = detect_cockpit_global_proxy_url();
+    migrate_config_with_cockpit_proxy(cfg, cockpit_proxy.as_deref())
+}
+
 pub fn load_config() -> AppConfig {
     let path = app_data_dir().join("config.json");
     if let Ok(raw) = std::fs::read_to_string(&path) {
-        if let Ok(cfg) = serde_json::from_str::<AppConfig>(&raw) {
+        if let Ok(mut cfg) = serde_json::from_str::<AppConfig>(&raw) {
+            if migrate_config_in_place(&mut cfg) {
+                let _ = save_config_to_disk(&cfg);
+            }
             return cfg;
         }
     }
@@ -653,5 +727,111 @@ impl LogBuffer {
         if let Ok(mut guard) = self.lines.lock() {
             guard.clear();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrate_config_updates_antigravity_and_cockpit_once_idempotently() {
+        let mut cfg = AppConfig {
+            managed_apps_schema_version: 0,
+            managed_apps: vec![
+                ManagedAppConfig {
+                    id: "claude-desktop".into(),
+                    name: "Claude Desktop".into(),
+                    builtin: true,
+                    exe_path: None,
+                    process_names: vec!["claude.exe".into()],
+                    proxy_mode: AppProxyMode::Netguard,
+                    custom_proxy_url: None,
+                    wfp_lock: true,
+                    extra_args: Vec::new(),
+                },
+                ManagedAppConfig {
+                    id: "antigravity".into(),
+                    name: "Antigravity".into(),
+                    builtin: true,
+                    exe_path: None,
+                    process_names: vec!["Antigravity.exe".into()],
+                    proxy_mode: AppProxyMode::SystemProxy,
+                    custom_proxy_url: Some("http://127.0.0.1:10809".into()),
+                    wfp_lock: true,
+                    extra_args: Vec::new(),
+                },
+                ManagedAppConfig {
+                    id: "cockpit-tools".into(),
+                    name: "Cockpit Tools".into(),
+                    builtin: true,
+                    exe_path: None,
+                    process_names: vec!["cockpit-tools.exe".into()],
+                    proxy_mode: AppProxyMode::SystemProxy,
+                    custom_proxy_url: None,
+                    wfp_lock: false,
+                    extra_args: Vec::new(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(migrate_config_with_cockpit_proxy(
+            &mut cfg,
+            Some("http://127.0.0.1:7897")
+        ));
+        assert_eq!(
+            cfg.managed_apps_schema_version,
+            CURRENT_MANAGED_APPS_SCHEMA_VERSION
+        );
+        let ag = cfg.managed_apps.iter().find(|a| a.id == "antigravity").unwrap();
+        assert_eq!(ag.proxy_mode, AppProxyMode::ExternalManaged);
+        assert_eq!(ag.custom_proxy_url, None);
+        assert!(!ag.wfp_lock);
+
+        let cp = cfg.managed_apps.iter().find(|a| a.id == "cockpit-tools").unwrap();
+        assert_eq!(cp.proxy_mode, AppProxyMode::CustomProxy);
+        assert_eq!(cp.custom_proxy_url.as_deref(), Some("http://127.0.0.1:7897"));
+
+        // Second run must be a no-op even if user switches Antigravity back manually.
+        cfg.managed_apps
+            .iter_mut()
+            .find(|a| a.id == "antigravity")
+            .unwrap()
+            .proxy_mode = AppProxyMode::Direct;
+        assert!(!migrate_config_with_cockpit_proxy(
+            &mut cfg,
+            Some("http://127.0.0.1:7897")
+        ));
+        assert_eq!(
+            cfg.managed_apps
+                .iter()
+                .find(|a| a.id == "antigravity")
+                .unwrap()
+                .proxy_mode,
+            AppProxyMode::Direct
+        );
+
+        // When Cockpit has no global proxy enabled, fallback to ExternalManaged.
+        let mut cfg_no_proxy = AppConfig {
+            managed_apps_schema_version: 0,
+            ..Default::default()
+        };
+        cfg_no_proxy
+            .managed_apps
+            .iter_mut()
+            .find(|a| a.id == "cockpit-tools")
+            .unwrap()
+            .proxy_mode = AppProxyMode::SystemProxy;
+        assert!(migrate_config_with_cockpit_proxy(&mut cfg_no_proxy, None));
+        assert_eq!(
+            cfg_no_proxy
+                .managed_apps
+                .iter()
+                .find(|a| a.id == "cockpit-tools")
+                .unwrap()
+                .proxy_mode,
+            AppProxyMode::ExternalManaged
+        );
     }
 }

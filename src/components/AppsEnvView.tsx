@@ -20,6 +20,7 @@ import type {
   AppConfig,
   AppEnvSnapshot,
   AppProxyMode,
+  ClashVergeNodesSnapshot,
   ManagedAppConfig,
   ManagedAppRuntimeStatus,
 } from "../types";
@@ -38,12 +39,15 @@ import { Switch } from "./ui/switch";
 interface AppsEnvViewProps {
   config: AppConfig;
   snapshot: AppEnvSnapshot | null;
+  clashNodes: ClashVergeNodesSnapshot | null;
   scanning: boolean;
+  loadingClashNodes: boolean;
   gatewayRunning: boolean;
   dirty: boolean;
   onConfigChange: (next: AppConfig) => void;
   onSave: () => Promise<void>;
   onRescan: () => Promise<void>;
+  onRefreshClashNodes: () => Promise<void>;
   onLaunchApp: (appId: string, relaunch: boolean) => Promise<void>;
   onCleanRegistryEnv: () => Promise<void>;
   onCreateShortcut: (appId: string) => Promise<void>;
@@ -51,9 +55,10 @@ interface AppsEnvViewProps {
 
 const MODE_LABELS: Record<AppProxyMode, string> = {
   netguard: "AI NetGuard 独享出口",
-  system_proxy: "干净系统代理 (Clash)",
+  external_managed: "外部托管 · 仅巡检",
+  custom_proxy: "指定代理 / Clash 端口",
+  system_proxy: "跟随系统网络 (无环境变量)",
   direct: "直连无代理",
-  custom_proxy: "自定义代理",
 };
 
 function appIconMeta(id: string) {
@@ -71,29 +76,47 @@ function appIconMeta(id: string) {
   }
 }
 
-function healthBadge(rt?: ManagedAppRuntimeStatus) {
+function healthBadge(rt?: ManagedAppRuntimeStatus, mode?: AppProxyMode) {
   if (!rt || !rt.running) {
     return <Badge variant="neutral">未运行</Badge>;
   }
+  const effectiveMode = mode ?? rt.proxyMode;
   switch (rt.health) {
     case "dead_proxy":
       return <Badge variant="danger">死代理污染</Badge>;
     case "mismatch":
-      return <Badge variant="warning">策略不一致</Badge>;
+      return (
+        <Badge variant="warning">
+          {effectiveMode === "external_managed" ? "环境告警" : "策略不一致"}
+        </Badge>
+      );
     default:
-      return <Badge variant="success">干净运行</Badge>;
+      return (
+        <Badge variant="success">
+          {effectiveMode === "external_managed" ? "托管正常" : "干净运行"}
+        </Badge>
+      );
   }
+}
+
+function normalizeProxyKey(raw?: string | null): string {
+  const trimmed = (raw ?? "").trim().toLowerCase();
+  if (!trimmed) return "";
+  return trimmed.includes("://") ? trimmed : `http://${trimmed}`;
 }
 
 export function AppsEnvView({
   config,
   snapshot,
+  clashNodes,
   scanning,
+  loadingClashNodes,
   gatewayRunning,
   dirty,
   onConfigChange,
   onSave,
   onRescan,
+  onRefreshClashNodes,
   onLaunchApp,
   onCleanRegistryEnv,
   onCreateShortcut,
@@ -179,6 +202,24 @@ export function AppsEnvView({
   const totalCount = config.managedApps.length;
   const pollutedCount = snapshot?.pollutedCount ?? 0;
 
+  const clashPortPresets: { url: string; label: string; nodeHint?: string }[] = [];
+  if (clashNodes?.mixedPort) {
+    clashPortPresets.push({
+      url: `http://127.0.0.1:${clashNodes.mixedPort}`,
+      label: `:${clashNodes.mixedPort} Clash 混合`,
+    });
+  }
+  for (const listener of clashNodes?.listeners ?? []) {
+    const scheme = listener.listenerType.toLowerCase().includes("socks")
+      ? "socks5"
+      : "http";
+    clashPortPresets.push({
+      url: `${scheme}://127.0.0.1:${listener.port}`,
+      label: `:${listener.port} ${listener.name}`,
+      nodeHint: listener.proxy || undefined,
+    });
+  }
+
   return (
     <div className="bento-sheet flex flex-col divide-y divide-[#eaecef] rounded-2xl border border-[#eaecef] bg-white shadow-[0_1px_3px_rgba(15,23,42,0.03)]">
       {/* Header */}
@@ -242,10 +283,10 @@ export function AppsEnvView({
           </div>
           <div className="text-[0.71rem] text-[#7c8495]">
             {sysProxy?.enabled && sysProxy.alive
-              ? "Clash 等系统代理工作正常，不会误判"
+              ? "系统代理工作正常（「跟随系统网络」应用将直连此代理）"
               : sysProxy?.enabled
                 ? "系统代理端口未监听，请检查代理软件"
-                : "跟随操作系统默认路由"}
+                : "未开启系统代理（「跟随系统网络」等同直连，推荐用指定 Clash 端口）"}
           </div>
         </div>
 
@@ -316,6 +357,7 @@ export function AppsEnvView({
           const isExpanded = expandedId === app.id;
           const isBusy = busyAppId === app.id;
           const isNetguard = app.proxyMode === "netguard";
+          const isExternalManaged = app.proxyMode === "external_managed";
           const isDead = rt?.health === "dead_proxy";
           const isMismatch = rt?.health === "mismatch";
 
@@ -339,7 +381,7 @@ export function AppsEnvView({
                       <span className="text-[0.88rem] font-semibold text-[#111827]">
                         {app.name}
                       </span>
-                      {healthBadge(rt)}
+                      {healthBadge(rt, app.proxyMode)}
                       {rt?.running && (
                         <span className="mono-num text-[0.7rem] text-[#7c8495]">
                           {rt.pids.length} 进程 (PID {rt.pids[0]})
@@ -404,7 +446,7 @@ export function AppsEnvView({
 
                 {/* Controls */}
                 <div className="flex shrink-0 flex-wrap items-center gap-2 pl-11 lg:pl-0">
-                  <div className="w-[178px]">
+                  <div className="w-[196px]">
                     <Select
                       value={app.proxyMode}
                       onValueChange={(v) => {
@@ -425,9 +467,10 @@ export function AppsEnvView({
                         {(
                           [
                             "netguard",
+                            "external_managed",
+                            "custom_proxy",
                             "system_proxy",
                             "direct",
-                            "custom_proxy",
                           ] as AppProxyMode[]
                         ).map((mode) => (
                           <SelectItem
@@ -442,87 +485,102 @@ export function AppsEnvView({
                     </Select>
                   </div>
 
-                  {/* Per-app WFP Lock switch (only active when NetGuard mode selected) */}
-                  <div
-                    className="flex items-center gap-1.5 rounded-lg border border-[#eaecef] bg-[#f8f9fb] px-2.5 py-1.5"
-                    title={
-                      isNetguard
-                        ? "仅允许该应用访问 AI NetGuard 回环端口，阻断直连"
-                        : "仅在选择「AI NetGuard 独享出口」模式时可启用 WFP 锁"
-                    }
-                  >
-                    <Shield
-                      className={`h-3.5 w-3.5 ${
-                        app.wfpLock && isNetguard
-                          ? "text-[#6d5bd0]"
-                          : "text-[#9ca3af]"
-                      }`}
-                      aria-hidden="true"
-                    />
-                    <label
-                      htmlFor={`${uid}-wfp-${app.id}`}
-                      className="text-[0.72rem] text-[#525866] cursor-pointer select-none"
+                  {isExternalManaged ? (
+                    <span
+                      className="inline-flex h-8 items-center rounded-lg border border-[#eaecef] bg-[#f8f9fb] px-2.5 text-[0.71rem] font-medium text-[#525866]"
+                      title={
+                        app.id === "antigravity"
+                          ? "由 Cockpit Tools 按账号管理与重启，AI NetGuard 不接管或改写该应用代理"
+                          : "由外部工具管理启动，AI NetGuard 仅做 PEB 巡检告警"
+                      }
                     >
-                      WFP
-                    </label>
-                    <Switch
-                      id={`${uid}-wfp-${app.id}`}
-                      size="sm"
-                      disabled={!isNetguard}
-                      checked={isNetguard && app.wfpLock}
-                      onCheckedChange={(checked) =>
-                        updateApp(app.id, { wfpLock: checked })
-                      }
-                    />
-                  </div>
-
-                  {/* Launch / Clean Relaunch Action */}
-                  {rt?.running ? (
-                    <Button
-                      variant={
-                        isDead ? "destructive" : isMismatch ? "solid" : "outline"
-                      }
-                      size="xs"
-                      disabled={
-                        isBusy || (isNetguard && !gatewayRunning)
-                      }
-                      onClick={() => runLaunch(app.id, true)}
-                    >
-                      <RotateCcw className="h-3 w-3" aria-hidden="true" />
-                      {isBusy ? "重启中..." : "干净重启"}
-                    </Button>
+                      仅巡检 · 不接管重启
+                    </span>
                   ) : (
-                    <Button
-                      variant="soft"
-                      size="xs"
-                      disabled={
-                        isBusy || (isNetguard && !gatewayRunning)
-                      }
-                      onClick={() => runLaunch(app.id, false)}
-                    >
-                      <Play className="h-3 w-3" aria-hidden="true" />
-                      {isBusy ? "启动中..." : "干净启动"}
-                    </Button>
-                  )}
+                    <>
+                      {/* Per-app WFP Lock switch (only active when NetGuard mode selected) */}
+                      <div
+                        className="flex items-center gap-1.5 rounded-lg border border-[#eaecef] bg-[#f8f9fb] px-2.5 py-1.5"
+                        title={
+                          isNetguard
+                            ? "仅允许该应用访问 AI NetGuard 回环端口，阻断直连"
+                            : "仅在选择「AI NetGuard 独享出口」模式时可启用 WFP 锁"
+                        }
+                      >
+                        <Shield
+                          className={`h-3.5 w-3.5 ${
+                            app.wfpLock && isNetguard
+                              ? "text-[#6d5bd0]"
+                              : "text-[#9ca3af]"
+                          }`}
+                          aria-hidden="true"
+                        />
+                        <label
+                          htmlFor={`${uid}-wfp-${app.id}`}
+                          className="text-[0.72rem] text-[#525866] cursor-pointer select-none"
+                        >
+                          WFP
+                        </label>
+                        <Switch
+                          id={`${uid}-wfp-${app.id}`}
+                          size="sm"
+                          disabled={!isNetguard}
+                          checked={isNetguard && app.wfpLock}
+                          onCheckedChange={(checked) =>
+                            updateApp(app.id, { wfpLock: checked })
+                          }
+                        />
+                      </div>
 
-                  <Button
-                    variant="ghost"
-                    size="xs"
-                    title={`在桌面创建 ${app.name} 托管快捷方式（双击直接按当前策略启动，无需打开 AI NetGuard）`}
-                    aria-label={`为 ${app.name} 创建桌面快捷方式`}
-                    disabled={isBusy}
-                    onClick={async () => {
-                      setBusyAppId(app.id);
-                      try {
-                        if (dirty) await onSave();
-                        await onCreateShortcut(app.id);
-                      } finally {
-                        setBusyAppId(null);
-                      }
-                    }}
-                  >
-                    <Link2 className="h-3.5 w-3.5" aria-hidden="true" />
-                  </Button>
+                      {/* Launch / Clean Relaunch Action */}
+                      {rt?.running ? (
+                        <Button
+                          variant={
+                            isDead ? "destructive" : isMismatch ? "solid" : "outline"
+                          }
+                          size="xs"
+                          disabled={
+                            isBusy || (isNetguard && !gatewayRunning)
+                          }
+                          onClick={() => runLaunch(app.id, true)}
+                        >
+                          <RotateCcw className="h-3 w-3" aria-hidden="true" />
+                          {isBusy ? "重启中..." : "干净重启"}
+                        </Button>
+                      ) : (
+                        <Button
+                          variant="soft"
+                          size="xs"
+                          disabled={
+                            isBusy || (isNetguard && !gatewayRunning)
+                          }
+                          onClick={() => runLaunch(app.id, false)}
+                        >
+                          <Play className="h-3 w-3" aria-hidden="true" />
+                          {isBusy ? "启动中..." : "干净启动"}
+                        </Button>
+                      )}
+
+                      <Button
+                        variant="ghost"
+                        size="xs"
+                        title={`在桌面创建 ${app.name} 托管快捷方式（双击直接按当前策略启动，无需打开 AI NetGuard）`}
+                        aria-label={`为 ${app.name} 创建桌面快捷方式`}
+                        disabled={isBusy}
+                        onClick={async () => {
+                          setBusyAppId(app.id);
+                          try {
+                            if (dirty) await onSave();
+                            await onCreateShortcut(app.id);
+                          } finally {
+                            setBusyAppId(null);
+                          }
+                        }}
+                      >
+                        <Link2 className="h-3.5 w-3.5" aria-hidden="true" />
+                      </Button>
+                    </>
+                  )}
 
                   <Button
                     variant="ghost"
@@ -538,24 +596,72 @@ export function AppsEnvView({
                 </div>
               </div>
 
-              {/* Custom proxy inline input when CustomProxy selected */}
+              {/* Custom proxy / Clash port inline selector when CustomProxy selected */}
               {app.proxyMode === "custom_proxy" && (
-                <div className="flex flex-wrap items-center gap-2 pl-11">
-                  <label
-                    htmlFor={`${uid}-cproxy-${app.id}`}
-                    className="text-[0.72rem] font-medium text-[#7c8495]"
-                  >
-                    自定义代理 URL
-                  </label>
-                  <Input
-                    id={`${uid}-cproxy-${app.id}`}
-                    className="mono-num h-7 max-w-[260px] text-[0.75rem]"
-                    placeholder="http://127.0.0.1:7897"
-                    value={app.customProxyUrl || ""}
-                    onChange={(e) =>
-                      updateApp(app.id, { customProxyUrl: e.target.value })
-                    }
-                  />
+                <div className="flex flex-col gap-2 pl-11">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label
+                      htmlFor={`${uid}-cproxy-${app.id}`}
+                      className="text-[0.72rem] font-medium text-[#7c8495]"
+                    >
+                      指定代理 URL
+                    </label>
+                    <Input
+                      id={`${uid}-cproxy-${app.id}`}
+                      className="mono-num h-7 max-w-[260px] text-[0.75rem]"
+                      placeholder="http://127.0.0.1:7897"
+                      value={app.customProxyUrl || ""}
+                      onChange={(e) =>
+                        updateApp(app.id, { customProxyUrl: e.target.value })
+                      }
+                    />
+                    <Button
+                      variant="ghost"
+                      size="xs"
+                      title="刷新本地 Clash Verge 监听端口"
+                      disabled={loadingClashNodes}
+                      onClick={() => void onRefreshClashNodes()}
+                    >
+                      <RefreshCw
+                        className={`h-3 w-3 ${loadingClashNodes ? "animate-spin" : ""}`}
+                        aria-hidden="true"
+                      />
+                      {clashPortPresets.length > 0 ? "刷新 Clash 端口" : "读取 Clash 端口"}
+                    </Button>
+                  </div>
+                  {clashPortPresets.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="text-[0.69rem] text-[#7c8495]">
+                        Clash 快捷端口：
+                      </span>
+                      {clashPortPresets.map((preset) => {
+                        const selected =
+                          normalizeProxyKey(app.customProxyUrl) ===
+                          normalizeProxyKey(preset.url);
+                        return (
+                          <button
+                            key={preset.url}
+                            type="button"
+                            title={
+                              preset.nodeHint
+                                ? `${preset.url}（出口组：${preset.nodeHint}）`
+                                : preset.url
+                            }
+                            onClick={() =>
+                              updateApp(app.id, { customProxyUrl: preset.url })
+                            }
+                            className={`mono-num inline-flex max-w-full items-center gap-1 rounded-md border px-2 py-0.5 text-[0.69rem] font-medium transition-colors cursor-pointer ${
+                              selected
+                                ? "border-[#c4b5fd] bg-[#f5f3ff] text-[#5b21b6]"
+                                : "border-[#eaecef] bg-[#f8f9fb] text-[#525866] hover:border-[#d1d5db] hover:bg-white"
+                            }`}
+                          >
+                            {preset.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -683,10 +789,11 @@ export function AppsEnvView({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="system_proxy">干净系统代理</SelectItem>
+                  <SelectItem value="custom_proxy">指定代理 / Clash</SelectItem>
+                  <SelectItem value="system_proxy">跟随系统网络</SelectItem>
                   <SelectItem value="netguard">AI NetGuard</SelectItem>
+                  <SelectItem value="external_managed">外部托管 · 仅巡检</SelectItem>
                   <SelectItem value="direct">直连</SelectItem>
-                  <SelectItem value="custom_proxy">自定义代理</SelectItem>
                 </SelectContent>
               </Select>
             </div>
