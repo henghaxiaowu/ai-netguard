@@ -53,6 +53,42 @@ pub enum AccountBrowserKind {
     #[default]
     Netguard,
     Adspower,
+    None,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_pct_100() -> u8 {
+    100
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountQuotaPool {
+    #[serde(default)]
+    pub id: String,
+    pub label: String,
+    #[serde(default = "default_pct_100")]
+    pub remaining_pct: u8,
+    #[serde(default)]
+    pub reset_hours: u32,
+    #[serde(default)]
+    pub reset_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountQuotaConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub plan_tier: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub pools: Vec<AccountQuotaPool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +115,8 @@ pub struct AccountRecord {
     pub environment_name: String,
     #[serde(default)]
     pub environment_profile: Option<String>,
+    #[serde(default = "default_true")]
+    pub enable_antigravity: bool,
     #[serde(default)]
     pub browser_kind: AccountBrowserKind,
     #[serde(default)]
@@ -87,6 +125,8 @@ pub struct AccountRecord {
     pub adspower_serial_number: Option<String>,
     #[serde(default)]
     pub adspower_profile_name: Option<String>,
+    #[serde(default)]
+    pub quota: Option<AccountQuotaConfig>,
     #[serde(default)]
     pub linked_node_source: AccountNodeSource,
     #[serde(default)]
@@ -290,6 +330,27 @@ pub fn normalize_account(
     record.purpose = record.purpose.trim().to_string();
     record.tags = normalize_tags(record.tags);
     record.notes = trim_opt(record.notes);
+
+    record.quota = record.quota.map(|mut q| {
+        q.plan_tier = q.plan_tier.trim().to_string();
+        q.expires_at = trim_opt(q.expires_at);
+        let mut clean_pools = Vec::with_capacity(q.pools.len());
+        for (idx, mut pool) in q.pools.into_iter().enumerate() {
+            pool.label = pool.label.trim().to_string();
+            if pool.label.is_empty() {
+                continue;
+            }
+            pool.id = pool.id.trim().to_string();
+            if pool.id.is_empty() {
+                pool.id = format!("pool-{}", idx + 1);
+            }
+            pool.remaining_pct = pool.remaining_pct.min(100);
+            pool.reset_at = trim_opt(pool.reset_at);
+            clean_pools.push(pool);
+        }
+        q.pools = clean_pools;
+        q
+    });
 
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     record.created_at = match existing {
@@ -1014,10 +1075,12 @@ mod tests {
             env_type: AccountEnvType::Fingerprint,
             environment_name: "AdsPower".into(),
             environment_profile: Some("Win-042".into()),
+            enable_antigravity: true,
             browser_kind: AccountBrowserKind::Netguard,
             adspower_user_id: None,
             adspower_serial_number: None,
             adspower_profile_name: None,
+            quota: None,
             linked_node_source: AccountNodeSource::Netguard,
             linked_node_id: Some("seoul-vps".into()),
             linked_node_name: Some("首尔 VPS 独享出口".into()),
@@ -1268,5 +1331,50 @@ proxies:
         assert_eq!(snap.listeners[1].proxy, "🇯🇵 日本Z10 | IEPL");
         assert_eq!(snap.listeners[2].port, 10810);
         assert_eq!(snap.listeners[2].proxy, "🇯🇵 日本家宽-川崎");
+    }
+
+    #[test]
+    fn normalize_account_sanitizes_quota_and_launcher_toggles() {
+        let legacy: AccountRecord =
+            serde_json::from_str(r#"{"email":"legacy@gmail.com"}"#).expect("legacy json deserializes");
+        assert!(legacy.enable_antigravity);
+        assert_eq!(legacy.browser_kind, AccountBrowserKind::Netguard);
+
+        let mut rec = sample_record("acc-q", "quota@gmail.com");
+        rec.enable_antigravity = false;
+        rec.browser_kind = AccountBrowserKind::None;
+        rec.quota = Some(AccountQuotaConfig {
+            enabled: true,
+            plan_tier: "  PRO  ".into(),
+            expires_at: Some(" 2026-12-31 ".into()),
+            pools: vec![
+                AccountQuotaPool {
+                    id: "".into(),
+                    label: " Claude / GPT ".into(),
+                    remaining_pct: 145,
+                    reset_hours: 5,
+                    reset_at: Some("   ".into()),
+                },
+                AccountQuotaPool {
+                    id: "empty-lbl".into(),
+                    label: "   ".into(),
+                    remaining_pct: 50,
+                    reset_hours: 5,
+                    reset_at: None,
+                },
+            ],
+        });
+
+        let norm = normalize_account(rec, None).expect("normalize should pass");
+        assert!(!norm.enable_antigravity);
+        assert_eq!(norm.browser_kind, AccountBrowserKind::None);
+        let q = norm.quota.expect("quota preserved");
+        assert_eq!(q.plan_tier, "PRO");
+        assert_eq!(q.expires_at.as_deref(), Some("2026-12-31"));
+        assert_eq!(q.pools.len(), 1);
+        assert_eq!(q.pools[0].id, "pool-1");
+        assert_eq!(q.pools[0].label, "Claude / GPT");
+        assert_eq!(q.pools[0].remaining_pct, 100);
+        assert_eq!(q.pools[0].reset_at, None);
     }
 }

@@ -1258,6 +1258,10 @@ async fn launch_account_antigravity(
             .ok_or_else(|| "未找到指定账号记录".to_string())?
     };
 
+    if !account.enable_antigravity {
+        return Err("该账号已关闭 Antigravity 一键启动，如需使用请在「编辑」中重新开启".into());
+    }
+
     let (resolved, verified_exit) = resolve_and_verify_account_proxy(state.inner(), &account).await?;
 
     let display_label = if account.label.trim().is_empty() {
@@ -1314,6 +1318,7 @@ async fn launch_account_antigravity(
             .unwrap_or_else(|| match account.browser_kind {
                 AccountBrowserKind::Adspower => "adspower".to_string(),
                 AccountBrowserKind::Netguard => "netguard".to_string(),
+                AccountBrowserKind::None => "none".to_string(),
             });
         let effective_adspower_uid = prev_same
             .and_then(|s| s.adspower_user_id.clone())
@@ -1425,6 +1430,10 @@ async fn launch_account_browser(
     } else {
         account.label.clone()
     };
+
+    if account.browser_kind == AccountBrowserKind::None {
+        return Err("该账号已关闭浏览器启动功能，如需使用请在「编辑」中重新开启".into());
+    }
 
     if account.browser_kind == AccountBrowserKind::Adspower {
         let (uid, sn, adspower_label) = resolve_account_adspower_target(&account);
@@ -2882,10 +2891,12 @@ mod tests {
             env_type: accounts::AccountEnvType::Custom,
             environment_name: String::new(),
             environment_profile: None,
+            enable_antigravity: true,
             browser_kind: AccountBrowserKind::Netguard,
             adspower_user_id: None,
             adspower_serial_number: None,
             adspower_profile_name: None,
+            quota: None,
             linked_node_source: AccountNodeSource::None,
             linked_node_id: None,
             linked_node_name: None,

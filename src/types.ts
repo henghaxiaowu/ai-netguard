@@ -220,7 +220,22 @@ export type AccountEnvType = "fingerprint" | "local" | "custom";
 
 export type AccountNodeSource = "none" | "netguard" | "clash_verge" | "custom";
 
-export type AccountBrowserKind = "netguard" | "adspower";
+export type AccountBrowserKind = "netguard" | "adspower" | "none";
+
+export interface AccountQuotaPool {
+  id: string;
+  label: string;
+  remainingPct: number;
+  resetHours: number;
+  resetAt?: string | null;
+}
+
+export interface AccountQuotaConfig {
+  enabled: boolean;
+  planTier: string;
+  expiresAt?: string | null;
+  pools: AccountQuotaPool[];
+}
 
 export interface AdsPowerConfigStatus {
   baseUrl: string;
@@ -283,10 +298,12 @@ export interface AccountRecord {
   envType: AccountEnvType;
   environmentName: string;
   environmentProfile?: string | null;
+  enableAntigravity?: boolean;
   browserKind?: AccountBrowserKind;
   adspowerUserId?: string | null;
   adspowerSerialNumber?: string | null;
   adspowerProfileName?: string | null;
+  quota?: AccountQuotaConfig | null;
   linkedNodeSource?: AccountNodeSource;
   linkedNodeId?: string | null;
   linkedNodeName?: string | null;

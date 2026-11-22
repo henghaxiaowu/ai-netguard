@@ -30,6 +30,8 @@ import type {
   AccountEnvPreset,
   AccountEnvType,
   AccountNodeSource,
+  AccountQuotaConfig,
+  AccountQuotaPool,
   AccountRecord,
   AccountStatus,
   ActiveAccountSession,
@@ -41,6 +43,15 @@ import type {
   NodeProfile,
 } from "../types";
 import { generateStrongPassword, generateTotp } from "../lib/totp";
+import {
+  createAntigravityQuotaPreset,
+  createClaudeQuotaPreset,
+  createSingleQuotaPreset,
+  evaluateAccountQuota,
+  isoToLocalDatetimeInput,
+  localDatetimeInputToIso,
+  type EvaluatedAccountQuota,
+} from "../lib/quota";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
@@ -110,10 +121,15 @@ interface AccountFormState {
   envType: AccountEnvType;
   environmentName: string;
   environmentProfile: string;
+  enableAntigravity: boolean;
   browserKind: AccountBrowserKind;
   adspowerUserId: string;
   adspowerSerialNumber: string;
   adspowerProfileName: string;
+  quotaEnabled: boolean;
+  quotaPlanTier: string;
+  quotaExpiresAt: string;
+  quotaPools: AccountQuotaPool[];
   linkedNodeSource: AccountNodeSource;
   linkedNodeId: string;
   linkedNodeName: string;
@@ -210,10 +226,15 @@ function emptyFormState(): AccountFormState {
     envType: "fingerprint",
     environmentName: "",
     environmentProfile: "",
+    enableAntigravity: true,
     browserKind: "netguard",
     adspowerUserId: "",
     adspowerSerialNumber: "",
     adspowerProfileName: "",
+    quotaEnabled: false,
+    quotaPlanTier: "PRO",
+    quotaExpiresAt: "",
+    quotaPools: createAntigravityQuotaPreset().pools,
     linkedNodeSource: "none",
     linkedNodeId: "",
     linkedNodeName: "",
@@ -229,6 +250,16 @@ function emptyFormState(): AccountFormState {
 
 function recordToFormState(acc: AccountRecord): AccountFormState {
   const source = normalizeNodeSource(acc.linkedNodeSource, acc.linkedNodeId);
+  const browserKind: AccountBrowserKind =
+    acc.browserKind === "none"
+      ? "none"
+      : acc.browserKind === "adspower"
+        ? "adspower"
+        : "netguard";
+  const quotaPools =
+    acc.quota?.pools && acc.quota.pools.length > 0
+      ? acc.quota.pools.map((p) => ({ ...p }))
+      : createAntigravityQuotaPreset().pools;
   return {
     id: acc.id,
     label: acc.label || "",
@@ -241,10 +272,15 @@ function recordToFormState(acc: AccountRecord): AccountFormState {
     envType: normalizeEnvType(acc.envType),
     environmentName: acc.environmentName || "",
     environmentProfile: acc.environmentProfile || "",
-    browserKind: acc.browserKind === "adspower" ? "adspower" : "netguard",
+    enableAntigravity: acc.enableAntigravity !== false,
+    browserKind,
     adspowerUserId: acc.adspowerUserId || "",
     adspowerSerialNumber: acc.adspowerSerialNumber || "",
     adspowerProfileName: acc.adspowerProfileName || "",
+    quotaEnabled: Boolean(acc.quota?.enabled),
+    quotaPlanTier: acc.quota?.planTier || "PRO",
+    quotaExpiresAt: acc.quota?.expiresAt || "",
+    quotaPools,
     linkedNodeSource: source,
     linkedNodeId: acc.linkedNodeId || "",
     linkedNodeName: acc.linkedNodeName || "",
@@ -471,6 +507,7 @@ export function AccountsView({
   const [search, setSearch] = useState("");
   const [envFilter, setEnvFilter] = useState<string>("__all__");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [quotaReadyOnly, setQuotaReadyOnly] = useState(false);
   const [expandedIds, setExpandedIds] = useState<Record<string, boolean>>({});
   const [revealedPasswords, setRevealedPasswords] = useState<Record<string, boolean>>({});
   const [revealedSecrets, setRevealedSecrets] = useState<Record<string, boolean>>({});
@@ -520,17 +557,26 @@ export function AccountsView({
     };
   } | null>(null);
 
-  const hasTotpTargets = useMemo(
-    () => editorOpen || accounts.some((a) => Boolean(a.totpSecret?.trim())),
+  const hasLiveTicker = useMemo(
+    () =>
+      editorOpen ||
+      accounts.some(
+        (a) =>
+          Boolean(a.totpSecret?.trim()) ||
+          Boolean(
+            a.quota?.enabled &&
+              a.quota.pools.some((p) => Boolean(p.resetAt?.trim())),
+          ),
+      ),
     [accounts, editorOpen],
   );
 
   useEffect(() => {
-    if (!hasTotpTargets) return;
+    if (!hasLiveTicker) return;
     setNowMs(Date.now());
     const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
     return () => window.clearInterval(timer);
-  }, [hasTotpTargets]);
+  }, [hasLiveTicker]);
 
   useEffect(() => {
     const cleanEditor = attachLightDismissFallback(editorDialogRef.current);
@@ -545,7 +591,10 @@ export function AccountsView({
   }, []);
 
   const isFiltered = Boolean(
-    search.trim() || envFilter !== "__all__" || statusFilter !== "all",
+    search.trim() ||
+      envFilter !== "__all__" ||
+      statusFilter !== "all" ||
+      quotaReadyOnly,
   );
   const reorderDisabled = isFiltered || accounts.length < 2;
 
@@ -640,12 +689,50 @@ export function AccountsView({
     return findMatchingClashListener(form.linkedNodeName, clashNodes?.listeners);
   }, [form.linkedNodeSource, form.linkedNodeName, clashNodes?.listeners]);
 
+  const quotaByAccountId = useMemo(() => {
+    const map = new Map<string, EvaluatedAccountQuota>();
+    for (const acc of accounts) {
+      map.set(acc.id, evaluateAccountQuota(acc, nowMs));
+    }
+    return map;
+  }, [accounts, nowMs]);
+
   const handleRowLaunchAntigravity = async (acc: AccountRecord) => {
+    const q = quotaByAccountId.get(acc.id);
+    if (q?.enabled) {
+      if (q.expiry?.state === "expired") {
+        onNotify(`提示：账号「${acc.label || acc.email}」订阅已到期，仍继续尝试拉起 Antigravity`);
+      } else if (q.allExhausted) {
+        onNotify(`提示：账号「${acc.label || acc.email}」所有模型分组均处于冷却中，仍继续尝试拉起`);
+      }
+    }
     setLaunchingAgId(acc.id);
     try {
       await onLaunchAntigravity(acc.id);
     } finally {
       setLaunchingAgId(null);
+    }
+  };
+
+  const handleUpdateQuotaPools = async (
+    acc: AccountRecord,
+    nextPools: AccountQuotaPool[],
+    note: string,
+  ) => {
+    setSaving(true);
+    try {
+      await onUpsert({
+        ...acc,
+        quota: {
+          enabled: acc.quota?.enabled ?? true,
+          planTier: acc.quota?.planTier || "PRO",
+          expiresAt: acc.quota?.expiresAt || null,
+          pools: nextPools,
+        },
+      });
+      onNotify(note);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -686,11 +773,22 @@ export function AccountsView({
     let standby = 0;
     let restricted = 0;
     let banned = 0;
+    let quotaTracked = 0;
+    let quotaReady = 0;
+    let quotaExhausted = 0;
+    let quotaExpiring = 0;
     for (const acc of accounts) {
       if (acc.status === "active") active += 1;
       else if (acc.status === "standby") standby += 1;
       else if (acc.status === "restricted") restricted += 1;
       else if (acc.status === "banned") banned += 1;
+      const q = quotaByAccountId.get(acc.id);
+      if (q?.enabled) {
+        quotaTracked += 1;
+        if (q.isExpiringSoonOrExpired) quotaExpiring += 1;
+        if (q.allExhausted) quotaExhausted += 1;
+        if (q.hasAvailablePool && q.expiry?.state !== "expired") quotaReady += 1;
+      }
     }
     return {
       total: accounts.length,
@@ -699,8 +797,12 @@ export function AccountsView({
       restricted,
       banned,
       envCount: distinctEnvironments.length,
+      quotaTracked,
+      quotaReady,
+      quotaExhausted,
+      quotaExpiring,
     };
-  }, [accounts, distinctEnvironments]);
+  }, [accounts, distinctEnvironments, quotaByAccountId]);
 
   const bannedIds = useMemo(
     () => accounts.filter((a) => a.status === "banned").map((a) => a.id),
@@ -712,6 +814,12 @@ export function AccountsView({
     return accounts.filter((acc) => {
       if (statusFilter !== "all" && acc.status !== statusFilter) {
         return false;
+      }
+      if (quotaReadyOnly) {
+        const q = quotaByAccountId.get(acc.id);
+        if (!q?.enabled || !q.hasAvailablePool || q.expiry?.state === "expired") {
+          return false;
+        }
       }
       if (envFilter === "__empty__" && acc.environmentName.trim() !== "") {
         return false;
@@ -732,6 +840,7 @@ export function AccountsView({
         acc.email,
         acc.environmentName,
         acc.environmentProfile || "",
+        acc.quota?.planTier || "",
         envMeta.label,
         nodeDisplay?.sourceLabel || "",
         nodeDisplay?.name || "",
@@ -744,7 +853,15 @@ export function AccountsView({
         .toLowerCase();
       return haystack.includes(query);
     });
-  }, [accounts, statusFilter, envFilter, search, nodeById]);
+  }, [
+    accounts,
+    statusFilter,
+    quotaReadyOnly,
+    quotaByAccountId,
+    envFilter,
+    search,
+    nodeById,
+  ]);
 
   const filteredClashGroups = useMemo(() => {
     const list = clashNodes?.groups ?? [];
@@ -1042,6 +1159,39 @@ export function AccountsView({
       parsedProxyPort = n;
     }
 
+    const sanitizedQuota: AccountQuotaConfig | null = form.quotaEnabled
+      ? {
+          enabled: true,
+          planTier: form.quotaPlanTier.trim() || "PRO",
+          expiresAt: form.quotaExpiresAt.trim() || null,
+          pools: form.quotaPools
+            .map((p, idx) => ({
+              id: p.id.trim() || `pool-${idx + 1}`,
+              label: p.label.trim(),
+              remainingPct: Math.max(
+                0,
+                Math.min(100, Math.round(Number(p.remainingPct) || 0)),
+              ),
+              resetHours: Math.max(0, Math.round(Number(p.resetHours) || 0)),
+              resetAt: p.resetAt?.trim() || null,
+            }))
+            .filter((p) => p.label.length > 0),
+        }
+      : form.quotaExpiresAt.trim() ||
+          (form.quotaPools && form.quotaPools.length > 0 && form.id)
+        ? {
+            enabled: false,
+            planTier: form.quotaPlanTier.trim(),
+            expiresAt: form.quotaExpiresAt.trim() || null,
+            pools: form.quotaPools.filter((p) => p.label.trim().length > 0),
+          }
+        : null;
+
+    if (form.quotaEnabled && (!sanitizedQuota || sanitizedQuota.pools.length === 0)) {
+      setFormError("已开启额度管理时，请至少保留一个有效的模型分组名称");
+      return;
+    }
+
     const record: AccountRecord = {
       id: form.id,
       label: form.label.trim(),
@@ -1054,11 +1204,13 @@ export function AccountsView({
       envType: form.envType,
       environmentName: form.environmentName.trim(),
       environmentProfile: form.environmentProfile.trim() || null,
+      enableAntigravity: form.enableAntigravity,
       browserKind: form.browserKind,
       adspowerUserId: form.adspowerUserId.trim() || null,
       adspowerSerialNumber:
         form.adspowerSerialNumber.trim().replace(/^#/, "").trim() || null,
       adspowerProfileName: form.adspowerProfileName.trim() || null,
+      quota: sanitizedQuota,
       linkedNodeSource: effectiveSource,
       linkedNodeId: effectiveNodeId,
       linkedNodeName: effectiveNodeName,
@@ -1174,8 +1326,16 @@ export function AccountsView({
               typeof item.environmentProfile === "string"
                 ? item.environmentProfile
                 : null,
+            enableAntigravity:
+              typeof item.enableAntigravity === "boolean"
+                ? item.enableAntigravity
+                : true,
             browserKind:
-              item.browserKind === "adspower" ? "adspower" : "netguard",
+              item.browserKind === "none"
+                ? "none"
+                : item.browserKind === "adspower"
+                  ? "adspower"
+                  : "netguard",
             adspowerUserId:
               typeof item.adspowerUserId === "string"
                 ? item.adspowerUserId
@@ -1187,6 +1347,10 @@ export function AccountsView({
             adspowerProfileName:
               typeof item.adspowerProfileName === "string"
                 ? item.adspowerProfileName
+                : null,
+            quota:
+              item.quota && typeof item.quota === "object"
+                ? (item.quota as AccountQuotaConfig)
                 : null,
             linkedNodeSource,
             linkedNodeId,
@@ -1595,6 +1759,9 @@ export function AccountsView({
           </div>
           <div className="mono-num text-[0.7rem] text-[#7c8495]">
             备用闲置 {stats.standby} 个
+            {stats.quotaTracked > 0
+              ? ` · 可用额度 ${stats.quotaReady}/${stats.quotaTracked}`
+              : ""}
           </div>
         </div>
 
@@ -1618,6 +1785,10 @@ export function AccountsView({
             <span>受限 / 已封禁</span>
             {stats.banned > 0 ? (
               <Badge variant="danger">{stats.banned} 封禁</Badge>
+            ) : stats.quotaExpiring > 0 || stats.quotaExhausted > 0 ? (
+              <Badge variant="warning">
+                冷却 {stats.quotaExhausted} · 临期 {stats.quotaExpiring}
+              </Badge>
             ) : (
               <Badge variant="neutral">状态良好</Badge>
             )}
@@ -1626,7 +1797,10 @@ export function AccountsView({
             {stats.restricted + stats.banned}
           </div>
           <div className="mono-num text-[0.7rem] text-[#7c8495]">
-            受限 {stats.restricted} · 已封禁 {stats.banned}
+            受限 {stats.restricted} · 封禁 {stats.banned}
+            {stats.quotaTracked > 0
+              ? ` · 冷却 ${stats.quotaExhausted} / 临期 ${stats.quotaExpiring}`
+              : ""}
           </div>
         </div>
       </section>
@@ -1694,7 +1868,7 @@ export function AccountsView({
                     ? "运行中"
                     : "已绑定"}
                 </Badge>
-              ) : (
+              ) : activeSession.browserKind === "none" ? null : (
                 activeSession.browserProfileId && (
                   <Badge
                     variant={
@@ -1713,25 +1887,27 @@ export function AccountsView({
             </div>
 
             <div className="flex shrink-0 flex-wrap items-center gap-1.5">
-              <Button
-                variant="outline"
-                size="xs"
-                disabled={launchingBrowserId === activeSession.accountId}
-                onClick={() => {
-                  const acc = accounts.find((a) => a.id === activeSession.accountId);
-                  if (acc) void handleRowLaunchBrowser(acc);
-                  else void onLaunchBrowser(activeSession.accountId);
-                }}
-              >
-                {launchingBrowserId === activeSession.accountId ? (
-                  <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
-                ) : (
-                  <Globe className="h-3 w-3 text-[#6d5bd0]" aria-hidden="true" />
-                )}
-                {activeSession.browserKind === "adspower"
-                  ? "再开 AdsPower"
-                  : "再开浏览器"}
-              </Button>
+              {activeSession.browserKind !== "none" && (
+                <Button
+                  variant="outline"
+                  size="xs"
+                  disabled={launchingBrowserId === activeSession.accountId}
+                  onClick={() => {
+                    const acc = accounts.find((a) => a.id === activeSession.accountId);
+                    if (acc) void handleRowLaunchBrowser(acc);
+                    else void onLaunchBrowser(activeSession.accountId);
+                  }}
+                >
+                  {launchingBrowserId === activeSession.accountId ? (
+                    <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
+                  ) : (
+                    <Globe className="h-3 w-3 text-[#6d5bd0]" aria-hidden="true" />
+                  )}
+                  {activeSession.browserKind === "adspower"
+                    ? "再开 AdsPower"
+                    : "再开浏览器"}
+                </Button>
+              )}
               {activeSession.browserKind === "adspower" ? (
                 activeSession.adspowerUserId &&
                 runningAdspowerSet.has(activeSession.adspowerUserId) && (
@@ -1871,6 +2047,22 @@ export function AccountsView({
                 </button>
               );
             })}
+            <button
+              type="button"
+              onClick={() => setQuotaReadyOnly((v) => !v)}
+              aria-pressed={quotaReadyOnly}
+              className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[0.72rem] font-medium transition-colors cursor-pointer ${
+                quotaReadyOnly
+                  ? "border-[#bbf7d0] bg-[#ecfdf5] text-[#15803d]"
+                  : "border-[#eaecef] bg-white text-[#525866] hover:bg-[#f3f4f6] hover:text-[#111827]"
+              }`}
+              title="筛选开启了额度管理且至少有一个模型分组未耗尽、订阅未过期的账号"
+            >
+              <span>仅看有可用额度</span>
+              <span className="mono-num text-[0.68rem] opacity-80">
+                {stats.quotaReady}
+              </span>
+            </button>
           </div>
 
           <div className="flex items-center gap-2">
@@ -1945,6 +2137,7 @@ export function AccountsView({
                 setSearch("");
                 setEnvFilter("__all__");
                 setStatusFilter("all");
+                setQuotaReadyOnly(false);
               }}
             >
               重置筛选条件
@@ -1972,6 +2165,9 @@ export function AccountsView({
               const isUnbound =
                 normalizeNodeSource(acc.linkedNodeSource, acc.linkedNodeId) === "none" ||
                 !nodeDisplay;
+              const showAntigravityBtn = acc.enableAntigravity !== false;
+              const showBrowserBtn = acc.browserKind !== "none";
+              const rowQuota = quotaByAccountId.get(acc.id);
               const isAdspower = acc.browserKind === "adspower";
               const adsUidTrimmed = acc.adspowerUserId?.trim() || "";
               const adsSnTrimmed =
@@ -2095,69 +2291,73 @@ export function AccountsView({
                       </div>
 
                       <div className="flex shrink-0 items-center gap-1">
-                        <Button
-                          variant={
-                            isActiveSessionAccount && activeSession?.antigravityLaunched
-                              ? "solid"
-                              : "soft"
-                          }
-                          size="xs"
-                          disabled={isBusyRow || isUnbound}
-                          title={
-                            isUnbound
-                              ? "未绑定节点（禁止裸连），请先在「编辑」中绑定节点"
-                              : previewPort.port
-                                ? `按「${nodeDisplay?.name}」(:${previewPort.port}) 切换代理并纯净重启 Antigravity`
-                                : previewPort.reason ||
-                                  `按「${nodeDisplay?.name}」纯净重启 Antigravity`
-                          }
-                          onClick={() => void handleRowLaunchAntigravity(acc)}
-                        >
-                          {launchingAgId === acc.id ? (
-                            <Loader2
-                              className="h-3 w-3 animate-spin"
-                              aria-hidden="true"
-                            />
-                          ) : (
-                            <Zap className="h-3 w-3" aria-hidden="true" />
-                          )}
-                          Antigravity
-                        </Button>
-                        <Button
-                          variant={isAccBrowserRunning ? "solid" : "outline"}
-                          size="xs"
-                          disabled={isBusyRow || !canLaunchBrowser}
-                          title={
-                            isAdspower
-                              ? !hasAdspowerTarget
-                                ? "已设为 AdsPower 模式，请先在「编辑」中选择或填写 AdsPower 环境 ID / 序号"
-                                : `通过 Local API 拉起 AdsPower 环境「${acc.adspowerProfileName || (adsSnTrimmed ? `#${adsSnTrimmed}` : adsUidTrimmed)}」${!isUnbound && previewPort.port ? `（启动前先核验 :${previewPort.port} 出口 IP，保持 AdsPower 原代理不变）` : "（使用 AdsPower 原代理设置）"}`
-                              : isUnbound
+                        {showAntigravityBtn && (
+                          <Button
+                            variant={
+                              isActiveSessionAccount && activeSession?.antigravityLaunched
+                                ? "solid"
+                                : "soft"
+                            }
+                            size="xs"
+                            disabled={isBusyRow || isUnbound}
+                            title={
+                              isUnbound
                                 ? "未绑定节点（禁止裸连），请先在「编辑」中绑定节点"
-                                : isAccBrowserRunning
-                                  ? `专属浏览器运行中${previewPort.port ? ` (:${previewPort.port})` : ""}，点击再开新标签页`
-                                  : `打开此账号专属隔离指纹浏览器${previewPort.port ? ` (:${previewPort.port})` : ""}`
-                          }
-                          onClick={() => void handleRowLaunchBrowser(acc)}
-                        >
-                          {launchingBrowserId === acc.id ? (
-                            <Loader2
-                              className="h-3 w-3 animate-spin"
-                              aria-hidden="true"
-                            />
-                          ) : isAccBrowserRunning ? (
-                            <span
-                              className="h-2 w-2 rounded-full bg-[#4ade80]"
-                              aria-hidden="true"
-                            />
-                          ) : (
-                            <Globe
-                              className="h-3 w-3 text-[#6d5bd0]"
-                              aria-hidden="true"
-                            />
-                          )}
-                          {isAdspower ? "AdsPower" : "浏览器"}
-                        </Button>
+                                : previewPort.port
+                                  ? `按「${nodeDisplay?.name}」(:${previewPort.port}) 切换代理并纯净重启 Antigravity`
+                                  : previewPort.reason ||
+                                    `按「${nodeDisplay?.name}」纯净重启 Antigravity`
+                            }
+                            onClick={() => void handleRowLaunchAntigravity(acc)}
+                          >
+                            {launchingAgId === acc.id ? (
+                              <Loader2
+                                className="h-3 w-3 animate-spin"
+                                aria-hidden="true"
+                              />
+                            ) : (
+                              <Zap className="h-3 w-3" aria-hidden="true" />
+                            )}
+                            Antigravity
+                          </Button>
+                        )}
+                        {showBrowserBtn && (
+                          <Button
+                            variant={isAccBrowserRunning ? "solid" : "outline"}
+                            size="xs"
+                            disabled={isBusyRow || !canLaunchBrowser}
+                            title={
+                              isAdspower
+                                ? !hasAdspowerTarget
+                                  ? "已设为 AdsPower 模式，请先在「编辑」中选择或填写 AdsPower 环境 ID / 序号"
+                                  : `通过 Local API 拉起 AdsPower 环境「${acc.adspowerProfileName || (adsSnTrimmed ? `#${adsSnTrimmed}` : adsUidTrimmed)}」${!isUnbound && previewPort.port ? `（启动前先核验 :${previewPort.port} 出口 IP，保持 AdsPower 原代理不变）` : "（使用 AdsPower 原代理设置）"}`
+                                : isUnbound
+                                  ? "未绑定节点（禁止裸连），请先在「编辑」中绑定节点"
+                                  : isAccBrowserRunning
+                                    ? `专属浏览器运行中${previewPort.port ? ` (:${previewPort.port})` : ""}，点击再开新标签页`
+                                    : `打开此账号专属隔离指纹浏览器${previewPort.port ? ` (:${previewPort.port})` : ""}`
+                            }
+                            onClick={() => void handleRowLaunchBrowser(acc)}
+                          >
+                            {launchingBrowserId === acc.id ? (
+                              <Loader2
+                                className="h-3 w-3 animate-spin"
+                                aria-hidden="true"
+                              />
+                            ) : isAccBrowserRunning ? (
+                              <span
+                                className="h-2 w-2 rounded-full bg-[#4ade80]"
+                                aria-hidden="true"
+                              />
+                            ) : (
+                              <Globe
+                                className="h-3 w-3 text-[#6d5bd0]"
+                                aria-hidden="true"
+                              />
+                            )}
+                            {isAdspower ? "AdsPower" : "浏览器"}
+                          </Button>
+                        )}
                         <Button
                           variant="ghost"
                           size="xs"
@@ -2402,6 +2602,220 @@ export function AccountsView({
                         )}
                       </div>
                     </div>
+
+                    {/* Band 3: Compact Cockpit Quota Bar (only when enabled) */}
+                    {rowQuota?.enabled && rowQuota.pools.length > 0 && (
+                      <div
+                        data-quota-bar={acc.id}
+                        className="space-y-1.5 rounded-lg border border-[#eaecef] bg-[#fafbfc] px-3 py-2"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-[0.7rem]">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            {rowQuota.planTier && (
+                              <Badge variant="iris" className="mono-num">
+                                {rowQuota.planTier}
+                              </Badge>
+                            )}
+                            {rowQuota.expiry && (
+                              <Badge
+                                variant={
+                                  rowQuota.expiry.state === "expired"
+                                    ? "danger"
+                                    : rowQuota.expiry.state === "soon"
+                                      ? "warning"
+                                      : "neutral"
+                                }
+                                className="mono-num"
+                                title={`订阅到期日: ${acc.quota?.expiresAt || ""}`}
+                              >
+                                {rowQuota.expiry.label}
+                              </Badge>
+                            )}
+                            {rowQuota.allExhausted ? (
+                              <Badge variant="danger">全池冷却中</Badge>
+                            ) : (
+                              <Badge variant="success">额度可用</Badge>
+                            )}
+                          </div>
+
+                          {rowQuota.pools.some((item) => item.effectivePct < 100) && (
+                            <button
+                              type="button"
+                              disabled={saving}
+                              onClick={() => {
+                                const refilled = (acc.quota?.pools ?? []).map((p) => ({
+                                  ...p,
+                                  remainingPct: 100,
+                                  resetAt: null,
+                                }));
+                                void handleUpdateQuotaPools(
+                                  acc,
+                                  refilled,
+                                  `已将「${titleText}」全部模型额度重置为 100%`,
+                                );
+                              }}
+                              className="rounded border border-[#dcd4fb] bg-white px-2 py-0.5 text-[0.67rem] font-medium text-[#5b48c4] hover:bg-[#f0edfc] cursor-pointer disabled:opacity-45"
+                            >
+                              全部回满
+                            </button>
+                          )}
+                        </div>
+
+                        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 md:grid-cols-3">
+                          {rowQuota.pools.map((item, idx) => {
+                            const barColor =
+                              item.effectivePct <= 0
+                                ? "bg-[#ef4444]"
+                                : item.effectivePct <= 25
+                                  ? "bg-[#f59e0b]"
+                                  : "bg-[#16a34a]";
+                            const textColor =
+                              item.effectivePct <= 0
+                                ? "text-[#dc2626]"
+                                : item.effectivePct <= 25
+                                  ? "text-[#d97706]"
+                                  : "text-[#15803d]";
+                            return (
+                              <div
+                                key={`${item.pool.id}-${idx}`}
+                                className="space-y-1 rounded-md border border-[#eaecef] bg-white px-2.5 py-1.5"
+                              >
+                                <div className="flex items-center justify-between gap-2 text-[0.7rem]">
+                                  <span
+                                    title={item.pool.label}
+                                    className="min-w-0 truncate font-medium text-[#111827]"
+                                  >
+                                    {item.pool.label}
+                                  </span>
+                                  <span className={`mono-num shrink-0 font-semibold ${textColor}`}>
+                                    {item.effectivePct}%
+                                  </span>
+                                </div>
+                                <div className="h-1.5 w-full overflow-hidden rounded-full bg-[#e5e7eb]">
+                                  <div
+                                    className={`h-full rounded-full transition-all ${barColor}`}
+                                    style={{ width: `${item.effectivePct}%` }}
+                                  />
+                                </div>
+                                <div className="flex items-center justify-between gap-1 text-[0.65rem]">
+                                  <span className="mono-num truncate text-[#7c8495]">
+                                    {item.countdownText
+                                      ? `恢复 ${item.countdownText}`
+                                      : item.effectivePct >= 100
+                                        ? "满血就绪"
+                                        : item.pool.resetHours > 0
+                                          ? `周期 ${item.pool.resetHours}h`
+                                          : "手动控制"}
+                                  </span>
+                                  <div className="flex shrink-0 items-center gap-1">
+                                    {item.effectivePct > 0 && (
+                                      <>
+                                        <button
+                                          type="button"
+                                          disabled={saving}
+                                          onClick={() => {
+                                            const nextPct = Math.max(
+                                              0,
+                                              item.effectivePct - 20,
+                                            );
+                                            const nextResetAt =
+                                              nextPct === 0 && item.pool.resetHours > 0
+                                                ? new Date(
+                                                    Date.now() +
+                                                      item.pool.resetHours * 3_600_000,
+                                                  ).toISOString()
+                                                : item.isRefilled
+                                                  ? null
+                                                  : item.pool.resetAt || null;
+                                            const updated = (acc.quota?.pools ?? []).map(
+                                              (p, i) =>
+                                                i === idx
+                                                  ? {
+                                                      ...p,
+                                                      remainingPct: nextPct,
+                                                      resetAt: nextResetAt,
+                                                    }
+                                                  : p,
+                                            );
+                                            void handleUpdateQuotaPools(
+                                              acc,
+                                              updated,
+                                              `「${item.pool.label}」剩余额度已调整为 ${nextPct}%`,
+                                            );
+                                          }}
+                                          className="mono-num rounded border border-[#eaecef] bg-[#f8f9fb] px-1.5 py-0.5 text-[0.63rem] text-[#525866] hover:bg-[#f3f4f6] cursor-pointer disabled:opacity-45"
+                                        >
+                                          -20%
+                                        </button>
+                                        <button
+                                          type="button"
+                                          disabled={saving}
+                                          onClick={() => {
+                                            const nextResetAt =
+                                              item.pool.resetHours > 0
+                                                ? new Date(
+                                                    Date.now() +
+                                                      item.pool.resetHours * 3_600_000,
+                                                  ).toISOString()
+                                                : null;
+                                            const updated = (acc.quota?.pools ?? []).map(
+                                              (p, i) =>
+                                                i === idx
+                                                  ? {
+                                                      ...p,
+                                                      remainingPct: 0,
+                                                      resetAt: nextResetAt,
+                                                    }
+                                                  : p,
+                                            );
+                                            void handleUpdateQuotaPools(
+                                              acc,
+                                              updated,
+                                              item.pool.resetHours > 0
+                                                ? `已标记「${item.pool.label}」耗尽，开始 ${item.pool.resetHours}h 恢复倒计时`
+                                                : `已标记「${item.pool.label}」额度耗尽`,
+                                            );
+                                          }}
+                                          className="rounded border border-[#fecaca] bg-[#fef2f2] px-1.5 py-0.5 text-[0.63rem] font-medium text-[#dc2626] hover:bg-[#fee2e2] cursor-pointer disabled:opacity-45"
+                                        >
+                                          耗尽
+                                        </button>
+                                      </>
+                                    )}
+                                    {item.effectivePct < 100 && (
+                                      <button
+                                        type="button"
+                                        disabled={saving}
+                                        onClick={() => {
+                                          const updated = (acc.quota?.pools ?? []).map(
+                                            (p, i) =>
+                                              i === idx
+                                                ? {
+                                                    ...p,
+                                                    remainingPct: 100,
+                                                    resetAt: null,
+                                                  }
+                                                : p,
+                                          );
+                                          void handleUpdateQuotaPools(
+                                            acc,
+                                            updated,
+                                            `已恢复「${item.pool.label}」为 100%`,
+                                          );
+                                        }}
+                                        className="rounded border border-[#bbf7d0] bg-[#ecfdf5] px-1.5 py-0.5 text-[0.63rem] font-medium text-[#15803d] hover:bg-[#dcfce7] cursor-pointer disabled:opacity-45"
+                                      >
+                                        回满
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
 
                     {/* Inline Expanded Details */}
                     {isExpanded && (
@@ -3069,15 +3483,57 @@ export function AccountsView({
                 </div>
               </div>
 
-              {/* Browser Launch Mode & Profile Binding */}
-              <div className="space-y-2.5 rounded-xl border border-[#eaecef] bg-[#fafbfc] p-3">
+              {/* Launcher Visibility & Browser Engine */}
+              <div className="space-y-3 rounded-xl border border-[#eaecef] bg-[#fafbfc] p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#eaecef] pb-2.5">
+                  <div>
+                    <div className="text-[0.73rem] font-medium text-[#525866]">
+                      Antigravity 一键启动按钮
+                    </div>
+                    <div className="text-[0.68rem] text-[#7c8495]">
+                      不用此账号跑 Antigravity 时可关闭，列表行将隐藏「⚡ Antigravity」
+                    </div>
+                  </div>
+                  <div className="flex gap-1" role="group" aria-label="Antigravity 启动开关">
+                    {(
+                      [
+                        { value: true, label: "启用" },
+                        { value: false, label: "不启用" },
+                      ] as const
+                    ).map((opt) => {
+                      const active = form.enableAntigravity === opt.value;
+                      return (
+                        <button
+                          key={String(opt.value)}
+                          type="button"
+                          aria-pressed={active}
+                          onClick={() =>
+                            setForm((prev) => ({
+                              ...prev,
+                              enableAntigravity: opt.value,
+                            }))
+                          }
+                          className={`rounded-md border px-2.5 py-0.5 text-[0.69rem] font-medium transition-colors cursor-pointer ${
+                            active
+                              ? "border-[#dcd4fb] bg-[#6d5bd0] text-white"
+                              : "border-[#dce0e6] bg-white text-[#525866] hover:bg-[#f3f4f6]"
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-[0.73rem] font-medium text-[#525866]">
-                    浏览器启动引擎（点击列表「🌐 浏览器 / AdsPower」时使用）
+                    浏览器启动引擎（不需要专用浏览器时选「不启用」）
                   </span>
                   <div className="flex flex-wrap gap-1" role="group" aria-label="浏览器引擎">
                     {(
                       [
+                        { value: "none", label: "不启用" },
                         { value: "netguard", label: "NetGuard 内置浏览器" },
                         { value: "adspower", label: "AdsPower 专属窗口" },
                       ] as const
@@ -3110,7 +3566,11 @@ export function AccountsView({
                   </div>
                 </div>
 
-                {form.browserKind === "netguard" ? (
+                {form.browserKind === "none" ? (
+                  <p className="rounded-lg border border-dashed border-[#dce0e6] bg-white px-3 py-2 text-[0.7rem] text-[#7c8495]">
+                    已关闭此账号的浏览器启动功能，列表中将不再显示「🌐 浏览器 / AdsPower」按钮。
+                  </p>
+                ) : form.browserKind === "netguard" ? (
                   <div className="space-y-1.5">
                     <label
                       htmlFor={fid("linkedBrowserProfileId")}
@@ -3591,10 +4051,323 @@ export function AccountsView({
               </div>
             </fieldset>
 
-            {/* Section 4: Purpose, Tags, Notes */}
+            {/* Section 4: Cockpit-Style Quota & Cooldown */}
+            <fieldset className="space-y-3 border-t border-[#eaecef] pt-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <legend className="text-[0.76rem] font-semibold text-[#111827]">
+                  4. 额度与订阅周期管理（Cockpit 风格）
+                </legend>
+                <div className="flex gap-1" role="group" aria-label="启用额度管理">
+                  {(
+                    [
+                      { value: true, label: "开启" },
+                      { value: false, label: "关闭" },
+                    ] as const
+                  ).map((opt) => {
+                    const active = form.quotaEnabled === opt.value;
+                    return (
+                      <button
+                        key={String(opt.value)}
+                        type="button"
+                        aria-pressed={active}
+                        onClick={() =>
+                          setForm((prev) => ({
+                            ...prev,
+                            quotaEnabled: opt.value,
+                            quotaPools:
+                              opt.value && prev.quotaPools.length === 0
+                                ? createAntigravityQuotaPreset().pools
+                                : prev.quotaPools,
+                          }))
+                        }
+                        className={`rounded-md border px-2.5 py-0.5 text-[0.69rem] font-medium transition-colors cursor-pointer ${
+                          active
+                            ? "border-[#dcd4fb] bg-[#6d5bd0] text-white"
+                            : "border-[#dce0e6] bg-white text-[#525866] hover:bg-[#f3f4f6]"
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {form.quotaEnabled ? (
+                <div className="space-y-3 rounded-xl border border-[#eaecef] bg-[#fafbfc] p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-[0.71rem] text-[#7c8495]">
+                      快捷套用模板：
+                    </span>
+                    <div className="flex flex-wrap gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const p = createAntigravityQuotaPreset();
+                          setForm((prev) => ({
+                            ...prev,
+                            quotaPlanTier: prev.quotaPlanTier || p.planTier,
+                            quotaPools: p.pools,
+                          }));
+                        }}
+                        className="rounded border border-[#dcd4fb] bg-[#f0edfc] px-2 py-0.5 text-[0.68rem] font-medium text-[#5b48c4] hover:bg-[#e7e1fa] cursor-pointer"
+                      >
+                        Antigravity 三分组 (Cockpit)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const p = createClaudeQuotaPreset();
+                          setForm((prev) => ({
+                            ...prev,
+                            quotaPlanTier: prev.quotaPlanTier || p.planTier,
+                            quotaPools: p.pools,
+                          }));
+                        }}
+                        className="rounded border border-[#dce0e6] bg-white px-2 py-0.5 text-[0.68rem] font-medium text-[#525866] hover:bg-[#f3f4f6] cursor-pointer"
+                      >
+                        Claude 双窗口
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const p = createSingleQuotaPreset();
+                          setForm((prev) => ({
+                            ...prev,
+                            quotaPlanTier: prev.quotaPlanTier || p.planTier,
+                            quotaPools: p.pools,
+                          }));
+                        }}
+                        className="rounded border border-[#dce0e6] bg-white px-2 py-0.5 text-[0.68rem] font-medium text-[#525866] hover:bg-[#f3f4f6] cursor-pointer"
+                      >
+                        单主额度
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between gap-1">
+                        <label
+                          htmlFor={fid("quotaPlanTier")}
+                          className="text-[0.71rem] font-medium text-[#525866]"
+                        >
+                          套餐等级
+                        </label>
+                        <div className="flex gap-1">
+                          {["FREE", "PRO", "ULTRA", "MAX"].map((tier) => (
+                            <button
+                              key={tier}
+                              type="button"
+                              onClick={() =>
+                                setForm((prev) => ({ ...prev, quotaPlanTier: tier }))
+                              }
+                              className={`rounded border px-1.5 py-0.5 text-[0.63rem] cursor-pointer ${
+                                form.quotaPlanTier === tier
+                                  ? "border-[#dcd4fb] bg-[#f0edfc] font-semibold text-[#5b48c4]"
+                                  : "border-[#eaecef] bg-white text-[#525866] hover:bg-[#f3f4f6]"
+                              }`}
+                            >
+                              {tier}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      <Input
+                        id={fid("quotaPlanTier")}
+                        className="mono-num h-8"
+                        placeholder="PRO / ULTRA / FREE"
+                        value={form.quotaPlanTier}
+                        onChange={(e) =>
+                          setForm((prev) => ({
+                            ...prev,
+                            quotaPlanTier: e.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <label
+                        htmlFor={fid("quotaExpiresAt")}
+                        className="block text-[0.71rem] font-medium text-[#525866]"
+                      >
+                        订阅到期日（可选）
+                      </label>
+                      <Input
+                        id={fid("quotaExpiresAt")}
+                        type="date"
+                        className="mono-num h-8"
+                        value={form.quotaExpiresAt}
+                        onChange={(e) =>
+                          setForm((prev) => ({
+                            ...prev,
+                            quotaExpiresAt: e.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[0.71rem] font-medium text-[#525866]">
+                        模型分组额度池（最多 4 组，到点自动回满 100%）
+                      </span>
+                      {form.quotaPools.length < 4 && (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="xs"
+                          onClick={() =>
+                            setForm((prev) => ({
+                              ...prev,
+                              quotaPools: [
+                                ...prev.quotaPools,
+                                {
+                                  id: `pool-${prev.quotaPools.length + 1}`,
+                                  label: `分组 ${prev.quotaPools.length + 1}`,
+                                  remainingPct: 100,
+                                  resetHours: 5,
+                                  resetAt: null,
+                                },
+                              ],
+                            }))
+                          }
+                        >
+                          <Plus className="h-3 w-3" aria-hidden="true" />
+                          添加模型分组
+                        </Button>
+                      )}
+                    </div>
+
+                    <div className="space-y-2">
+                      {form.quotaPools.map((pool, idx) => (
+                        <div
+                          key={`${pool.id}-${idx}`}
+                          className="grid grid-cols-1 gap-2 rounded-lg border border-[#eaecef] bg-white p-2 sm:grid-cols-[minmax(0,1fr)_5rem_7.5rem_11.5rem_auto] sm:items-end"
+                        >
+                          <div className="space-y-1">
+                            <span className="block text-[0.65rem] text-[#7c8495]">
+                              分组名称
+                            </span>
+                            <Input
+                              aria-label={`分组名称 ${idx + 1}`}
+                              className="h-7 text-[0.72rem]"
+                              value={pool.label}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                setForm((prev) => ({
+                                  ...prev,
+                                  quotaPools: prev.quotaPools.map((item, i) =>
+                                    i === idx ? { ...item, label: v } : item,
+                                  ),
+                                }));
+                              }}
+                            />
+                          </div>
+                          <div className="space-y-1">
+                            <span className="block text-[0.65rem] text-[#7c8495]">
+                              剩余 %
+                            </span>
+                            <Input
+                              aria-label={`剩余百分比 ${idx + 1}`}
+                              type="number"
+                              min={0}
+                              max={100}
+                              className="mono-num h-7 text-[0.72rem]"
+                              value={pool.remainingPct}
+                              onChange={(e) => {
+                                const n = Math.max(
+                                  0,
+                                  Math.min(100, Number(e.target.value) || 0),
+                                );
+                                setForm((prev) => ({
+                                  ...prev,
+                                  quotaPools: prev.quotaPools.map((item, i) =>
+                                    i === idx ? { ...item, remainingPct: n } : item,
+                                  ),
+                                }));
+                              }}
+                            />
+                          </div>
+                          <div className="space-y-1">
+                            <span className="block text-[0.65rem] text-[#7c8495]">
+                              刷新周期
+                            </span>
+                            <select
+                              aria-label={`刷新周期 ${idx + 1}`}
+                              className={`${NATIVE_SELECT_CLASS} min-h-7 py-0.5 text-[0.71rem]`}
+                              value={String(pool.resetHours)}
+                              onChange={(e) => {
+                                const h = Number(e.target.value) || 0;
+                                setForm((prev) => ({
+                                  ...prev,
+                                  quotaPools: prev.quotaPools.map((item, i) =>
+                                    i === idx ? { ...item, resetHours: h } : item,
+                                  ),
+                                }));
+                              }}
+                            >
+                              <option value="5">5 小时</option>
+                              <option value="24">24 小时</option>
+                              <option value="168">7 天 (168h)</option>
+                              <option value="720">30 天 (720h)</option>
+                              <option value="0">手动 (不倒计时)</option>
+                            </select>
+                          </div>
+                          <div className="space-y-1">
+                            <span className="block text-[0.65rem] text-[#7c8495]">
+                              恢复时间 (可选)
+                            </span>
+                            <Input
+                              aria-label={`恢复时间 ${idx + 1}`}
+                              type="datetime-local"
+                              className="mono-num h-7 text-[0.69rem]"
+                              value={isoToLocalDatetimeInput(pool.resetAt)}
+                              onChange={(e) => {
+                                const iso = localDatetimeInputToIso(e.target.value);
+                                setForm((prev) => ({
+                                  ...prev,
+                                  quotaPools: prev.quotaPools.map((item, i) =>
+                                    i === idx ? { ...item, resetAt: iso } : item,
+                                  ),
+                                }));
+                              }}
+                            />
+                          </div>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            disabled={form.quotaPools.length <= 1}
+                            aria-label={`删除模型分组 ${idx + 1}`}
+                            onClick={() =>
+                              setForm((prev) => ({
+                                ...prev,
+                                quotaPools: prev.quotaPools.filter((_, i) => i !== idx),
+                              }))
+                            }
+                            className="h-7 w-7 text-[#7c8495] hover:text-[#dc2626]"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-[0.71rem] text-[#7c8495]">
+                  未启用额度跟踪的账号保持简洁展示，不占用额外行高；需要统计余量与冷却时可随时打开。
+                </p>
+              )}
+            </fieldset>
+
+            {/* Section 5: Purpose, Tags, Notes */}
             <fieldset className="space-y-3 border-t border-[#eaecef] pt-4">
               <legend className="text-[0.76rem] font-semibold text-[#111827]">
-                4. 用途与备注
+                5. 用途与备注
               </legend>
 
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
