@@ -47,6 +47,14 @@ pub enum AccountNodeSource {
     Custom,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountBrowserKind {
+    #[default]
+    Netguard,
+    Adspower,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountRecord {
@@ -72,11 +80,23 @@ pub struct AccountRecord {
     #[serde(default)]
     pub environment_profile: Option<String>,
     #[serde(default)]
+    pub browser_kind: AccountBrowserKind,
+    #[serde(default)]
+    pub adspower_user_id: Option<String>,
+    #[serde(default)]
+    pub adspower_serial_number: Option<String>,
+    #[serde(default)]
+    pub adspower_profile_name: Option<String>,
+    #[serde(default)]
     pub linked_node_source: AccountNodeSource,
     #[serde(default)]
     pub linked_node_id: Option<String>,
     #[serde(default)]
     pub linked_node_name: Option<String>,
+    #[serde(default)]
+    pub linked_browser_profile_id: Option<String>,
+    #[serde(default)]
+    pub linked_proxy_port: Option<u16>,
     #[serde(default)]
     pub purpose: String,
     #[serde(default)]
@@ -109,11 +129,24 @@ pub struct ClashVergeNodeItem {
     pub is_group: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClashVergeListenerItem {
+    pub name: String,
+    pub listener_type: String,
+    pub port: u16,
+    pub proxy: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ClashVergeNodesSnapshot {
     pub detected: bool,
     pub source_path: Option<String>,
+    #[serde(default)]
+    pub mixed_port: Option<u16>,
+    #[serde(default)]
+    pub listeners: Vec<ClashVergeListenerItem>,
     pub groups: Vec<ClashVergeNodeItem>,
     pub proxies: Vec<ClashVergeNodeItem>,
 }
@@ -212,9 +245,24 @@ pub fn normalize_account(
 
     record.environment_name = record.environment_name.trim().to_string();
     record.environment_profile = trim_opt(record.environment_profile);
+    record.adspower_user_id = trim_opt(record.adspower_user_id);
+    record.adspower_serial_number = record
+        .adspower_serial_number
+        .take()
+        .and_then(|s| {
+            let trimmed = s.trim().trim_start_matches('#').trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        });
+    record.adspower_profile_name = trim_opt(record.adspower_profile_name);
 
     record.linked_node_id = trim_opt(record.linked_node_id);
     record.linked_node_name = trim_opt(record.linked_node_name);
+    record.linked_browser_profile_id = trim_opt(record.linked_browser_profile_id);
+    record.linked_proxy_port = record.linked_proxy_port.filter(|&p| p > 0);
 
     if record.linked_node_source == AccountNodeSource::None && record.linked_node_id.is_some() {
         record.linked_node_source = AccountNodeSource::Netguard;
@@ -224,6 +272,7 @@ pub fn normalize_account(
         AccountNodeSource::None => {
             record.linked_node_id = None;
             record.linked_node_name = None;
+            record.linked_proxy_port = None;
         }
         AccountNodeSource::Netguard => {
             if record.linked_node_id.is_none() && record.linked_node_name.is_none() {
@@ -430,7 +479,7 @@ fn split_yaml_kv(line: &str) -> Option<(&str, &str)> {
     Some((key, rest.trim()))
 }
 
-fn parse_inline_clash_flow(body: &str) -> (Option<String>, Option<String>) {
+fn parse_inline_clash_flow(body: &str) -> (Option<String>, Option<String>, Option<u16>, Option<String>) {
     let trimmed = body.trim();
     let inner = trimmed
         .strip_prefix('{')
@@ -485,6 +534,8 @@ fn parse_inline_clash_flow(body: &str) -> (Option<String>, Option<String>) {
 
     let mut name = None;
     let mut node_type = None;
+    let mut port = None;
+    let mut proxy = None;
     for pair in pairs {
         if let Some((k, v)) = split_yaml_kv(pair.trim()) {
             if k == "name" && name.is_none() {
@@ -497,20 +548,32 @@ fn parse_inline_clash_flow(body: &str) -> (Option<String>, Option<String>) {
                 if !parsed.is_empty() {
                     node_type = Some(parsed);
                 }
+            } else if k == "port" && port.is_none() {
+                if let Ok(p) = unquote_yaml_value(v).parse::<u16>() {
+                    if p > 0 {
+                        port = Some(p);
+                    }
+                }
+            } else if k == "proxy" && proxy.is_none() {
+                let parsed = unquote_yaml_value(v);
+                if !parsed.is_empty() {
+                    proxy = Some(parsed);
+                }
             }
         }
     }
-    (name, node_type)
+    (name, node_type, port, proxy)
 }
 
-/// Extract proxy groups and proxy node names/types from a Clash / Clash Verge YAML config.
-/// Only `name` and `type` are extracted; credentials and server addresses are ignored.
-pub fn parse_clash_yaml_nodes(yaml: &str) -> (Vec<ClashVergeNodeItem>, Vec<ClashVergeNodeItem>) {
+/// Parse Clash / Clash Verge YAML including `mixed-port`, `listeners`, `proxy-groups`, and `proxies`.
+/// Credentials and remote server addresses are intentionally ignored.
+pub fn parse_clash_yaml_snapshot(yaml: &str) -> ClashVergeNodesSnapshot {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Section {
         None,
         Proxies,
         ProxyGroups,
+        Listeners,
     }
 
     let mut section = Section::None;
@@ -518,23 +581,60 @@ pub fn parse_clash_yaml_nodes(yaml: &str) -> (Vec<ClashVergeNodeItem>, Vec<Clash
     let mut sub_block_indent: Option<usize> = None;
     let mut cur_name: Option<String> = None;
     let mut cur_type: Option<String> = None;
+    let mut cur_port: Option<u16> = None;
+    let mut cur_proxy: Option<String> = None;
 
+    let mut mixed_port: Option<u16> = None;
+    let mut fallback_port: Option<u16> = None;
+    let mut listeners = Vec::new();
     let mut groups = Vec::new();
     let mut proxies = Vec::new();
     let mut seen_groups = HashSet::new();
     let mut seen_proxies = HashSet::new();
+    let mut seen_listeners = HashSet::new();
 
     let flush_current = |sec: Section,
                          name_opt: &mut Option<String>,
                          type_opt: &mut Option<String>,
+                         port_opt: &mut Option<u16>,
+                         proxy_opt: &mut Option<String>,
+                         listeners: &mut Vec<ClashVergeListenerItem>,
                          groups: &mut Vec<ClashVergeNodeItem>,
                          proxies: &mut Vec<ClashVergeNodeItem>,
+                         seen_listeners: &mut HashSet<(String, u16)>,
                          seen_groups: &mut HashSet<String>,
                          seen_proxies: &mut HashSet<String>| {
-        if let Some(name) = name_opt.take() {
+        let name = name_opt.take();
+        let raw_type = type_opt.take();
+        let raw_port = port_opt.take();
+        let raw_proxy = proxy_opt.take();
+
+        if sec == Section::Listeners {
+            if let (Some(port), Some(proxy)) = (raw_port.filter(|&p| p > 0), raw_proxy) {
+                let proxy_trimmed = proxy.trim().to_string();
+                let lname = name
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| format!("listener-{port}"));
+                let ltype = raw_type
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "mixed".into());
+                if !proxy_trimmed.is_empty() && seen_listeners.insert((lname.clone(), port)) {
+                    listeners.push(ClashVergeListenerItem {
+                        name: lname,
+                        listener_type: ltype,
+                        port,
+                        proxy: proxy_trimmed,
+                    });
+                }
+            }
+            return;
+        }
+
+        if let Some(name) = name {
             let trimmed = name.trim().to_string();
-            let node_type = type_opt
-                .take()
+            let node_type = raw_type
                 .map(|t| t.trim().to_string())
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| {
@@ -564,11 +664,9 @@ pub fn parse_clash_yaml_nodes(yaml: &str) -> (Vec<ClashVergeNodeItem>, Vec<Clash
                             });
                         }
                     }
-                    Section::None => {}
+                    Section::Listeners | Section::None => {}
                 }
             }
-        } else {
-            *type_opt = None;
         }
     };
 
@@ -587,20 +685,41 @@ pub fn parse_clash_yaml_nodes(yaml: &str) -> (Vec<ClashVergeNodeItem>, Vec<Clash
                 section,
                 &mut cur_name,
                 &mut cur_type,
+                &mut cur_port,
+                &mut cur_proxy,
+                &mut listeners,
                 &mut groups,
                 &mut proxies,
+                &mut seen_listeners,
                 &mut seen_groups,
                 &mut seen_proxies,
             );
             item_indent = None;
             sub_block_indent = None;
 
-            if let Some((key, _)) = split_yaml_kv(trimmed) {
-                section = match key {
-                    "proxies" => Section::Proxies,
-                    "proxy-groups" => Section::ProxyGroups,
-                    _ => Section::None,
-                };
+            if let Some((key, val)) = split_yaml_kv(trimmed) {
+                match key {
+                    "proxies" => section = Section::Proxies,
+                    "proxy-groups" => section = Section::ProxyGroups,
+                    "listeners" => section = Section::Listeners,
+                    "mixed-port" => {
+                        if let Ok(p) = unquote_yaml_value(val).parse::<u16>() {
+                            if p > 0 {
+                                mixed_port = Some(p);
+                            }
+                        }
+                        section = Section::None;
+                    }
+                    "port" => {
+                        if let Ok(p) = unquote_yaml_value(val).parse::<u16>() {
+                            if p > 0 {
+                                fallback_port = Some(p);
+                            }
+                        }
+                        section = Section::None;
+                    }
+                    _ => section = Section::None,
+                }
             } else {
                 section = Section::None;
             }
@@ -620,35 +739,37 @@ pub fn parse_clash_yaml_nodes(yaml: &str) -> (Vec<ClashVergeNodeItem>, Vec<Clash
         }) {
             let expected_indent = *item_indent.get_or_insert(indent);
             if indent > expected_indent {
-                // Nested list item (e.g. group members under `proxies:`)
                 continue;
             }
             flush_current(
                 section,
                 &mut cur_name,
                 &mut cur_type,
+                &mut cur_port,
+                &mut cur_proxy,
+                &mut listeners,
                 &mut groups,
                 &mut proxies,
+                &mut seen_listeners,
                 &mut seen_groups,
                 &mut seen_proxies,
             );
             sub_block_indent = None;
 
             if after_dash.starts_with('{') {
-                let (n, t) = parse_inline_clash_flow(after_dash);
+                let (n, t, p, px) = parse_inline_clash_flow(after_dash);
                 cur_name = n;
                 cur_type = t;
+                cur_port = p;
+                cur_proxy = px;
             } else if let Some((k, v)) = split_yaml_kv(after_dash) {
-                if k == "name" {
-                    let parsed = unquote_yaml_value(v);
-                    if !parsed.is_empty() {
-                        cur_name = Some(parsed);
-                    }
-                } else if k == "type" {
-                    let parsed = unquote_yaml_value(v);
-                    if !parsed.is_empty() {
-                        cur_type = Some(parsed);
-                    }
+                let parsed = unquote_yaml_value(v);
+                match k {
+                    "name" if !parsed.is_empty() => cur_name = Some(parsed),
+                    "type" if !parsed.is_empty() => cur_type = Some(parsed),
+                    "port" => cur_port = parsed.parse::<u16>().ok().filter(|&p| p > 0),
+                    "proxy" if !parsed.is_empty() => cur_proxy = Some(parsed),
+                    _ => {}
                 }
             }
             continue;
@@ -668,15 +789,18 @@ pub fn parse_clash_yaml_nodes(yaml: &str) -> (Vec<ClashVergeNodeItem>, Vec<Clash
                 let clean_val = strip_yaml_comment(v).trim();
                 if clean_val.is_empty() {
                     sub_block_indent = Some(indent + 1);
-                } else if k == "name" && cur_name.is_none() {
+                } else {
                     let parsed = unquote_yaml_value(v);
-                    if !parsed.is_empty() {
-                        cur_name = Some(parsed);
-                    }
-                } else if k == "type" && cur_type.is_none() {
-                    let parsed = unquote_yaml_value(v);
-                    if !parsed.is_empty() {
-                        cur_type = Some(parsed);
+                    match k {
+                        "name" if cur_name.is_none() && !parsed.is_empty() => cur_name = Some(parsed),
+                        "type" if cur_type.is_none() && !parsed.is_empty() => cur_type = Some(parsed),
+                        "port" if cur_port.is_none() => {
+                            cur_port = parsed.parse::<u16>().ok().filter(|&p| p > 0);
+                        }
+                        "proxy" if cur_proxy.is_none() && !parsed.is_empty() => {
+                            cur_proxy = Some(parsed);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -687,16 +811,35 @@ pub fn parse_clash_yaml_nodes(yaml: &str) -> (Vec<ClashVergeNodeItem>, Vec<Clash
         section,
         &mut cur_name,
         &mut cur_type,
+        &mut cur_port,
+        &mut cur_proxy,
+        &mut listeners,
         &mut groups,
         &mut proxies,
+        &mut seen_listeners,
         &mut seen_groups,
         &mut seen_proxies,
     );
 
-    (groups, proxies)
+    ClashVergeNodesSnapshot {
+        detected: false,
+        source_path: None,
+        mixed_port: mixed_port.or(fallback_port),
+        listeners,
+        groups,
+        proxies,
+    }
 }
 
-/// Inspect local Clash Verge configuration files for proxy groups and node names.
+/// Extract proxy groups and proxy node names/types from a Clash / Clash Verge YAML config.
+/// Only `name` and `type` are extracted; credentials and server addresses are ignored.
+#[cfg(test)]
+pub fn parse_clash_yaml_nodes(yaml: &str) -> (Vec<ClashVergeNodeItem>, Vec<ClashVergeNodeItem>) {
+    let snap = parse_clash_yaml_snapshot(yaml);
+    (snap.groups, snap.proxies)
+}
+
+/// Inspect local Clash Verge configuration files for proxy groups, listeners, and node names.
 pub fn discover_clash_verge_nodes() -> ClashVergeNodesSnapshot {
     let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) else {
         return ClashVergeNodesSnapshot::default();
@@ -715,13 +858,10 @@ pub fn discover_clash_verge_nodes() -> ClashVergeNodesSnapshot {
     for path in candidates {
         if path.is_file() {
             if let Ok(raw) = fs::read_to_string(&path) {
-                let (groups, proxies) = parse_clash_yaml_nodes(&raw);
-                return ClashVergeNodesSnapshot {
-                    detected: true,
-                    source_path: Some(path.to_string_lossy().to_string()),
-                    groups,
-                    proxies,
-                };
+                let mut snap = parse_clash_yaml_snapshot(&raw);
+                snap.detected = true;
+                snap.source_path = Some(path.to_string_lossy().to_string());
+                return snap;
             }
         }
     }
@@ -874,9 +1014,15 @@ mod tests {
             env_type: AccountEnvType::Fingerprint,
             environment_name: "AdsPower".into(),
             environment_profile: Some("Win-042".into()),
+            browser_kind: AccountBrowserKind::Netguard,
+            adspower_user_id: None,
+            adspower_serial_number: None,
+            adspower_profile_name: None,
             linked_node_source: AccountNodeSource::Netguard,
             linked_node_id: Some("seoul-vps".into()),
             linked_node_name: Some("首尔 VPS 独享出口".into()),
+            linked_browser_profile_id: None,
+            linked_proxy_port: None,
             purpose: "CloudCart / Google Ads 投放".into(),
             tags: vec!["Ads".into(), "KR".into()],
             status: AccountStatus::Active,
@@ -1091,5 +1237,36 @@ rules:
         );
         let ids: Vec<&str> = reordered.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["acc-c", "acc-a", "acc-b"]);
+    }
+
+    #[test]
+    fn parse_clash_yaml_snapshot_extracts_mixed_port_and_listeners() {
+        let yaml = r#"
+mode: rule
+mixed-port: 7897
+listeners:
+- name: adspower-canada
+  type: mixed
+  listen: 127.0.0.1
+  port: 10808
+  proxy: 🇨🇦 加拿大Z01
+- name: adspower-japan
+  type: mixed
+  listen: 127.0.0.1
+  port: 10809
+  proxy: "🇯🇵 日本Z10 | IEPL"
+- { name: "inline-jp", type: mixed, port: 10810, proxy: "🇯🇵 日本家宽-川崎" }
+proxies:
+- name: "🇯🇵 日本Z10 | IEPL"
+  type: ss
+"#;
+        let snap = parse_clash_yaml_snapshot(yaml);
+        assert_eq!(snap.mixed_port, Some(7897));
+        assert_eq!(snap.listeners.len(), 3);
+        assert_eq!(snap.listeners[1].name, "adspower-japan");
+        assert_eq!(snap.listeners[1].port, 10809);
+        assert_eq!(snap.listeners[1].proxy, "🇯🇵 日本Z10 | IEPL");
+        assert_eq!(snap.listeners[2].port, 10810);
+        assert_eq!(snap.listeners[2].proxy, "🇯🇵 日本家宽-川崎");
     }
 }

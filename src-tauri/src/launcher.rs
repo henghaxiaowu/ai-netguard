@@ -291,10 +291,11 @@ impl ProcessLauncher {
             .map(|n| n.name.clone())
             .unwrap_or_else(|| "主出口".into());
 
+        let proxy_url = format!("socks5://127.0.0.1:{}", cfg.browser_port);
         self.launch_browser_profile(
             cfg,
             &profile,
-            cfg.browser_port,
+            &proxy_url,
             &node_label,
             &tz,
             &locale,
@@ -307,7 +308,7 @@ impl ProcessLauncher {
         &mut self,
         cfg: &AppConfig,
         profile: &BrowserProfile,
-        socks_port: u16,
+        proxy_server_url: &str,
         node_label: &str,
         effective_tz: &str,
         effective_locale: &str,
@@ -347,7 +348,7 @@ impl ProcessLauncher {
 
         let mut cmd = Command::new(&exe);
         cmd.arg(format!("--user-data-dir={}", profile_dir.display()))
-            .arg(format!("--proxy-server=socks5://127.0.0.1:{socks_port}"))
+            .arg(format!("--proxy-server={proxy_server_url}"))
             .arg("--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1")
             .arg("--force-webrtc-ip-handling-policy")
             .arg("--webrtc-ip-handling-policy=disable_non_proxied_udp")
@@ -397,11 +398,11 @@ impl ProcessLauncher {
             BrowserFingerprintMode::IsolatedFingerprint => "完整独立指纹",
         };
         logs.push(format!(
-            "已启动浏览器环境 [{}] ({mode_label}, 出口: {node_label}, SOCKS5 127.0.0.1:{socks_port}) -> {target_url}",
+            "已启动浏览器环境 [{}] ({mode_label}, 出口: {node_label}, 代理 {proxy_server_url}) -> {target_url}",
             profile.name
         ));
         Ok(format!(
-            "已启动 [{}] -> {node_label} (:{socks_port})",
+            "已启动 [{}] -> {node_label} ({proxy_server_url})",
             profile.name
         ))
     }

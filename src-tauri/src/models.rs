@@ -248,6 +248,8 @@ pub struct BrowserProfile {
     pub builtin: bool,
     #[serde(default)]
     pub node_id: Option<String>,
+    #[serde(default)]
+    pub custom_proxy_url: Option<String>,
     #[serde(default = "default_browser_homepage")]
     pub homepage: String,
     #[serde(default)]
@@ -264,11 +266,59 @@ pub fn default_browser_profiles() -> Vec<BrowserProfile> {
         name: "默认安全浏览器 (主出口)".into(),
         builtin: true,
         node_id: None,
+        custom_proxy_url: None,
         homepage: default_browser_homepage(),
         fingerprint_mode: BrowserFingerprintMode::CleanAlign,
         fingerprint: BrowserFingerprintConfig::default(),
         notes: Some("默认跟随活跃主出口节点，使用纯净时区与语言对齐（对 Claude / hCaptcha 最安全）".into()),
     }]
+}
+
+fn default_browser_kind_str() -> String {
+    "netguard".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveAccountSession {
+    pub account_id: String,
+    pub account_label: String,
+    pub email: String,
+    pub node_source: String,
+    pub node_name: String,
+    pub proxy_url: String,
+    pub local_port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_exit_ip: Option<ExitIpInfo>,
+    pub antigravity_launched: bool,
+    #[serde(default = "default_browser_kind_str")]
+    pub browser_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adspower_user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adspower_profile_label: Option<String>,
+    pub activated_at: String,
+}
+
+pub fn extract_loopback_port(raw_url: &str) -> Option<u16> {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    let parsed = url::Url::parse(&with_scheme).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    if host != "127.0.0.1" && host != "localhost" {
+        return None;
+    }
+    let port = parsed.port()?;
+    (port > 1024).then_some(port)
 }
 
 pub fn effective_outbound_mode(cfg: &AppConfig, node: &NodeProfile) -> OutboundMode {
@@ -472,7 +522,11 @@ pub struct GatewayStatus {
     #[serde(default)]
     pub running_browser_profiles: Vec<String>,
     #[serde(default)]
+    pub running_adspower_profiles: Vec<String>,
+    #[serde(default)]
     pub secondary_node_ports: std::collections::BTreeMap<String, u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_account_session: Option<ActiveAccountSession>,
     pub logs: Vec<String>,
 }
 

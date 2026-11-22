@@ -244,7 +244,7 @@ impl SingBoxManager {
                 "listen_port": cfg.cli_port
             }),
             json!({
-                "type": "socks",
+                "type": "mixed",
                 "tag": "in_browser",
                 "listen": "127.0.0.1",
                 "listen_port": cfg.browser_port
@@ -273,7 +273,7 @@ impl SingBoxManager {
             apply_outbound_mode(&mut sec_outbound, &sec_mode, physical_nic);
             outbounds.push(sec_outbound);
             inbounds.push(json!({
-                "type": "socks",
+                "type": "mixed",
                 "tag": in_tag,
                 "listen": "127.0.0.1",
                 "listen_port": sec_port

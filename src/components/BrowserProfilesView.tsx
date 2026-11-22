@@ -161,6 +161,10 @@ function attachLightDismissFallback(dialog: HTMLDialogElement | null) {
   };
 }
 
+function extractProxyHostPort(url: string): string {
+  return url.replace(/^[a-zA-Z0-9+.-]+:\/\//, "").split("/")[0] || url;
+}
+
 function createFormForNode(
   node: NodeProfile | undefined,
   mode: BrowserFingerprintMode = "isolated_fingerprint",
@@ -170,6 +174,7 @@ function createFormForNode(
     name: node ? `环境 · ${node.name}` : "新独立指纹浏览器",
     builtin: false,
     nodeId: node?.id ?? null,
+    customProxyUrl: null,
     homepage: "https://claude.ai",
     fingerprintMode: mode,
     fingerprint: generateConsistentFingerprint(
@@ -375,6 +380,7 @@ export function BrowserProfilesView({
       name: cleanName,
       homepage: cleanHomepage,
       nodeId: form.nodeId?.trim() || null,
+      customProxyUrl: form.customProxyUrl?.trim() || null,
       notes: form.notes?.trim() || undefined,
       fingerprint: {
         ...form.fingerprint,
@@ -413,6 +419,7 @@ export function BrowserProfilesView({
     setForm((prev) => ({
       ...prev,
       nodeId: nextNodeId,
+      customProxyUrl: null,
       fingerprint: {
         ...prev.fingerprint,
         timezone: targetNode?.timezone || prev.fingerprint.timezone,
@@ -504,27 +511,39 @@ export function BrowserProfilesView({
       <section className="p-5 px-6">
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
           {profiles.map((profile) => {
+            const customProxyUrl = profile.customProxyUrl?.trim() || "";
+            const hasCustomProxy = Boolean(customProxyUrl);
+            const customProxyHostPort = hasCustomProxy
+              ? extractProxyHostPort(customProxyUrl)
+              : "";
             const boundNodeId = profile.nodeId || config.activeNodeId;
             const boundNode = nodeById.get(boundNodeId);
-            const isPrimary = boundNodeId === config.activeNodeId;
+            const isPrimary =
+              !hasCustomProxy && boundNodeId === config.activeNodeId;
             const isRunning = runningSet.has(profile.id);
-            const secPort = !isPrimary
-              ? status?.secondaryNodePorts?.[boundNodeId]
-              : undefined;
+            const secPort =
+              !hasCustomProxy && !isPrimary
+                ? status?.secondaryNodePorts?.[boundNodeId]
+                : undefined;
             const activePort = isPrimary ? config.browserPort : secPort;
             const needsGatewayRestart =
-              !!status?.running && !isPrimary && secPort === undefined;
+              !hasCustomProxy &&
+              !!status?.running &&
+              !isPrimary &&
+              secPort === undefined;
             const effectiveTz =
               profile.fingerprint.timezone || boundNode?.timezone || "Asia/Seoul";
             const effectiveLocale =
               profile.fingerprint.locale || boundNode?.locale || "ko-KR";
             const canLaunch =
               !!status?.browserInstalled &&
-              !!status?.running &&
-              !(isPrimary && status?.blockedByKillSwitch) &&
-              !needsGatewayRestart;
-            const probeInfo =
-              isPrimary && status?.exitIp
+              (hasCustomProxy ||
+                (!!status?.running &&
+                  !(isPrimary && status?.blockedByKillSwitch) &&
+                  !needsGatewayRestart));
+            const probeInfo = hasCustomProxy
+              ? undefined
+              : isPrimary && status?.exitIp
                 ? status.exitIp
                 : nodeProbeResults[boundNodeId];
 
@@ -580,25 +599,47 @@ export function BrowserProfilesView({
                 <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[#eaecef] bg-[#f8f9fb] px-3 py-2 text-[0.73rem]">
                   <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                     <span className="font-medium text-[#525866]">绑定出口:</span>
-                    <span className="truncate font-semibold text-[#111827]">
-                      {boundNode?.name || "未找到节点"}
-                    </span>
-                    {boundNode && (
-                      <Badge variant="neutral" className="mono-num uppercase text-[0.62rem]">
-                        {boundNode.protocol}
-                      </Badge>
-                    )}
-                    {activePort ? (
-                      <span className="mono-num text-[0.7rem] text-[#15803d]">
-                        127.0.0.1:{activePort}
-                      </span>
-                    ) : needsGatewayRestart ? (
-                      <span className="inline-flex items-center gap-1 text-[0.69rem] text-[#b45309]">
-                        <AlertTriangle className="h-3 w-3" aria-hidden="true" />
-                        需重启网关激活端口
-                      </span>
+                    {hasCustomProxy ? (
+                      <>
+                        <span className="truncate font-semibold text-[#111827]">
+                          独立代理
+                        </span>
+                        <Badge
+                          variant="warning"
+                          className="mono-num uppercase text-[0.62rem]"
+                        >
+                          PROXY
+                        </Badge>
+                        <span className="mono-num text-[0.7rem] text-[#15803d]">
+                          {customProxyHostPort}
+                        </span>
+                      </>
                     ) : (
-                      <span className="text-[0.69rem] text-[#9ca3af]">待启动</span>
+                      <>
+                        <span className="truncate font-semibold text-[#111827]">
+                          {boundNode?.name || "未找到节点"}
+                        </span>
+                        {boundNode && (
+                          <Badge
+                            variant="neutral"
+                            className="mono-num uppercase text-[0.62rem]"
+                          >
+                            {boundNode.protocol}
+                          </Badge>
+                        )}
+                        {activePort ? (
+                          <span className="mono-num text-[0.7rem] text-[#15803d]">
+                            127.0.0.1:{activePort}
+                          </span>
+                        ) : needsGatewayRestart ? (
+                          <span className="inline-flex items-center gap-1 text-[0.69rem] text-[#b45309]">
+                            <AlertTriangle className="h-3 w-3" aria-hidden="true" />
+                            需重启网关激活端口
+                          </span>
+                        ) : (
+                          <span className="text-[0.69rem] text-[#9ca3af]">待启动</span>
+                        )}
+                      </>
                     )}
                   </div>
 
@@ -609,7 +650,11 @@ export function BrowserProfilesView({
                         {probeInfo.latencyMs ? ` · ${probeInfo.latencyMs}ms` : ""}
                       </span>
                     )}
-                    {needsGatewayRestart && onRestartGateway ? (
+                    {hasCustomProxy ? (
+                      <span className="text-[0.68rem] text-[#7c8495]">
+                        账号独立代理 · 需本地代理在线
+                      </span>
+                    ) : needsGatewayRestart && onRestartGateway ? (
                       <Button
                         variant="outline"
                         size="xs"
@@ -841,6 +886,20 @@ export function BrowserProfilesView({
                     </option>
                   ))}
                 </select>
+                {form.customProxyUrl?.trim() && (
+                  <div className="mt-1 flex items-center justify-between gap-2 rounded-md border border-[#fde68a] bg-[#fffbeb] px-2 py-1 text-[0.68rem] text-[#92400e]">
+                    <span className="mono-num truncate">
+                      当前使用独立代理: {form.customProxyUrl}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setForm({ ...form, customProxyUrl: null })}
+                      className="shrink-0 font-medium text-[#b45309] underline hover:text-[#78350f] cursor-pointer"
+                    >
+                      清除改用节点
+                    </button>
+                  </div>
+                )}
               </div>
 
               <div className="space-y-1 sm:col-span-2">

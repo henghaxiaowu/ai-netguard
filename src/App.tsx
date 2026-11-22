@@ -62,6 +62,8 @@ import { cn } from "@/lib/utils";
 import type {
   AccountEnvPreset,
   AccountRecord,
+  AdsPowerConfigStatus,
+  AdsPowerProfilesSnapshot,
   AppConfig,
   AppEnvSnapshot,
   BrowserProfile,
@@ -222,6 +224,9 @@ export default function App() {
   ]);
   const [clashNodes, setClashNodes] = useState<ClashVergeNodesSnapshot | null>(null);
   const [loadingClashNodes, setLoadingClashNodes] = useState(false);
+  const [adspowerConfig, setAdspowerConfig] = useState<AdsPowerConfigStatus | null>(null);
+  const [adspowerProfiles, setAdspowerProfiles] = useState<AdsPowerProfilesSnapshot | null>(null);
+  const [loadingAdsPower, setLoadingAdsPower] = useState(false);
   const [quickProfileId, setQuickProfileId] = useState("default");
   const [preselectedBrowserNode, setPreselectedBrowserNode] = useState<{
     nodeId: string;
@@ -371,10 +376,20 @@ export default function App() {
     }
   }, []);
 
+  const refreshAdsPowerConfig = useCallback(async () => {
+    try {
+      const cfg = await api.getAdsPowerConfig();
+      setAdspowerConfig(cfg);
+    } catch {
+      // Ignore outside Tauri runtime during preview
+    }
+  }, []);
+
   const refreshAll = async () => {
     void refreshAppEnv();
     void refreshAccounts();
     void refreshClashNodes();
+    void refreshAdsPowerConfig();
     const [cfg, st] = await Promise.all([api.getConfig(), api.getStatus()]);
     setConfig(cfg);
     setStatus(st);
@@ -829,6 +844,169 @@ export default function App() {
       }
       setAccounts(prevSnapshot);
       notify(`调整账号顺序失败: ${String(err)}`);
+    }
+  };
+
+  const handleLaunchAccountAntigravity = async (accountId: string) => {
+    try {
+      if (dirty && config) {
+        await handleSaveConfig(config);
+      }
+      const res = await api.launchAccountAntigravity(accountId);
+      setConfig(res.config);
+      setAccounts(res.accounts);
+      setStatus(res.status);
+      setDirty(false);
+      notify(res.message);
+      setTimeout(() => {
+        void refreshAppEnv();
+      }, 900);
+    } catch (err) {
+      if (!isTauriEnv()) {
+        const acc = accounts.find((a) => a.id === accountId);
+        notify(
+          `预览模式：已模拟按账号「${acc?.label || acc?.email || accountId}」切换代理并拉起 Antigravity`,
+        );
+        return;
+      }
+      notify(`拉起 Antigravity 失败: ${String(err)}`);
+    }
+  };
+
+  const handleLaunchAccountBrowser = async (accountId: string) => {
+    try {
+      if (dirty && config) {
+        await handleSaveConfig(config);
+      }
+      const res = await api.launchAccountBrowser(accountId, null);
+      setConfig(res.config);
+      setAccounts(res.accounts);
+      setStatus(res.status);
+      setDirty(false);
+      notify(res.message);
+    } catch (err) {
+      if (!isTauriEnv()) {
+        const acc = accounts.find((a) => a.id === accountId);
+        notify(
+          `预览模式：已模拟打开「${acc?.label || acc?.email || accountId}」专属隔离浏览器`,
+        );
+        return;
+      }
+      notify(`启动专属浏览器失败: ${String(err)}`);
+    }
+  };
+
+  const handleClearActiveAccountSession = async (closeBrowser = false) => {
+    try {
+      const st = await api.clearActiveAccountSession(closeBrowser);
+      setStatus(st);
+      notify(closeBrowser ? "已关闭专属浏览器并清除激活环境" : "已清除当前激活账号环境状态");
+    } catch (err) {
+      if (!isTauriEnv()) {
+        setStatus((prev) =>
+          prev ? { ...prev, activeAccountSession: null } : prev,
+        );
+        notify("预览模式：已清除激活账号环境状态");
+        return;
+      }
+      notify(`清除状态失败: ${String(err)}`);
+    }
+  };
+
+  const handleSaveAdsPowerConfig = async (
+    baseUrl: string,
+    apiKey: string | null,
+    clearApiKey = false,
+  ): Promise<AdsPowerConfigStatus> => {
+    try {
+      const saved = await api.saveAdsPowerConfig(baseUrl, apiKey, clearApiKey);
+      setAdspowerConfig(saved);
+      notify("AdsPower Local API 配置已通过 DPAPI 加密保存");
+      return saved;
+    } catch (err) {
+      if (!isTauriEnv()) {
+        const cleanUrl = (baseUrl || "http://127.0.0.1:50325").trim() || "http://127.0.0.1:50325";
+        const keyTrimmed = apiKey?.trim() || "";
+        const nextHasKey = clearApiKey
+          ? false
+          : keyTrimmed.length > 0 || Boolean(adspowerConfig?.hasApiKey);
+        const masked = clearApiKey
+          ? null
+          : keyTrimmed.length >= 10
+            ? `${keyTrimmed.slice(0, 4)}••••••${keyTrimmed.slice(-4)}`
+            : keyTrimmed.length > 0
+              ? "••••••"
+              : (adspowerConfig?.apiKeyMasked ?? null);
+        const mockSaved: AdsPowerConfigStatus = {
+          baseUrl: cleanUrl,
+          hasApiKey: nextHasKey,
+          apiKeyMasked: masked,
+        };
+        setAdspowerConfig(mockSaved);
+        return mockSaved;
+      }
+      throw err;
+    }
+  };
+
+  const handleTestAdsPowerConnection = async (): Promise<string> => {
+    try {
+      const msg = await api.testAdsPowerConnection();
+      notify(msg);
+      return msg;
+    } catch (err) {
+      if (!isTauriEnv()) {
+        const msg = "预览模式：已模拟连接 AdsPower Local API";
+        notify(msg);
+        return msg;
+      }
+      throw err;
+    }
+  };
+
+  const handleRefreshAdsPowerProfiles = async (): Promise<AdsPowerProfilesSnapshot | null> => {
+    setLoadingAdsPower(true);
+    try {
+      const snap = await api.listAdsPowerProfiles();
+      setAdspowerProfiles(snap);
+      if (snap.error) {
+        notify(snap.error);
+      }
+      return snap;
+    } catch (err) {
+      if (!isTauriEnv()) {
+        return adspowerProfiles;
+      }
+      notify(`拉取 AdsPower 环境列表失败: ${String(err)}`);
+      return null;
+    } finally {
+      setLoadingAdsPower(false);
+    }
+  };
+
+  const handleCloseAdsPowerProfile = async (
+    userId?: string | null,
+    serialNumber?: string | null,
+  ) => {
+    try {
+      const st = await api.closeAdsPowerProfile(userId, serialNumber);
+      setStatus(st);
+      notify("已通过 Local API 关闭该 AdsPower 窗口");
+    } catch (err) {
+      if (!isTauriEnv()) {
+        setStatus((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            runningAdspowerProfiles: (prev.runningAdspowerProfiles ?? []).filter(
+              (x) => x !== userId && x !== serialNumber,
+            ),
+          };
+        });
+        notify("预览模式：已关闭 AdsPower 窗口");
+        return;
+      }
+      notify(`关闭 AdsPower 窗口失败: ${String(err)}`);
     }
   };
 
@@ -1962,8 +2140,22 @@ export default function App() {
                 nodes={config?.nodes ?? []}
                 envPresets={envPresets}
                 clashNodes={clashNodes}
+                browserProfiles={browserProfiles}
+                activeSession={status?.activeAccountSession ?? null}
+                runningBrowserProfiles={status?.runningBrowserProfiles ?? []}
+                runningAdspowerProfiles={status?.runningAdspowerProfiles ?? []}
+                secondaryNodePorts={status?.secondaryNodePorts ?? {}}
+                gatewayRunning={Boolean(status?.running && !status?.blockedByKillSwitch)}
+                gatewayBrowserPort={config?.browserPort ?? 17891}
+                gatewayActiveNodeId={config?.activeNodeId ?? ""}
+                antigravityRunning={Boolean(
+                  appEnv?.apps?.find((a) => a.id === "antigravity")?.running,
+                )}
+                adspowerConfig={adspowerConfig}
+                adspowerProfiles={adspowerProfiles}
                 loading={loadingAccounts}
                 loadingClashNodes={loadingClashNodes}
+                loadingAdsPower={loadingAdsPower}
                 onUpsert={handleUpsertAccount}
                 onDelete={handleDeleteAccount}
                 onBulkDelete={handleBulkDeleteAccounts}
@@ -1971,6 +2163,14 @@ export default function App() {
                 onSaveEnvPresets={handleSaveEnvPresets}
                 onRefreshClashNodes={refreshClashNodes}
                 onReorder={handleReorderAccounts}
+                onLaunchAntigravity={handleLaunchAccountAntigravity}
+                onLaunchBrowser={handleLaunchAccountBrowser}
+                onCloseBrowserProfile={handleCloseBrowserProfile}
+                onCloseAdsPowerProfile={handleCloseAdsPowerProfile}
+                onClearActiveSession={handleClearActiveAccountSession}
+                onSaveAdsPowerConfig={handleSaveAdsPowerConfig}
+                onTestAdsPowerConnection={handleTestAdsPowerConnection}
+                onRefreshAdsPowerProfiles={handleRefreshAdsPowerProfiles}
                 onNotify={notify}
               />
             )}

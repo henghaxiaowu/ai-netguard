@@ -72,6 +72,7 @@ export interface BrowserProfile {
   name: string;
   builtin?: boolean;
   nodeId?: string | null;
+  customProxyUrl?: string | null;
   homepage: string;
   fingerprintMode: BrowserFingerprintMode;
   fingerprint: BrowserFingerprintConfig;
@@ -160,7 +161,9 @@ export interface GatewayStatus {
   detectedConflicts: string[];
   exitIp?: ExitIpInfo;
   runningBrowserProfiles?: string[];
+  runningAdspowerProfiles?: string[];
   secondaryNodePorts?: Record<string, number>;
+  activeAccountSession?: ActiveAccountSession | null;
   logs: string[];
 }
 
@@ -217,6 +220,29 @@ export type AccountEnvType = "fingerprint" | "local" | "custom";
 
 export type AccountNodeSource = "none" | "netguard" | "clash_verge" | "custom";
 
+export type AccountBrowserKind = "netguard" | "adspower";
+
+export interface AdsPowerConfigStatus {
+  baseUrl: string;
+  hasApiKey: boolean;
+  apiKeyMasked?: string | null;
+}
+
+export interface AdsPowerProfileItem {
+  userId: string;
+  serialNumber: string;
+  name: string;
+  groupName: string;
+  remark: string;
+}
+
+export interface AdsPowerProfilesSnapshot {
+  connected: boolean;
+  baseUrl: string;
+  profiles: AdsPowerProfileItem[];
+  error?: string | null;
+}
+
 export interface AccountEnvPreset {
   id: string;
   name: string;
@@ -229,9 +255,18 @@ export interface ClashVergeNodeItem {
   isGroup: boolean;
 }
 
+export interface ClashVergeListenerItem {
+  name: string;
+  listenerType: string;
+  port: number;
+  proxy: string;
+}
+
 export interface ClashVergeNodesSnapshot {
   detected: boolean;
   sourcePath?: string | null;
+  mixedPort?: number | null;
+  listeners?: ClashVergeListenerItem[];
   groups: ClashVergeNodeItem[];
   proxies: ClashVergeNodeItem[];
 }
@@ -248,13 +283,44 @@ export interface AccountRecord {
   envType: AccountEnvType;
   environmentName: string;
   environmentProfile?: string | null;
+  browserKind?: AccountBrowserKind;
+  adspowerUserId?: string | null;
+  adspowerSerialNumber?: string | null;
+  adspowerProfileName?: string | null;
   linkedNodeSource?: AccountNodeSource;
   linkedNodeId?: string | null;
   linkedNodeName?: string | null;
+  linkedBrowserProfileId?: string | null;
+  linkedProxyPort?: number | null;
   purpose: string;
   tags: string[];
   status: AccountStatus;
   notes?: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ActiveAccountSession {
+  accountId: string;
+  accountLabel: string;
+  email: string;
+  nodeSource: AccountNodeSource | string;
+  nodeName: string;
+  proxyUrl: string;
+  localPort: number;
+  verifiedExitIp?: ExitIpInfo | null;
+  antigravityLaunched: boolean;
+  browserKind?: AccountBrowserKind | string;
+  browserProfileId?: string | null;
+  adspowerUserId?: string | null;
+  adspowerProfileLabel?: string | null;
+  activatedAt: string;
+}
+
+export interface AccountLaunchOutcome {
+  message: string;
+  config: AppConfig;
+  accounts: AccountRecord[];
+  status: GatewayStatus;
+  session: ActiveAccountSession;
 }

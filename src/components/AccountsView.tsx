@@ -9,24 +9,34 @@ import {
   Eye,
   EyeOff,
   FileUp,
+  Globe,
   GripVertical,
   KeyRound,
   Layers,
+  Loader2,
   Pencil,
   Plus,
   RefreshCw,
   Search,
   ShieldCheck,
   Sparkles,
+  Square,
   Trash2,
   X,
+  Zap,
 } from "lucide-react";
 import type {
+  AccountBrowserKind,
   AccountEnvPreset,
   AccountEnvType,
   AccountNodeSource,
   AccountRecord,
   AccountStatus,
+  ActiveAccountSession,
+  AdsPowerConfigStatus,
+  AdsPowerProfilesSnapshot,
+  BrowserProfile,
+  ClashVergeListenerItem,
   ClashVergeNodesSnapshot,
   NodeProfile,
 } from "../types";
@@ -47,8 +57,20 @@ interface AccountsViewProps {
   nodes: NodeProfile[];
   envPresets: AccountEnvPreset[];
   clashNodes: ClashVergeNodesSnapshot | null;
+  browserProfiles: BrowserProfile[];
+  activeSession: ActiveAccountSession | null;
+  runningBrowserProfiles: string[];
+  runningAdspowerProfiles: string[];
+  secondaryNodePorts: Record<string, number>;
+  gatewayRunning: boolean;
+  gatewayBrowserPort: number;
+  gatewayActiveNodeId: string;
+  antigravityRunning: boolean;
+  adspowerConfig: AdsPowerConfigStatus | null;
+  adspowerProfiles: AdsPowerProfilesSnapshot | null;
   loading: boolean;
   loadingClashNodes: boolean;
+  loadingAdsPower: boolean;
   onUpsert: (account: AccountRecord) => Promise<void>;
   onDelete: (id: string) => Promise<void>;
   onBulkDelete: (ids: string[]) => Promise<void>;
@@ -56,6 +78,21 @@ interface AccountsViewProps {
   onSaveEnvPresets: (presets: AccountEnvPreset[]) => Promise<void>;
   onRefreshClashNodes: () => Promise<void>;
   onReorder: (orderedIds: string[]) => Promise<void>;
+  onLaunchAntigravity: (accountId: string) => Promise<void>;
+  onLaunchBrowser: (accountId: string) => Promise<void>;
+  onCloseBrowserProfile: (profileId: string) => Promise<void>;
+  onCloseAdsPowerProfile: (
+    userId?: string | null,
+    serialNumber?: string | null,
+  ) => Promise<void>;
+  onClearActiveSession: (closeBrowser?: boolean) => Promise<void>;
+  onSaveAdsPowerConfig: (
+    baseUrl: string,
+    apiKey: string | null,
+    clearApiKey?: boolean,
+  ) => Promise<AdsPowerConfigStatus>;
+  onTestAdsPowerConnection: () => Promise<string>;
+  onRefreshAdsPowerProfiles: () => Promise<AdsPowerProfilesSnapshot | null>;
   onNotify: (msg: string) => void;
 }
 
@@ -73,9 +110,15 @@ interface AccountFormState {
   envType: AccountEnvType;
   environmentName: string;
   environmentProfile: string;
+  browserKind: AccountBrowserKind;
+  adspowerUserId: string;
+  adspowerSerialNumber: string;
+  adspowerProfileName: string;
   linkedNodeSource: AccountNodeSource;
   linkedNodeId: string;
   linkedNodeName: string;
+  linkedBrowserProfileId: string;
+  linkedProxyPort: string;
   purpose: string;
   tagsText: string;
   status: AccountStatus;
@@ -167,9 +210,15 @@ function emptyFormState(): AccountFormState {
     envType: "fingerprint",
     environmentName: "",
     environmentProfile: "",
+    browserKind: "netguard",
+    adspowerUserId: "",
+    adspowerSerialNumber: "",
+    adspowerProfileName: "",
     linkedNodeSource: "none",
     linkedNodeId: "",
     linkedNodeName: "",
+    linkedBrowserProfileId: "",
+    linkedProxyPort: "",
     purpose: "",
     tagsText: "",
     status: "active",
@@ -192,9 +241,15 @@ function recordToFormState(acc: AccountRecord): AccountFormState {
     envType: normalizeEnvType(acc.envType),
     environmentName: acc.environmentName || "",
     environmentProfile: acc.environmentProfile || "",
+    browserKind: acc.browserKind === "adspower" ? "adspower" : "netguard",
+    adspowerUserId: acc.adspowerUserId || "",
+    adspowerSerialNumber: acc.adspowerSerialNumber || "",
+    adspowerProfileName: acc.adspowerProfileName || "",
     linkedNodeSource: source,
     linkedNodeId: acc.linkedNodeId || "",
     linkedNodeName: acc.linkedNodeName || "",
+    linkedBrowserProfileId: acc.linkedBrowserProfileId || "",
+    linkedProxyPort: acc.linkedProxyPort ? String(acc.linkedProxyPort) : "",
     purpose: acc.purpose || "",
     tagsText: (acc.tags || []).join(", "),
     status: acc.status || "active",
@@ -272,6 +327,74 @@ function resolveAccountNodeDisplay(
   };
 }
 
+function findMatchingClashListener(
+  nodeName: string,
+  listeners?: ClashVergeListenerItem[],
+): ClashVergeListenerItem | undefined {
+  const trimmed = nodeName.trim();
+  if (!trimmed || !listeners || listeners.length === 0) return undefined;
+  const exact = listeners.find(
+    (l) => l.proxy.trim() === trimmed || l.name.trim() === trimmed,
+  );
+  if (exact) return exact;
+  const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
+  const target = norm(trimmed);
+  if (!target) return undefined;
+  return listeners.find((l) => {
+    const p = norm(l.proxy);
+    return p === target || (p.length >= 2 && (target.includes(p) || p.includes(target)));
+  });
+}
+
+function resolveAccountPreviewPort(
+  acc: AccountRecord,
+  nodeById: Map<string, NodeProfile>,
+  clashNodes: ClashVergeNodesSnapshot | null,
+  gatewayRunning: boolean,
+  gatewayActiveNodeId: string,
+  gatewayBrowserPort: number,
+  secondaryNodePorts: Record<string, number>,
+): { port: number | null; reason?: string } {
+  const source = normalizeNodeSource(acc.linkedNodeSource, acc.linkedNodeId);
+  if (source === "none") {
+    return { port: null, reason: "未绑定节点（禁止裸连），请先在「编辑」中绑定节点" };
+  }
+  if (source === "netguard") {
+    const id = acc.linkedNodeId?.trim();
+    if (!id || !nodeById.has(id)) {
+      return { port: null, reason: "绑定的 NetGuard 节点不存在，请重新选择" };
+    }
+    if (!gatewayRunning) {
+      return { port: null, reason: "NetGuard 安全网关未运行" };
+    }
+    if (id === gatewayActiveNodeId) {
+      return { port: gatewayBrowserPort };
+    }
+    const sec = secondaryNodePorts[id];
+    if (sec) return { port: sec };
+    return { port: null, reason: "多出口副端口未激活（点击可触发校验并提示）" };
+  }
+  if (source === "clash_verge") {
+    if (acc.linkedProxyPort) return { port: acc.linkedProxyPort };
+    const matched = findMatchingClashListener(
+      acc.linkedNodeName || "",
+      clashNodes?.listeners,
+    );
+    if (matched) return { port: matched.port };
+    if (clashNodes?.mixedPort) return { port: clashNodes.mixedPort };
+    return { port: 7897 };
+  }
+  if (acc.linkedProxyPort) return { port: acc.linkedProxyPort };
+  const text = acc.linkedNodeName || "";
+  const m =
+    text.match(/(?:127\.0\.0\.1|localhost):(\d{2,5})/i) || text.match(/\b(\d{4,5})\b/);
+  if (m) {
+    const p = Number(m[1]);
+    if (p >= 1024 && p <= 65535) return { port: p };
+  }
+  return { port: null, reason: "自定义节点需设置本地代理端口（如 7897）" };
+}
+
 function attachLightDismissFallback(dialog: HTMLDialogElement | null) {
   if (!dialog || "closedBy" in HTMLDialogElement.prototype) {
     return () => {};
@@ -308,8 +431,20 @@ export function AccountsView({
   nodes,
   envPresets,
   clashNodes,
+  browserProfiles,
+  activeSession,
+  runningBrowserProfiles,
+  runningAdspowerProfiles,
+  secondaryNodePorts,
+  gatewayRunning,
+  gatewayBrowserPort,
+  gatewayActiveNodeId,
+  antigravityRunning,
+  adspowerConfig,
+  adspowerProfiles,
   loading,
   loadingClashNodes,
+  loadingAdsPower,
   onUpsert,
   onDelete,
   onBulkDelete,
@@ -317,11 +452,20 @@ export function AccountsView({
   onSaveEnvPresets,
   onRefreshClashNodes,
   onReorder,
+  onLaunchAntigravity,
+  onLaunchBrowser,
+  onCloseBrowserProfile,
+  onCloseAdsPowerProfile,
+  onClearActiveSession,
+  onSaveAdsPowerConfig,
+  onTestAdsPowerConnection,
+  onRefreshAdsPowerProfiles,
   onNotify,
 }: AccountsViewProps) {
   const uid = useId();
   const fid = (name: string) => `${uid}-${name}`;
   const editorTitleId = fid("editor-title");
+  const adsTitleId = fid("ads-title");
   const confirmTitleId = fid("confirm-title");
 
   const [search, setSearch] = useState("");
@@ -332,11 +476,21 @@ export function AccountsView({
   const [revealedSecrets, setRevealedSecrets] = useState<Record<string, boolean>>({});
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [saving, setSaving] = useState(false);
+  const [launchingAgId, setLaunchingAgId] = useState<string | null>(null);
+  const [launchingBrowserId, setLaunchingBrowserId] = useState<string | null>(null);
+  const [clearingSession, setClearingSession] = useState(false);
 
   const [editorOpen, setEditorOpen] = useState(false);
   const [form, setForm] = useState<AccountFormState>(emptyFormState);
   const [formError, setFormError] = useState("");
   const [showFormPassword, setShowFormPassword] = useState(false);
+
+  const [adsBaseUrl, setAdsBaseUrl] = useState("http://127.0.0.1:50325");
+  const [adsApiKeyInput, setAdsApiKeyInput] = useState("");
+  const [adsShowKey, setAdsShowKey] = useState(false);
+  const [adsSaving, setAdsSaving] = useState(false);
+  const [adsTestMessage, setAdsTestMessage] = useState("");
+  const [adsTestIsError, setAdsTestIsError] = useState(false);
 
   const [addingPreset, setAddingPreset] = useState(false);
   const [newPresetName, setNewPresetName] = useState("");
@@ -347,8 +501,10 @@ export function AccountsView({
   const [reorderAnnouncement, setReorderAnnouncement] = useState("");
 
   const editorDialogRef = useRef<HTMLDialogElement>(null);
+  const adsDialogRef = useRef<HTMLDialogElement>(null);
   const confirmDialogRef = useRef<HTMLDialogElement>(null);
   const emailInputRef = useRef<HTMLInputElement>(null);
+  const adsUrlInputRef = useRef<HTMLInputElement>(null);
   const confirmCancelRef = useRef<HTMLButtonElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -378,9 +534,11 @@ export function AccountsView({
 
   useEffect(() => {
     const cleanEditor = attachLightDismissFallback(editorDialogRef.current);
+    const cleanAds = attachLightDismissFallback(adsDialogRef.current);
     const cleanConfirm = attachLightDismissFallback(confirmDialogRef.current);
     return () => {
       cleanEditor();
+      cleanAds();
       cleanConfirm();
       activeCleanupRef.current?.();
     };
@@ -466,6 +624,48 @@ export function AccountsView({
     }
     return map;
   }, [nodes]);
+
+  const runningBrowserSet = useMemo(
+    () => new Set(runningBrowserProfiles),
+    [runningBrowserProfiles],
+  );
+
+  const runningAdspowerSet = useMemo(
+    () => new Set(runningAdspowerProfiles),
+    [runningAdspowerProfiles],
+  );
+
+  const matchedFormListener = useMemo(() => {
+    if (form.linkedNodeSource !== "clash_verge") return undefined;
+    return findMatchingClashListener(form.linkedNodeName, clashNodes?.listeners);
+  }, [form.linkedNodeSource, form.linkedNodeName, clashNodes?.listeners]);
+
+  const handleRowLaunchAntigravity = async (acc: AccountRecord) => {
+    setLaunchingAgId(acc.id);
+    try {
+      await onLaunchAntigravity(acc.id);
+    } finally {
+      setLaunchingAgId(null);
+    }
+  };
+
+  const handleRowLaunchBrowser = async (acc: AccountRecord) => {
+    setLaunchingBrowserId(acc.id);
+    try {
+      await onLaunchBrowser(acc.id);
+    } finally {
+      setLaunchingBrowserId(null);
+    }
+  };
+
+  const handleClearSessionClick = async (closeBrowser: boolean) => {
+    setClearingSession(true);
+    try {
+      await onClearActiveSession(closeBrowser);
+    } finally {
+      setClearingSession(false);
+    }
+  };
 
   const distinctEnvironments = useMemo(() => {
     const set = new Set<string>();
@@ -588,6 +788,13 @@ export function AccountsView({
     if (!clashNodes?.detected) {
       void onRefreshClashNodes();
     }
+    if (
+      (existing?.browserKind === "adspower" ||
+        adspowerConfig?.hasApiKey) &&
+      !adspowerProfiles?.connected
+    ) {
+      void onRefreshAdsPowerProfiles();
+    }
     const dlg = editorDialogRef.current;
     if (dlg && !dlg.open) {
       dlg.showModal();
@@ -601,6 +808,72 @@ export function AccountsView({
       dlg.close();
     }
     setEditorOpen(false);
+  };
+
+  const openAdsDialog = () => {
+    setAdsBaseUrl(adspowerConfig?.baseUrl || "http://127.0.0.1:50325");
+    setAdsApiKeyInput("");
+    setAdsShowKey(false);
+    setAdsTestMessage("");
+    setAdsTestIsError(false);
+    const dlg = adsDialogRef.current;
+    if (dlg && !dlg.open) {
+      dlg.showModal();
+      requestAnimationFrame(() => adsUrlInputRef.current?.focus());
+    }
+  };
+
+  const closeAdsDialog = () => {
+    const dlg = adsDialogRef.current;
+    if (dlg?.open) {
+      dlg.close();
+    }
+  };
+
+  const handleSaveAdsPower = async (andTest: boolean) => {
+    setAdsSaving(true);
+    setAdsTestMessage("");
+    setAdsTestIsError(false);
+    try {
+      const nextKey = adsApiKeyInput.trim() ? adsApiKeyInput.trim() : null;
+      await onSaveAdsPowerConfig(adsBaseUrl, nextKey, false);
+      setAdsApiKeyInput("");
+      if (andTest) {
+        const msg = await onTestAdsPowerConnection();
+        const snap = await onRefreshAdsPowerProfiles();
+        const count = snap?.profiles.length ?? 0;
+        setAdsTestMessage(
+          snap?.connected
+            ? `${msg} · 已读取 ${count} 个 AdsPower 环境`
+            : msg,
+        );
+        setAdsTestIsError(false);
+      } else {
+        setAdsTestMessage("AdsPower Local API 设置已加密保存");
+        setAdsTestIsError(false);
+      }
+    } catch (err) {
+      setAdsTestMessage(String(err));
+      setAdsTestIsError(true);
+    } finally {
+      setAdsSaving(false);
+    }
+  };
+
+  const handleClearAdsPowerKey = async () => {
+    setAdsSaving(true);
+    setAdsTestMessage("");
+    setAdsTestIsError(false);
+    try {
+      await onSaveAdsPowerConfig(adsBaseUrl, null, true);
+      setAdsApiKeyInput("");
+      setAdsTestMessage("已清除保存的 API Key");
+    } catch (err) {
+      setAdsTestMessage(String(err));
+      setAdsTestIsError(true);
+    } finally {
+      setAdsSaving(false);
+    }
   };
 
   const openConfirmDelete = (target: ConfirmTarget) => {
@@ -698,6 +971,7 @@ export function AccountsView({
           linkedNodeSource: "none",
           linkedNodeId: "",
           linkedNodeName: "",
+          linkedProxyPort: "",
         };
       }
       if (nextSource === "netguard") {
@@ -706,6 +980,7 @@ export function AccountsView({
           ...prev,
           linkedNodeSource: "netguard",
           linkedNodeName: currentNode?.name || "",
+          linkedProxyPort: "",
         };
       }
       return {
@@ -713,6 +988,7 @@ export function AccountsView({
         linkedNodeSource: nextSource,
         linkedNodeId: "",
         linkedNodeName: prev.linkedNodeSource === nextSource ? prev.linkedNodeName : "",
+        linkedProxyPort: prev.linkedNodeSource === nextSource ? prev.linkedProxyPort : "",
       };
     });
   };
@@ -753,6 +1029,19 @@ export function AccountsView({
       }
     }
 
+    let parsedProxyPort: number | null = null;
+    if (
+      (effectiveSource === "clash_verge" || effectiveSource === "custom") &&
+      form.linkedProxyPort.trim()
+    ) {
+      const n = Number(form.linkedProxyPort.trim());
+      if (!Number.isInteger(n) || n < 1 || n > 65535) {
+        setFormError("独立监听端口必须是 1 到 65535 之间的整数");
+        return;
+      }
+      parsedProxyPort = n;
+    }
+
     const record: AccountRecord = {
       id: form.id,
       label: form.label.trim(),
@@ -765,9 +1054,16 @@ export function AccountsView({
       envType: form.envType,
       environmentName: form.environmentName.trim(),
       environmentProfile: form.environmentProfile.trim() || null,
+      browserKind: form.browserKind,
+      adspowerUserId: form.adspowerUserId.trim() || null,
+      adspowerSerialNumber:
+        form.adspowerSerialNumber.trim().replace(/^#/, "").trim() || null,
+      adspowerProfileName: form.adspowerProfileName.trim() || null,
       linkedNodeSource: effectiveSource,
       linkedNodeId: effectiveNodeId,
       linkedNodeName: effectiveNodeName,
+      linkedBrowserProfileId: form.linkedBrowserProfileId.trim() || null,
+      linkedProxyPort: parsedProxyPort,
       purpose: form.purpose.trim(),
       tags,
       status: form.status,
@@ -878,10 +1174,30 @@ export function AccountsView({
               typeof item.environmentProfile === "string"
                 ? item.environmentProfile
                 : null,
+            browserKind:
+              item.browserKind === "adspower" ? "adspower" : "netguard",
+            adspowerUserId:
+              typeof item.adspowerUserId === "string"
+                ? item.adspowerUserId
+                : null,
+            adspowerSerialNumber:
+              typeof item.adspowerSerialNumber === "string"
+                ? item.adspowerSerialNumber
+                : null,
+            adspowerProfileName:
+              typeof item.adspowerProfileName === "string"
+                ? item.adspowerProfileName
+                : null,
             linkedNodeSource,
             linkedNodeId,
             linkedNodeName:
               typeof item.linkedNodeName === "string" ? item.linkedNodeName : null,
+            linkedBrowserProfileId:
+              typeof item.linkedBrowserProfileId === "string"
+                ? item.linkedBrowserProfileId
+                : null,
+            linkedProxyPort:
+              typeof item.linkedProxyPort === "number" ? item.linkedProxyPort : null,
             purpose: typeof item.purpose === "string" ? item.purpose : "",
             tags: Array.isArray(item.tags)
               ? item.tags.filter((t): t is string => typeof t === "string")
@@ -1214,6 +1530,24 @@ export function AccountsView({
           <Button
             variant="outline"
             size="sm"
+            onClick={openAdsDialog}
+            title={
+              adspowerConfig?.hasApiKey
+                ? `AdsPower Local API 已配置密钥 (${adspowerConfig.apiKeyMasked || "DPAPI"})`
+                : "配置 AdsPower Local API 地址与 API Key 鉴权"
+            }
+          >
+            <span
+              className={`h-2 w-2 rounded-full ${
+                adspowerConfig?.hasApiKey ? "bg-[#16a34a]" : "bg-[#9ca3af]"
+              }`}
+              aria-hidden="true"
+            />
+            AdsPower API
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
             onClick={() => fileInputRef.current?.click()}
             disabled={saving}
           >
@@ -1295,6 +1629,165 @@ export function AccountsView({
             受限 {stats.restricted} · 已封禁 {stats.banned}
           </div>
         </div>
+      </section>
+
+      {/* Active Account Environment Banner */}
+      <section
+        aria-label="当前激活的账号环境"
+        className={`flex flex-wrap items-center justify-between gap-3 px-6 py-3 ${
+          activeSession ? "bg-[#f8f7fe]" : "bg-[#fafbfc]"
+        }`}
+      >
+        {activeSession ? (
+          <>
+            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2 text-[0.75rem]">
+              <span className="inline-flex items-center gap-1.5 font-semibold text-[#111827]">
+                <span
+                  className="h-2 w-2 shrink-0 rounded-full bg-[#16a34a]"
+                  aria-hidden="true"
+                />
+                当前激活环境：
+                <span className="truncate text-[#5b48c4]">
+                  {activeSession.accountLabel || activeSession.email}
+                </span>
+              </span>
+              {activeSession.accountLabel &&
+                activeSession.accountLabel !== activeSession.email && (
+                  <span className="mono-num truncate text-[0.71rem] text-[#525866]">
+                    ({activeSession.email})
+                  </span>
+                )}
+              <Badge variant="iris" className="mono-num">
+                {activeSession.localPort > 0
+                  ? `${activeSession.nodeName} · 127.0.0.1:${activeSession.localPort}`
+                  : activeSession.nodeName}
+              </Badge>
+              {activeSession.verifiedExitIp && (
+                <Badge variant="success" className="mono-num">
+                  ✓ 出口核验 {activeSession.verifiedExitIp.ip} (
+                  {activeSession.verifiedExitIp.countryCode || "--"})
+                  {activeSession.verifiedExitIp.latencyMs
+                    ? ` · ${activeSession.verifiedExitIp.latencyMs}ms`
+                    : ""}
+                </Badge>
+              )}
+              {activeSession.antigravityLaunched && (
+                <Badge variant={antigravityRunning ? "iris" : "neutral"}>
+                  Antigravity {antigravityRunning ? "运行中" : "已按此端口拉起"}
+                </Badge>
+              )}
+              {activeSession.browserKind === "adspower" ? (
+                <Badge
+                  variant={
+                    activeSession.adspowerUserId &&
+                    runningAdspowerSet.has(activeSession.adspowerUserId)
+                      ? "success"
+                      : "neutral"
+                  }
+                >
+                  AdsPower{" "}
+                  {activeSession.adspowerProfileLabel
+                    ? `(${activeSession.adspowerProfileLabel}) `
+                    : ""}
+                  {activeSession.adspowerUserId &&
+                  runningAdspowerSet.has(activeSession.adspowerUserId)
+                    ? "运行中"
+                    : "已绑定"}
+                </Badge>
+              ) : (
+                activeSession.browserProfileId && (
+                  <Badge
+                    variant={
+                      runningBrowserSet.has(activeSession.browserProfileId)
+                        ? "success"
+                        : "neutral"
+                    }
+                  >
+                    专属浏览器{" "}
+                    {runningBrowserSet.has(activeSession.browserProfileId)
+                      ? "运行中"
+                      : "已绑定"}
+                  </Badge>
+                )
+              )}
+            </div>
+
+            <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+              <Button
+                variant="outline"
+                size="xs"
+                disabled={launchingBrowserId === activeSession.accountId}
+                onClick={() => {
+                  const acc = accounts.find((a) => a.id === activeSession.accountId);
+                  if (acc) void handleRowLaunchBrowser(acc);
+                  else void onLaunchBrowser(activeSession.accountId);
+                }}
+              >
+                {launchingBrowserId === activeSession.accountId ? (
+                  <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
+                ) : (
+                  <Globe className="h-3 w-3 text-[#6d5bd0]" aria-hidden="true" />
+                )}
+                {activeSession.browserKind === "adspower"
+                  ? "再开 AdsPower"
+                  : "再开浏览器"}
+              </Button>
+              {activeSession.browserKind === "adspower" ? (
+                activeSession.adspowerUserId &&
+                runningAdspowerSet.has(activeSession.adspowerUserId) && (
+                  <Button
+                    variant="destructive-outline"
+                    size="xs"
+                    onClick={() => {
+                      const target = activeSession.adspowerUserId!;
+                      const isDigits = /^\d+$/.test(target);
+                      void onCloseAdsPowerProfile(
+                        isDigits ? null : target,
+                        isDigits ? target : null,
+                      );
+                    }}
+                  >
+                    <Square className="h-3 w-3" aria-hidden="true" />
+                    关闭 AdsPower
+                  </Button>
+                )
+              ) : (
+                activeSession.browserProfileId &&
+                runningBrowserSet.has(activeSession.browserProfileId) && (
+                  <Button
+                    variant="destructive-outline"
+                    size="xs"
+                    onClick={() =>
+                      void onCloseBrowserProfile(activeSession.browserProfileId!)
+                    }
+                  >
+                    <Square className="h-3 w-3" aria-hidden="true" />
+                    关闭浏览器
+                  </Button>
+                )
+              )}
+              <Button
+                variant="ghost"
+                size="xs"
+                disabled={clearingSession}
+                onClick={() => void handleClearSessionClick(false)}
+              >
+                清除状态
+              </Button>
+            </div>
+          </>
+        ) : (
+          <div className="flex flex-wrap items-center gap-2 text-[0.73rem] text-[#7c8495]">
+            <span
+              className="h-2 w-2 shrink-0 rounded-full bg-[#9ca3af]"
+              aria-hidden="true"
+            />
+            <span className="font-medium text-[#525866]">当前激活环境：待机</span>
+            <span>
+              点击下方任意已绑定节点的账号「⚡ Antigravity」或「🌐 浏览器」，将先完成外部真实出口 IP 强校验再纯净拉起
+            </span>
+          </div>
+        )}
       </section>
 
       {/* Search & Filter Toolbar */}
@@ -1467,6 +1960,38 @@ export function AccountsView({
               const envNameTrimmed = acc.environmentName.trim();
               const envProfileTrimmed = acc.environmentProfile?.trim() || "";
               const nodeDisplay = resolveAccountNodeDisplay(acc, nodeById);
+              const previewPort = resolveAccountPreviewPort(
+                acc,
+                nodeById,
+                clashNodes,
+                gatewayRunning,
+                gatewayActiveNodeId,
+                gatewayBrowserPort,
+                secondaryNodePorts,
+              );
+              const isUnbound =
+                normalizeNodeSource(acc.linkedNodeSource, acc.linkedNodeId) === "none" ||
+                !nodeDisplay;
+              const isAdspower = acc.browserKind === "adspower";
+              const adsUidTrimmed = acc.adspowerUserId?.trim() || "";
+              const adsSnTrimmed =
+                acc.adspowerSerialNumber?.trim().replace(/^#/, "") ||
+                acc.environmentProfile?.trim().replace(/^#/, "") ||
+                "";
+              const hasAdspowerTarget = Boolean(adsUidTrimmed || adsSnTrimmed);
+              const canLaunchBrowser = isAdspower ? hasAdspowerTarget : !isUnbound;
+              const isBusyRow =
+                launchingAgId === acc.id || launchingBrowserId === acc.id;
+              const isAccBrowserRunning = isAdspower
+                ? Boolean(
+                    (adsUidTrimmed && runningAdspowerSet.has(adsUidTrimmed)) ||
+                      (adsSnTrimmed && runningAdspowerSet.has(adsSnTrimmed)),
+                  )
+                : Boolean(
+                    acc.linkedBrowserProfileId &&
+                      runningBrowserSet.has(acc.linkedBrowserProfileId),
+                  );
+              const isActiveSessionAccount = activeSession?.accountId === acc.id;
               const isExpanded = Boolean(expandedIds[acc.id]);
               const isPassShown = Boolean(revealedPasswords[acc.id]);
               const isSecretShown = Boolean(revealedSecrets[acc.id]);
@@ -1487,7 +2012,9 @@ export function AccountsView({
                       ? "bg-[#fef2f2]/35"
                       : isRestricted
                         ? "bg-[#fffbeb]/35"
-                        : "hover:bg-[#fafbfc]/70"
+                        : isActiveSessionAccount
+                          ? "bg-[#f8f7fe]/70"
+                          : "hover:bg-[#fafbfc]/70"
                   }`}
                 >
                   {/* Left Sort Rail */}
@@ -1568,6 +2095,69 @@ export function AccountsView({
                       </div>
 
                       <div className="flex shrink-0 items-center gap-1">
+                        <Button
+                          variant={
+                            isActiveSessionAccount && activeSession?.antigravityLaunched
+                              ? "solid"
+                              : "soft"
+                          }
+                          size="xs"
+                          disabled={isBusyRow || isUnbound}
+                          title={
+                            isUnbound
+                              ? "未绑定节点（禁止裸连），请先在「编辑」中绑定节点"
+                              : previewPort.port
+                                ? `按「${nodeDisplay?.name}」(:${previewPort.port}) 切换代理并纯净重启 Antigravity`
+                                : previewPort.reason ||
+                                  `按「${nodeDisplay?.name}」纯净重启 Antigravity`
+                          }
+                          onClick={() => void handleRowLaunchAntigravity(acc)}
+                        >
+                          {launchingAgId === acc.id ? (
+                            <Loader2
+                              className="h-3 w-3 animate-spin"
+                              aria-hidden="true"
+                            />
+                          ) : (
+                            <Zap className="h-3 w-3" aria-hidden="true" />
+                          )}
+                          Antigravity
+                        </Button>
+                        <Button
+                          variant={isAccBrowserRunning ? "solid" : "outline"}
+                          size="xs"
+                          disabled={isBusyRow || !canLaunchBrowser}
+                          title={
+                            isAdspower
+                              ? !hasAdspowerTarget
+                                ? "已设为 AdsPower 模式，请先在「编辑」中选择或填写 AdsPower 环境 ID / 序号"
+                                : `通过 Local API 拉起 AdsPower 环境「${acc.adspowerProfileName || (adsSnTrimmed ? `#${adsSnTrimmed}` : adsUidTrimmed)}」${!isUnbound && previewPort.port ? `（启动前先核验 :${previewPort.port} 出口 IP，保持 AdsPower 原代理不变）` : "（使用 AdsPower 原代理设置）"}`
+                              : isUnbound
+                                ? "未绑定节点（禁止裸连），请先在「编辑」中绑定节点"
+                                : isAccBrowserRunning
+                                  ? `专属浏览器运行中${previewPort.port ? ` (:${previewPort.port})` : ""}，点击再开新标签页`
+                                  : `打开此账号专属隔离指纹浏览器${previewPort.port ? ` (:${previewPort.port})` : ""}`
+                          }
+                          onClick={() => void handleRowLaunchBrowser(acc)}
+                        >
+                          {launchingBrowserId === acc.id ? (
+                            <Loader2
+                              className="h-3 w-3 animate-spin"
+                              aria-hidden="true"
+                            />
+                          ) : isAccBrowserRunning ? (
+                            <span
+                              className="h-2 w-2 rounded-full bg-[#4ade80]"
+                              aria-hidden="true"
+                            />
+                          ) : (
+                            <Globe
+                              className="h-3 w-3 text-[#6d5bd0]"
+                              aria-hidden="true"
+                            />
+                          )}
+                          {isAdspower ? "AdsPower" : "浏览器"}
+                        </Button>
                         <Button
                           variant="ghost"
                           size="xs"
@@ -1702,15 +2292,25 @@ export function AccountsView({
                           <span className="w-7 shrink-0 text-[0.68rem] text-[#9ca3af]">
                             节点
                           </span>
-                          <div className="flex min-w-0 flex-1 items-center">
+                          <div className="flex min-w-0 flex-1 items-center gap-1">
                             {nodeDisplay ? (
-                              <Badge
-                                variant={nodeDisplay.variant}
-                                className="max-w-full overflow-hidden"
-                                title={nodeDisplay.badgeText}
-                              >
-                                <span className="truncate">{nodeDisplay.badgeText}</span>
-                              </Badge>
+                              <>
+                                <Badge
+                                  variant={nodeDisplay.variant}
+                                  className="min-w-0 max-w-full overflow-hidden"
+                                  title={nodeDisplay.badgeText}
+                                >
+                                  <span className="truncate">{nodeDisplay.badgeText}</span>
+                                </Badge>
+                                {previewPort.port && (
+                                  <span
+                                    className="mono-num shrink-0 rounded border border-[#eaecef] bg-[#f8f9fb] px-1 py-0.5 text-[0.63rem] font-medium text-[#374151]"
+                                    title={`独立本地监听端口 127.0.0.1:${previewPort.port}`}
+                                  >
+                                    :{previewPort.port}
+                                  </span>
+                                )}
+                              </>
                             ) : (
                               <span className="truncate text-[0.72rem] text-[#9ca3af]">
                                 未绑定
@@ -2469,6 +3069,227 @@ export function AccountsView({
                 </div>
               </div>
 
+              {/* Browser Launch Mode & Profile Binding */}
+              <div className="space-y-2.5 rounded-xl border border-[#eaecef] bg-[#fafbfc] p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-[0.73rem] font-medium text-[#525866]">
+                    浏览器启动引擎（点击列表「🌐 浏览器 / AdsPower」时使用）
+                  </span>
+                  <div className="flex flex-wrap gap-1" role="group" aria-label="浏览器引擎">
+                    {(
+                      [
+                        { value: "netguard", label: "NetGuard 内置浏览器" },
+                        { value: "adspower", label: "AdsPower 专属窗口" },
+                      ] as const
+                    ).map((opt) => {
+                      const active = form.browserKind === opt.value;
+                      return (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          aria-pressed={active}
+                          onClick={() => {
+                            setForm((prev) => ({ ...prev, browserKind: opt.value }));
+                            if (
+                              opt.value === "adspower" &&
+                              !adspowerProfiles?.connected
+                            ) {
+                              void onRefreshAdsPowerProfiles();
+                            }
+                          }}
+                          className={`rounded-md border px-2 py-0.5 text-[0.69rem] font-medium transition-colors cursor-pointer ${
+                            active
+                              ? "border-[#dcd4fb] bg-[#6d5bd0] text-white"
+                              : "border-[#dce0e6] bg-white text-[#525866] hover:bg-[#f3f4f6]"
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {form.browserKind === "netguard" ? (
+                  <div className="space-y-1.5">
+                    <label
+                      htmlFor={fid("linkedBrowserProfileId")}
+                      className="block text-[0.71rem] font-medium text-[#7c8495]"
+                    >
+                      关联「指纹浏览器」独立档案
+                    </label>
+                    <select
+                      id={fid("linkedBrowserProfileId")}
+                      className={NATIVE_SELECT_CLASS}
+                      value={form.linkedBrowserProfileId}
+                      onChange={(e) =>
+                        setForm((prev) => ({
+                          ...prev,
+                          linkedBrowserProfileId: e.target.value,
+                        }))
+                      }
+                    >
+                      <option value="">
+                        自动为本账号创建并记住独立环境（推荐，独立缓存目录 + 指纹）
+                      </option>
+                      {browserProfiles.map((bp) => (
+                        <option key={bp.id} value={bp.id}>
+                          {bp.name}
+                          {bp.customProxyUrl
+                            ? ` · ${bp.customProxyUrl}`
+                            : bp.nodeId
+                              ? ` · ${nodeById.get(bp.nodeId)?.name || bp.nodeId}`
+                              : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-[0.7rem] text-[#7c8495]">
+                      <span>
+                        {adspowerProfiles?.connected
+                          ? `已连接 AdsPower：读取到 ${adspowerProfiles.profiles.length} 个环境`
+                          : adspowerProfiles?.error
+                            ? adspowerProfiles.error
+                            : "点击右侧拉取本机 AdsPower 环境，或在下方直接填写 ID / 序号"}
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="xs"
+                          onClick={openAdsDialog}
+                        >
+                          配置 API Key
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="xs"
+                          disabled={loadingAdsPower}
+                          onClick={() => void onRefreshAdsPowerProfiles()}
+                        >
+                          <RefreshCw
+                            className={`h-3 w-3 ${loadingAdsPower ? "animate-spin" : ""}`}
+                            aria-hidden="true"
+                          />
+                          拉取环境
+                        </Button>
+                      </div>
+                    </div>
+
+                    <div className="space-y-1">
+                      <label
+                        htmlFor={fid("adspowerUserIdSelect")}
+                        className="block text-[0.71rem] font-medium text-[#525866]"
+                      >
+                        选择 AdsPower 环境
+                      </label>
+                      <select
+                        id={fid("adspowerUserIdSelect")}
+                        className={NATIVE_SELECT_CLASS}
+                        value={form.adspowerUserId}
+                        onChange={(e) => {
+                          const uidVal = e.target.value;
+                          const matched = adspowerProfiles?.profiles.find(
+                            (p) => p.userId === uidVal,
+                          );
+                          if (!matched) {
+                            setForm((prev) => ({
+                              ...prev,
+                              adspowerUserId: "",
+                              adspowerProfileName: "",
+                            }));
+                            return;
+                          }
+                          setForm((prev) => ({
+                            ...prev,
+                            adspowerUserId: matched.userId,
+                            adspowerSerialNumber: matched.serialNumber,
+                            adspowerProfileName: matched.name,
+                            environmentName: prev.environmentName.trim()
+                              ? prev.environmentName
+                              : "AdsPower",
+                            environmentProfile:
+                              prev.environmentProfile.trim() || !matched.serialNumber
+                                ? prev.environmentProfile
+                                : `#${matched.serialNumber}`,
+                          }));
+                        }}
+                      >
+                        <option value="">
+                          -- 请选择 AdsPower 环境（或下方手动填写 user_id / 序号）--
+                        </option>
+                        {(adspowerProfiles?.profiles ?? []).map((p) => (
+                          <option key={p.userId} value={p.userId}>
+                            {p.serialNumber ? `#${p.serialNumber} · ` : ""}
+                            {p.name || p.userId}
+                            {p.groupName ? ` [${p.groupName}]` : ""} ({p.userId})
+                          </option>
+                        ))}
+                        {form.adspowerUserId &&
+                          !(adspowerProfiles?.profiles ?? []).some(
+                            (p) => p.userId === form.adspowerUserId,
+                          ) && (
+                            <option value={form.adspowerUserId}>
+                              已绑定：{form.adspowerProfileName || form.adspowerUserId} (
+                              {form.adspowerUserId})
+                            </option>
+                          )}
+                      </select>
+                    </div>
+
+                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      <div className="space-y-1">
+                        <label
+                          htmlFor={fid("adspowerUserId")}
+                          className="block text-[0.69rem] text-[#7c8495]"
+                        >
+                          AdsPower user_id
+                        </label>
+                        <Input
+                          id={fid("adspowerUserId")}
+                          className="mono-num h-7 text-[0.72rem]"
+                          placeholder="例如：j82xkp41"
+                          value={form.adspowerUserId}
+                          onChange={(e) =>
+                            setForm((prev) => ({
+                              ...prev,
+                              adspowerUserId: e.target.value,
+                            }))
+                          }
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <label
+                          htmlFor={fid("adspowerSerialNumber")}
+                          className="block text-[0.69rem] text-[#7c8495]"
+                        >
+                          窗口序号 serial_number（可选）
+                        </label>
+                        <Input
+                          id={fid("adspowerSerialNumber")}
+                          className="mono-num h-7 text-[0.72rem]"
+                          placeholder="例如：42（留空将尝试读取上方窗口编号）"
+                          value={form.adspowerSerialNumber}
+                          onChange={(e) =>
+                            setForm((prev) => ({
+                              ...prev,
+                              adspowerSerialNumber: e.target.value,
+                            }))
+                          }
+                        />
+                      </div>
+                    </div>
+
+                    <p className="rounded-lg border border-[#eaecef] bg-white px-2.5 py-1.5 text-[0.69rem] text-[#525866]">
+                      拉起时会<strong className="text-[#111827]">完全保留 AdsPower 里已配好的代理与指纹</strong>；若下方同时绑定了 Clash / NetGuard 节点，启动前会自动先核验该端口的真实出口 IP。
+                    </p>
+                  </div>
+                )}
+              </div>
+
               {/* Multi-Source Node Binding */}
               <div className="space-y-2.5 rounded-xl border border-[#eaecef] bg-[#fafbfc] p-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
@@ -2688,20 +3509,84 @@ export function AccountsView({
                         </div>
                       </div>
                     )}
+
+                    <div className="grid grid-cols-1 gap-2 rounded-lg border border-[#eaecef] bg-white px-3 py-2 sm:grid-cols-[minmax(0,1fr)_10.5rem] sm:items-center">
+                      <div className="text-[0.7rem] text-[#525866]">
+                        {form.linkedProxyPort.trim() ? (
+                          <span>
+                            使用手动覆盖端口：{" "}
+                            <span className="mono-num font-semibold text-[#5b48c4]">
+                              127.0.0.1:{form.linkedProxyPort.trim()}
+                            </span>
+                          </span>
+                        ) : matchedFormListener ? (
+                          <span className="text-[#15803d]">
+                            ✓ 自动匹配 Listener「{matchedFormListener.name}」→{" "}
+                            <span className="mono-num font-semibold">
+                              127.0.0.1:{matchedFormListener.port}
+                            </span>
+                          </span>
+                        ) : (
+                          <span>
+                            未命中专用 Listener，默认走 Clash mixed-port：{" "}
+                            <span className="mono-num font-semibold text-[#111827]">
+                              127.0.0.1:{clashNodes?.mixedPort || 7897}
+                            </span>
+                          </span>
+                        )}
+                      </div>
+                      <Input
+                        aria-label="独立监听端口覆盖"
+                        type="number"
+                        min={1}
+                        max={65535}
+                        className="mono-num h-7 text-[0.72rem]"
+                        placeholder="覆盖端口 (可选)"
+                        value={form.linkedProxyPort}
+                        onChange={(e) =>
+                          setForm((prev) => ({
+                            ...prev,
+                            linkedProxyPort: e.target.value,
+                          }))
+                        }
+                      />
+                    </div>
                   </div>
                 )}
 
                 {form.linkedNodeSource === "custom" && (
-                  <Input
-                    placeholder="输入自定义代理节点或直连描述，如：静态住宅 1.2.3.4 / 本地直连 / 指纹内置 Socks5"
-                    value={form.linkedNodeName}
-                    onChange={(e) =>
-                      setForm((prev) => ({
-                        ...prev,
-                        linkedNodeName: e.target.value,
-                      }))
-                    }
-                  />
+                  <div className="space-y-2">
+                    <Input
+                      placeholder="输入自定义代理节点或直连描述，如：静态住宅 1.2.3.4 / socks5://127.0.0.1:10808"
+                      value={form.linkedNodeName}
+                      onChange={(e) =>
+                        setForm((prev) => ({
+                          ...prev,
+                          linkedNodeName: e.target.value,
+                        }))
+                      }
+                    />
+                    <div className="grid grid-cols-1 gap-2 rounded-lg border border-[#eaecef] bg-white px-3 py-2 sm:grid-cols-[minmax(0,1fr)_10.5rem] sm:items-center">
+                      <span className="text-[0.7rem] text-[#525866]">
+                        一键拉起所需的本地 SOCKS5 / HTTP 代理端口（禁止无代理裸连防 IP 污染）
+                      </span>
+                      <Input
+                        aria-label="自定义本地代理端口"
+                        type="number"
+                        min={1}
+                        max={65535}
+                        className="mono-num h-7 text-[0.72rem]"
+                        placeholder="本地端口 如 7897"
+                        value={form.linkedProxyPort}
+                        onChange={(e) =>
+                          setForm((prev) => ({
+                            ...prev,
+                            linkedProxyPort: e.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                  </div>
                 )}
               </div>
             </fieldset>
@@ -2840,6 +3725,156 @@ export function AccountsView({
             </Button>
           </div>
         </form>
+      </dialog>
+
+      {/* Modal 3: AdsPower Local API Configuration Native <dialog> */}
+      <dialog
+        ref={adsDialogRef}
+        aria-labelledby={adsTitleId}
+        {...({ closedby: "any" } as Record<string, string>)}
+        className="ng-dialog m-auto w-[min(32rem,calc(100vi-2rem))] max-w-none overflow-hidden rounded-2xl border border-[#dce0e6] bg-white p-0 text-[#111827] shadow-[0_24px_56px_-12px_rgba(15,23,42,0.28)]"
+      >
+        <div className="flex flex-col">
+          <div className="flex items-center justify-between gap-3 border-b border-[#eaecef] px-6 py-3.5">
+            <div className="min-w-0">
+              <h2
+                id={adsTitleId}
+                className="text-[0.98rem] font-semibold tracking-tight text-[#111827]"
+              >
+                AdsPower Local API 连接设置
+              </h2>
+              <p className="mt-0.5 text-[0.72rem] text-[#7c8495]">
+                API Key 使用 Windows DPAPI 本地加密保存，仅直连本机 AdsPower 环回接口
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={closeAdsDialog}
+              aria-label="关闭 AdsPower 设置"
+              className="inline-grid h-7 w-7 shrink-0 place-items-center rounded-lg text-[#7c8495] hover:bg-[#f3f4f6] hover:text-[#111827] cursor-pointer"
+            >
+              <X className="h-4 w-4" aria-hidden="true" />
+            </button>
+          </div>
+
+          <div className="space-y-3.5 px-6 py-4">
+            <div className="space-y-1.5">
+              <label
+                htmlFor={fid("adsBaseUrl")}
+                className="block text-[0.73rem] font-medium text-[#525866]"
+              >
+                Local API 接口地址
+              </label>
+              <Input
+                ref={adsUrlInputRef}
+                id={fid("adsBaseUrl")}
+                className="mono-num"
+                placeholder="http://127.0.0.1:50325"
+                value={adsBaseUrl}
+                onChange={(e) => setAdsBaseUrl(e.target.value)}
+              />
+              <p className="text-[0.68rem] text-[#7c8495]">
+                仅允许本机地址（`http://127.0.0.1:50325` / `localhost` / `local.adspower.net`），可在 AdsPower 客户端「自动化 / Local API」查看
+              </p>
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <label
+                  htmlFor={fid("adsApiKey")}
+                  className="block text-[0.73rem] font-medium text-[#525866]"
+                >
+                  API Key（已在 AdsPower 开启鉴权时必填）
+                </label>
+                {adspowerConfig?.hasApiKey && (
+                  <button
+                    type="button"
+                    disabled={adsSaving}
+                    onClick={() => void handleClearAdsPowerKey()}
+                    className="text-[0.69rem] font-medium text-[#dc2626] hover:underline cursor-pointer"
+                  >
+                    清除已存密钥
+                  </button>
+                )}
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Input
+                  id={fid("adsApiKey")}
+                  type={adsShowKey ? "text" : "password"}
+                  className="mono-num flex-1"
+                  placeholder={
+                    adspowerConfig?.hasApiKey
+                      ? `已加密保存 (${adspowerConfig.apiKeyMasked || "DPAPI"})，留空保持不变`
+                      : "粘贴 AdsPower Local API Key（Authorization Bearer）"
+                  }
+                  value={adsApiKeyInput}
+                  onChange={(e) => setAdsApiKeyInput(e.target.value)}
+                />
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label={adsShowKey ? "隐藏 API Key" : "显示 API Key"}
+                  onClick={() => setAdsShowKey((v) => !v)}
+                  className="h-8 w-8 shrink-0 text-[#525866]"
+                >
+                  {adsShowKey ? (
+                    <EyeOff className="h-3.5 w-3.5" aria-hidden="true" />
+                  ) : (
+                    <Eye className="h-3.5 w-3.5" aria-hidden="true" />
+                  )}
+                </Button>
+              </div>
+            </div>
+
+            {adsTestMessage && (
+              <div
+                role="status"
+                className={`rounded-lg border px-3 py-2 text-[0.73rem] ${
+                  adsTestIsError
+                    ? "border-[#fecaca] bg-[#fef2f2] text-[#b91c1c]"
+                    : "border-[#bbf7d0] bg-[#f0fdf4] text-[#15803d]"
+                }`}
+              >
+                {adsTestMessage}
+              </div>
+            )}
+          </div>
+
+          <div className="flex items-center justify-end gap-2 border-t border-[#eaecef] bg-[#fafbfc] px-6 py-3.5">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={closeAdsDialog}
+            >
+              关闭
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={adsSaving}
+              onClick={() => void handleSaveAdsPower(false)}
+            >
+              仅保存
+            </Button>
+            <Button
+              type="button"
+              variant="solid"
+              size="sm"
+              disabled={adsSaving}
+              onClick={() => void handleSaveAdsPower(true)}
+            >
+              {adsSaving ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+              ) : (
+                <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+              )}
+              保存并测试连接
+            </Button>
+          </div>
+        </div>
       </dialog>
     </div>
   );

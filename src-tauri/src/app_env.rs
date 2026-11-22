@@ -117,6 +117,11 @@ pub fn extract_proxy_host_port(raw: &str) -> Option<String> {
     None
 }
 
+pub fn is_tcp_host_port_alive(host_port: &str) -> bool {
+    let mut cache = HashMap::new();
+    probe_tcp_alive(host_port, &mut cache)
+}
+
 fn probe_tcp_alive(host_port: &str, cache: &mut HashMap<String, bool>) -> bool {
     if let Some(&cached) = cache.get(host_port) {
         return cached;
@@ -1120,6 +1125,25 @@ pub fn launch_managed_app_with_clean_env(
     }
     if matches!(app.proxy_mode, AppProxyMode::Direct) && app.id != "claude-desktop" {
         cmd.arg("--no-proxy-server");
+    }
+    if matches!(app.proxy_mode, AppProxyMode::CustomProxy) && app.id != "claude-desktop" {
+        let already_has_proxy_arg = app
+            .extra_args
+            .iter()
+            .any(|a| a.trim().starts_with("--proxy-server"));
+        let already_has_bypass_arg = app
+            .extra_args
+            .iter()
+            .any(|a| a.trim().starts_with("--proxy-bypass-list"));
+        if !already_has_proxy_arg {
+            let proxy_url = app.custom_proxy_url.as_deref().unwrap_or("").trim();
+            if !proxy_url.is_empty() {
+                cmd.arg(format!("--proxy-server={proxy_url}"));
+                if !already_has_bypass_arg {
+                    cmd.arg("--proxy-bypass-list=<-loopback>;localhost;127.0.0.1");
+                }
+            }
+        }
     }
     for arg in &app.extra_args {
         let a = arg.trim();

@@ -380,8 +380,11 @@ pub async fn probe_exit_ip_fast(socks_port: u16) -> Result<(String, u64), String
 }
 
 pub async fn probe_exit_ip(socks_port: u16) -> Result<ExitIpInfo, String> {
-    let proxy = Proxy::all(format!("socks5h://127.0.0.1:{socks_port}"))
-        .map_err(|e| format!("构造代理探针失败: {e}"))?;
+    probe_exit_ip_via_proxy(&format!("socks5h://127.0.0.1:{socks_port}")).await
+}
+
+pub async fn probe_exit_ip_via_proxy(proxy_url: &str) -> Result<ExitIpInfo, String> {
+    let proxy = Proxy::all(proxy_url).map_err(|e| format!("构造代理探针失败 ({proxy_url}): {e}"))?;
     let client = reqwest::Client::builder()
         .proxy(proxy)
         .timeout(Duration::from_secs(5))

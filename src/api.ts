@@ -2,7 +2,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AccountEnvPreset,
+  AccountLaunchOutcome,
   AccountRecord,
+  AdsPowerConfigStatus,
+  AdsPowerProfilesSnapshot,
   AppConfig,
   AppEnvSnapshot,
   ClashVergeNodesSnapshot,
@@ -64,6 +67,36 @@ export const api = {
     invoke<ClashVergeNodesSnapshot>("list_clash_verge_nodes"),
   reorderAccounts: (orderedIds: string[]) =>
     invoke<AccountRecord[]>("reorder_accounts", { orderedIds }),
+  launchAccountAntigravity: (accountId: string) =>
+    invoke<AccountLaunchOutcome>("launch_account_antigravity", { accountId }),
+  launchAccountBrowser: (accountId: string, url?: string | null) =>
+    invoke<AccountLaunchOutcome>("launch_account_browser", {
+      accountId,
+      url: url ?? null,
+    }),
+  clearActiveAccountSession: (closeBrowser = false) =>
+    invoke<GatewayStatus>("clear_active_account_session", { closeBrowser }),
+  getAdsPowerConfig: () =>
+    invoke<AdsPowerConfigStatus>("get_adspower_config"),
+  saveAdsPowerConfig: (
+    baseUrl: string,
+    apiKey: string | null,
+    clearApiKey = false,
+  ) =>
+    invoke<AdsPowerConfigStatus>("save_adspower_config", {
+      baseUrl,
+      apiKey,
+      clearApiKey,
+    }),
+  testAdsPowerConnection: () =>
+    invoke<string>("test_adspower_connection"),
+  listAdsPowerProfiles: () =>
+    invoke<AdsPowerProfilesSnapshot>("list_adspower_profiles"),
+  closeAdsPowerProfile: (userId?: string | null, serialNumber?: string | null) =>
+    invoke<GatewayStatus>("close_adspower_profile", {
+      userId: userId ?? null,
+      serialNumber: serialNumber ?? null,
+    }),
   connectGuard: () => invoke<GatewayStatus>("connect_guard"),
   clearLogs: () => invoke<void>("clear_logs"),
   generateVpsScript: (protocol: "vless-reality" | "hysteria2", port: number) =>
