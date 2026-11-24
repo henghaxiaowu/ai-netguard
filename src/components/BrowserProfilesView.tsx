@@ -2,30 +2,40 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
+  Check,
+  ClipboardPaste,
   Copy,
   Cpu,
+  Download,
   ExternalLink,
   Fingerprint,
   Globe,
+  KeyRound,
   Monitor,
   Pencil,
   Play,
   Plus,
   RefreshCw,
+  Search,
   ShieldCheck,
   Sparkles,
   Square,
   Trash2,
   X,
 } from "lucide-react";
+import { api } from "../api";
 import type {
   AppConfig,
+  BrowserCookieRecord,
   BrowserFingerprintConfig,
   BrowserFingerprintMode,
   BrowserProfile,
+  ClashVergeNodesSnapshot,
+  DownloadProgress,
   ExitIpInfo,
   GatewayStatus,
   NodeProfile,
+  ProfileCookiesSnapshot,
 } from "../types";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
@@ -35,11 +45,15 @@ interface Props {
   config: AppConfig;
   status: GatewayStatus | null;
   gatewayReady: boolean;
+  dlProgress?: DownloadProgress | null;
+  clashNodes?: ClashVergeNodesSnapshot | null;
   preselectedNodeRequest?: { nodeId: string; nonce: number } | null;
   onSaveProfiles: (profiles: BrowserProfile[]) => Promise<void>;
   onLaunchProfile: (profileId: string, url?: string) => Promise<void>;
   onCloseProfile: (profileId: string) => Promise<void>;
   onProbeNodeExit: (nodeId: string) => Promise<ExitIpInfo>;
+  onProbeProxyExit?: (proxyUrl: string) => Promise<ExitIpInfo>;
+  onRefreshClashNodes?: () => Promise<void>;
   onInstallBrowser: () => Promise<void>;
   onRestartGateway?: () => Promise<void>;
   onNotify: (msg: string) => void;
@@ -47,6 +61,20 @@ interface Props {
 
 const NATIVE_SELECT_CLASS =
   "flex min-h-8 w-full rounded-lg border border-[#dce0e6] bg-white px-2.5 py-1.5 text-[0.765rem] text-[#111827] shadow-[0_1px_1px_rgba(15,23,42,0.02)] transition-colors hover:border-[#c3cad6] focus-visible:outline-2 focus-visible:outline-[#5b48c4] focus-visible:outline-offset-1 cursor-pointer";
+
+const LOCALE_PRESETS: { value: string; label: string }[] = [
+  { value: "en-US", label: "en-US · 英文 (United States · 默认)" },
+  { value: "en-GB", label: "en-GB · 英文 (United Kingdom)" },
+  { value: "en-SG", label: "en-SG · 英文 (Singapore)" },
+  { value: "ja-JP", label: "ja-JP · 日语 (Japan)" },
+  { value: "ko-KR", label: "ko-KR · 韩语 (Korea)" },
+  { value: "zh-TW", label: "zh-TW · 繁体中文 (台湾)" },
+  { value: "zh-HK", label: "zh-HK · 繁体中文 (香港)" },
+  { value: "zh-CN", label: "zh-CN · 简体中文 (中国)" },
+  { value: "de-DE", label: "de-DE · 德语 (Germany)" },
+  { value: "fr-FR", label: "fr-FR · 法语 (France)" },
+  { value: "", label: "跟随出口节点默认语言" },
+];
 
 const GPU_PRESETS: { vendor: string; renderer: string }[] = [
   {
@@ -84,10 +112,62 @@ const DEVICE_MEMORY_OPTIONS = [8, 16, 32];
 
 const HOMEPAGE_SHORTCUTS = [
   { label: "Claude", url: "https://claude.ai" },
+  { label: "Chrome 商店", url: "https://chromewebstore.google.com/" },
   { label: "IP 信誉检测", url: "https://ip.net.coffee/" },
   { label: "指纹检测", url: "https://fuck-claude.vercel.app/" },
   { label: "Google", url: "https://www.google.com/" },
 ];
+
+const COUNTRY_LOCALE_DEFAULTS: Record<string, { timezone: string; locale: string }> = {
+  JP: { timezone: "Asia/Tokyo", locale: "ja-JP" },
+  KR: { timezone: "Asia/Seoul", locale: "ko-KR" },
+  US: { timezone: "America/Los_Angeles", locale: "en-US" },
+  GB: { timezone: "Europe/London", locale: "en-GB" },
+  UK: { timezone: "Europe/London", locale: "en-GB" },
+  DE: { timezone: "Europe/Berlin", locale: "de-DE" },
+  SG: { timezone: "Asia/Singapore", locale: "en-SG" },
+  HK: { timezone: "Asia/Hong_Kong", locale: "zh-HK" },
+  TW: { timezone: "Asia/Taipei", locale: "zh-TW" },
+  FR: { timezone: "Europe/Paris", locale: "fr-FR" },
+  NL: { timezone: "Europe/Amsterdam", locale: "nl-NL" },
+  CA: { timezone: "America/Toronto", locale: "en-CA" },
+  AU: { timezone: "Australia/Sydney", locale: "en-AU" },
+};
+
+function inferTimezoneLocaleFromExit(info: ExitIpInfo): {
+  timezone: string;
+  locale: string;
+} {
+  const cc = (info.countryCode || "").trim().toUpperCase();
+  const mapped = COUNTRY_LOCALE_DEFAULTS[cc];
+  const tz = (info.timezone || "").trim() || mapped?.timezone || "America/New_York";
+  const locale = mapped?.locale || "en-US";
+  return { timezone: tz, locale };
+}
+
+function normalizeLoopbackProxyKey(raw?: string | null): string {
+  const trimmed = (raw ?? "").trim().toLowerCase();
+  if (!trimmed) return "";
+  return trimmed.includes("://") ? trimmed : `http://${trimmed}`;
+}
+
+function parseLoopbackProxyInput(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed || /\s/.test(trimmed)) return null;
+  const withScheme = trimmed.includes("://") ? trimmed : `socks5://${trimmed}`;
+  try {
+    const parsed = new URL(withScheme);
+    const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
+    if (!["http", "https", "socks5", "socks5h"].includes(scheme)) return null;
+    const host = parsed.hostname.toLowerCase();
+    if (host !== "127.0.0.1" && host !== "localhost") return null;
+    const port = Number(parsed.port);
+    if (!Number.isInteger(port) || port <= 1024 || port > 65535) return null;
+    return `${scheme}://${host}:${port}`;
+  } catch {
+    return null;
+  }
+}
 
 function randomHexSeed(bytesLen = 8): string {
   const bytes = new Uint8Array(bytesLen);
@@ -179,7 +259,7 @@ function createFormForNode(
     fingerprintMode: mode,
     fingerprint: generateConsistentFingerprint(
       node?.timezone || null,
-      node?.locale || null,
+      "en-US",
     ),
     notes: "",
   };
@@ -188,11 +268,15 @@ function createFormForNode(
 export function BrowserProfilesView({
   config,
   status,
+  dlProgress,
+  clashNodes,
   preselectedNodeRequest,
   onSaveProfiles,
   onLaunchProfile,
   onCloseProfile,
   onProbeNodeExit,
+  onProbeProxyExit,
+  onRefreshClashNodes,
   onInstallBrowser,
   onRestartGateway,
   onNotify,
@@ -201,6 +285,7 @@ export function BrowserProfilesView({
   const fid = (name: string) => `${uid}-${name}`;
   const editorTitleId = fid("bp-editor-title");
   const confirmTitleId = fid("bp-confirm-title");
+  const cookieTitleId = fid("bp-cookie-title");
 
   const profiles = useMemo<BrowserProfile[]>(() => {
     if (config.browserProfiles && config.browserProfiles.length > 0) {
@@ -240,13 +325,59 @@ export function BrowserProfilesView({
     [status?.runningBrowserProfiles],
   );
 
+  const clashPortPresets = useMemo(() => {
+    const out: { url: string; label: string; nodeHint: string }[] = [];
+    const seen = new Set<number>();
+    for (const l of clashNodes?.listeners ?? []) {
+      if (!l.port || l.port <= 1024 || seen.has(l.port)) continue;
+      seen.add(l.port);
+      const scheme = l.listenerType.toLowerCase() === "http" ? "http" : "socks5";
+      out.push({
+        url: `${scheme}://127.0.0.1:${l.port}`,
+        label: `:${l.port}`,
+        nodeHint: l.proxy || l.name || "",
+      });
+    }
+    if (
+      clashNodes?.mixedPort &&
+      clashNodes.mixedPort > 1024 &&
+      !seen.has(clashNodes.mixedPort)
+    ) {
+      out.push({
+        url: `socks5://127.0.0.1:${clashNodes.mixedPort}`,
+        label: `:${clashNodes.mixedPort}`,
+        nodeHint: "Clash 混合端口",
+      });
+    }
+    return out;
+  }, [clashNodes]);
+
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState<BrowserProfile>(() =>
     createFormForNode(config.nodes[0]),
   );
+  const [exitSource, setExitSource] = useState<"node" | "custom_proxy">("node");
   const [formError, setFormError] = useState("");
   const [saving, setSaving] = useState(false);
+  const [autoMatchingTz, setAutoMatchingTz] = useState(false);
+  const [refreshingClash, setRefreshingClash] = useState(false);
+  const [customLocaleMode, setCustomLocaleMode] = useState(false);
+  const [initialCookiesText, setInitialCookiesText] = useState("");
+
+  const [cookieDialogProfile, setCookieDialogProfile] =
+    useState<BrowserProfile | null>(null);
+  const [cookieSnapshot, setCookieSnapshot] =
+    useState<ProfileCookiesSnapshot | null>(null);
+  const [cookieLoading, setCookieLoading] = useState(false);
+  const [cookieBusy, setCookieBusy] = useState(false);
+  const [cookieTab, setCookieTab] = useState<"list" | "import">("list");
+  const [cookieSearch, setCookieSearch] = useState("");
+  const [importText, setImportText] = useState("");
+  const [importReplace, setImportReplace] = useState(false);
+  const [confirmClearCookies, setConfirmClearCookies] = useState(false);
+  const [cookieError, setCookieError] = useState("");
+  const [copiedCookieKey, setCopiedCookieKey] = useState<string | null>(null);
 
   const [confirmDelete, setConfirmDelete] = useState<BrowserProfile | null>(
     null,
@@ -255,11 +386,17 @@ export function BrowserProfilesView({
   const [nodeProbeResults, setNodeProbeResults] = useState<
     Record<string, ExitIpInfo>
   >({});
+  const [probingProfileId, setProbingProfileId] = useState<string | null>(null);
+  const [proxyProbeResults, setProxyProbeResults] = useState<
+    Record<string, ExitIpInfo>
+  >({});
 
   const editorDialogRef = useRef<HTMLDialogElement>(null);
   const confirmDialogRef = useRef<HTMLDialogElement>(null);
+  const cookieDialogRef = useRef<HTMLDialogElement>(null);
   const nameInputRef = useRef<HTMLInputElement>(null);
   const confirmCancelRef = useRef<HTMLButtonElement>(null);
+  const cookieCloseRef = useRef<HTMLButtonElement>(null);
   const handledPreselectNonce = useRef<number>(0);
 
   // Sync native <dialog> showModal() lifecycle
@@ -289,6 +426,19 @@ export function BrowserProfilesView({
     return attachLightDismissFallback(dialog);
   }, [confirmDelete]);
 
+  useEffect(() => {
+    const dialog = cookieDialogRef.current;
+    if (!dialog) return;
+    if (cookieDialogProfile && !dialog.open) {
+      dialog.returnValue = "";
+      dialog.showModal();
+      requestAnimationFrame(() => cookieCloseRef.current?.focus());
+    } else if (!cookieDialogProfile && dialog.open) {
+      dialog.close();
+    }
+    return attachLightDismissFallback(dialog);
+  }, [cookieDialogProfile]);
+
   // Open preselected node creation modal when triggered from NodeEditor
   useEffect(() => {
     if (!preselectedNodeRequest) return;
@@ -297,6 +447,9 @@ export function BrowserProfilesView({
     const node = nodeById.get(preselectedNodeRequest.nodeId);
     setEditingId(null);
     setForm(createFormForNode(node, "isolated_fingerprint"));
+    setExitSource("node");
+    setCustomLocaleMode(false);
+    setInitialCookiesText("");
     setFormError("");
     setEditorOpen(true);
   }, [preselectedNodeRequest, nodeById]);
@@ -315,16 +468,23 @@ export function BrowserProfilesView({
           : "isolated_fingerprint",
       ),
     );
+    setExitSource("node");
+    setCustomLocaleMode(false);
+    setInitialCookiesText("");
     setFormError("");
     setEditorOpen(true);
   };
 
   const openEditModal = (profile: BrowserProfile) => {
+    const curLoc = profile.fingerprint.locale ?? "";
     setEditingId(profile.id);
     setForm({
       ...profile,
       fingerprint: { ...profile.fingerprint },
     });
+    setExitSource(profile.customProxyUrl?.trim() ? "custom_proxy" : "node");
+    setCustomLocaleMode(!LOCALE_PRESETS.some((p) => p.value === curLoc));
+    setInitialCookiesText("");
     setFormError("");
     setEditorOpen(true);
   };
@@ -341,7 +501,7 @@ export function BrowserProfilesView({
       fingerprint: {
         ...profile.fingerprint,
         timezone: profile.fingerprint.timezone || node?.timezone || undefined,
-        locale: profile.fingerprint.locale || node?.locale || undefined,
+        locale: profile.fingerprint.locale || node?.locale || "en-US",
         noiseSeed: `ng-${randomHexSeed(6)}`,
       },
     };
@@ -374,13 +534,27 @@ export function BrowserProfilesView({
       return;
     }
 
+    let finalNodeId: string | null = form.nodeId?.trim() || null;
+    let finalCustomProxy: string | null = null;
+    if (exitSource === "custom_proxy") {
+      const parsedProxy = parseLoopbackProxyInput(form.customProxyUrl || "");
+      if (!parsedProxy) {
+        setFormError(
+          "请填写或点选有效的本机回环代理地址（如 socks5://127.0.0.1:10808 或 http://127.0.0.1:7897）",
+        );
+        return;
+      }
+      finalNodeId = null;
+      finalCustomProxy = parsedProxy;
+    }
+
     const nextRecord: BrowserProfile = {
       ...form,
       id: editingId || `bp-${Date.now()}`,
       name: cleanName,
       homepage: cleanHomepage,
-      nodeId: form.nodeId?.trim() || null,
-      customProxyUrl: form.customProxyUrl?.trim() || null,
+      nodeId: finalNodeId,
+      customProxyUrl: finalCustomProxy,
       notes: form.notes?.trim() || undefined,
       fingerprint: {
         ...form.fingerprint,
@@ -402,14 +576,254 @@ export function BrowserProfilesView({
         ? profiles.map((p) => (p.id === editingId ? nextRecord : p))
         : [...profiles, nextRecord];
       await onSaveProfiles(nextList);
-      setEditorOpen(false);
-      onNotify(`已保存浏览器环境: ${nextRecord.name}`);
+
+      const pendingInitCookies = !editingId ? initialCookiesText.trim() : "";
+      if (pendingInitCookies) {
+        try {
+          const outcome = await api.importProfileCookies(
+            nextRecord.id,
+            pendingInitCookies,
+            true,
+          );
+          setInitialCookiesText("");
+          setEditorOpen(false);
+          onNotify(
+            `已保存浏览器环境 ${nextRecord.name}，并写入 ${outcome.importedCount} 条初始 Cookie` +
+              (outcome.warning ? `（${outcome.warning}）` : ""),
+          );
+        } catch (cookieErr) {
+          setEditorOpen(false);
+          onNotify(
+            `环境「${nextRecord.name}」已保存，但初始 Cookie 写入失败：${String(cookieErr)}（可点击卡片「Cookie」重试）`,
+          );
+        }
+      } else {
+        setEditorOpen(false);
+        onNotify(`已保存浏览器环境: ${nextRecord.name}`);
+      }
     } catch (err) {
       setFormError(`保存失败: ${String(err)}`);
     } finally {
       setSaving(false);
     }
   };
+
+  const loadProfileCookies = async (profileId: string) => {
+    setCookieLoading(true);
+    setCookieError("");
+    try {
+      const snap = await api.getProfileCookies(profileId);
+      setCookieSnapshot(snap);
+    } catch (err) {
+      setCookieError(`读取 Cookie 失败：${String(err)}`);
+    } finally {
+      setCookieLoading(false);
+    }
+  };
+
+  const openCookieDialog = (
+    profile: BrowserProfile,
+    tab: "list" | "import" = "list",
+  ) => {
+    setCookieDialogProfile(profile);
+    setCookieSnapshot(null);
+    setCookieTab(tab);
+    setCookieSearch("");
+    setImportText("");
+    setImportReplace(false);
+    setConfirmClearCookies(false);
+    setCookieError("");
+    setCopiedCookieKey(null);
+    void loadProfileCookies(profile.id);
+  };
+
+  const handleImportCookies = async () => {
+    if (!cookieDialogProfile) return;
+    if (!importText.trim()) {
+      setCookieError(
+        "请先粘贴 AdsPower / EditThisCookie JSON 或 Netscape cookies.txt 内容",
+      );
+      return;
+    }
+    setCookieBusy(true);
+    setCookieError("");
+    setConfirmClearCookies(false);
+    try {
+      const outcome = await api.importProfileCookies(
+        cookieDialogProfile.id,
+        importText,
+        importReplace,
+      );
+      setCookieSnapshot({
+        profileId: cookieDialogProfile.id,
+        liveMode: outcome.liveMode,
+        cookies: outcome.cookies,
+        exportJson: outcome.exportJson,
+      });
+      setImportText("");
+      setCookieTab("list");
+      onNotify(
+        `已导入 ${outcome.importedCount} 条 Cookie（当前共 ${outcome.totalCount} 条` +
+          (outcome.liveMode ? " · 已实时同步" : " · 离线写入完成") +
+          (outcome.warning ? ` · ${outcome.warning}` : "") +
+          "）",
+      );
+    } catch (err) {
+      setCookieError(String(err));
+    } finally {
+      setCookieBusy(false);
+    }
+  };
+
+  const handleDeleteSingleCookie = async (c: BrowserCookieRecord) => {
+    if (!cookieDialogProfile) return;
+    setCookieBusy(true);
+    setCookieError("");
+    setConfirmClearCookies(false);
+    try {
+      const snap = await api.deleteProfileCookies(cookieDialogProfile.id, [
+        { name: c.name, domain: c.domain, path: c.path, secure: c.secure },
+      ]);
+      setCookieSnapshot(snap);
+      onNotify(`已删除 Cookie: ${c.name} (${c.domain})`);
+    } catch (err) {
+      setCookieError(`删除 Cookie 失败：${String(err)}`);
+    } finally {
+      setCookieBusy(false);
+    }
+  };
+
+  const handleDeleteDomainCookies = async (domain: string) => {
+    if (!cookieDialogProfile || !cookieSnapshot) return;
+    const targets = cookieSnapshot.cookies
+      .filter((c) => c.domain === domain)
+      .map((c) => ({
+        name: c.name,
+        domain: c.domain,
+        path: c.path,
+        secure: c.secure,
+      }));
+    if (targets.length === 0) return;
+    setCookieBusy(true);
+    setCookieError("");
+    setConfirmClearCookies(false);
+    try {
+      const snap = await api.deleteProfileCookies(
+        cookieDialogProfile.id,
+        targets,
+      );
+      setCookieSnapshot(snap);
+      onNotify(`已删除域名 ${domain} 下的 ${targets.length} 条 Cookie`);
+    } catch (err) {
+      setCookieError(`删除域名 Cookie 失败：${String(err)}`);
+    } finally {
+      setCookieBusy(false);
+    }
+  };
+
+  const handleClearAllCookies = async () => {
+    if (!cookieDialogProfile) return;
+    if (!confirmClearCookies) {
+      setConfirmClearCookies(true);
+      return;
+    }
+    setCookieBusy(true);
+    setCookieError("");
+    try {
+      const snap = await api.clearProfileCookies(cookieDialogProfile.id);
+      setCookieSnapshot(snap);
+      setConfirmClearCookies(false);
+      onNotify(`已清空环境「${cookieDialogProfile.name}」的所有 Cookie`);
+    } catch (err) {
+      setCookieError(`清空 Cookie 失败：${String(err)}`);
+    } finally {
+      setCookieBusy(false);
+    }
+  };
+
+  const formatSubsetExportJson = (list: BrowserCookieRecord[]) =>
+    JSON.stringify(
+      list.map((c) => {
+        const sameSite =
+          c.sameSite === "None"
+            ? "no_restriction"
+            : c.sameSite === "Lax"
+              ? "lax"
+              : c.sameSite === "Strict"
+                ? "strict"
+                : "unspecified";
+        const obj: Record<string, unknown> = { domain: c.domain };
+        if (typeof c.expires === "number" && c.expires > 0) {
+          obj.expirationDate = c.expires;
+        }
+        obj.hostOnly = c.hostOnly;
+        obj.httpOnly = c.httpOnly;
+        obj.name = c.name;
+        obj.path = c.path;
+        obj.sameSite = sameSite;
+        obj.secure = c.secure;
+        obj.session = c.session;
+        obj.value = c.value;
+        return obj;
+      }),
+      null,
+      2,
+    );
+
+  const handleCopyTextFeedback = async (
+    key: string,
+    text: string,
+    notifyMsg: string,
+  ) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedCookieKey(key);
+      setTimeout(() => {
+        setCopiedCookieKey((cur) => (cur === key ? null : cur));
+      }, 2000);
+      onNotify(notifyMsg);
+    } catch (err) {
+      setCookieError(`复制失败：${String(err)}`);
+    }
+  };
+
+  const handleDownloadExportJson = (jsonStr: string) => {
+    if (!cookieDialogProfile) return;
+    const blob = new Blob([jsonStr], {
+      type: "application/json;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `cookies-${cookieDialogProfile.id}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    onNotify(`已导出 cookies-${cookieDialogProfile.id}.json`);
+  };
+
+  const filteredCookies = useMemo(() => {
+    const all = cookieSnapshot?.cookies ?? [];
+    const q = cookieSearch.trim().toLowerCase();
+    if (!q) return all;
+    return all.filter(
+      (c) =>
+        c.domain.toLowerCase().includes(q) ||
+        c.name.toLowerCase().includes(q) ||
+        c.value.toLowerCase().includes(q),
+    );
+  }, [cookieSnapshot?.cookies, cookieSearch]);
+
+  const groupedCookies = useMemo(() => {
+    const groups = new Map<string, BrowserCookieRecord[]>();
+    for (const c of filteredCookies) {
+      const list = groups.get(c.domain) ?? [];
+      list.push(c);
+      groups.set(c.domain, list);
+    }
+    return Array.from(groups.entries());
+  }, [filteredCookies]);
 
   const handleNodeChangeInForm = (selectedVal: string) => {
     const nextNodeId = selectedVal === "__active__" ? null : selectedVal;
@@ -423,7 +837,6 @@ export function BrowserProfilesView({
       fingerprint: {
         ...prev.fingerprint,
         timezone: targetNode?.timezone || prev.fingerprint.timezone,
-        locale: targetNode?.locale || prev.fingerprint.locale,
       },
     }));
   };
@@ -443,6 +856,73 @@ export function BrowserProfilesView({
     }
   };
 
+  const handleProbeCustomProxy = async (profileId: string, proxyUrl: string) => {
+    if (!onProbeProxyExit) return;
+    setProbingProfileId(profileId);
+    try {
+      const info = await onProbeProxyExit(proxyUrl);
+      setProxyProbeResults((prev) => ({ ...prev, [profileId]: info }));
+      onNotify(
+        `独立代理探测通过: ${info.ip} (${info.countryCode || "--"}) · ${info.latencyMs || "--"}ms`,
+      );
+    } catch (err) {
+      onNotify(`独立代理探测失败: ${String(err)}`);
+    } finally {
+      setProbingProfileId(null);
+    }
+  };
+
+  const handleRefreshClashPorts = async () => {
+    if (!onRefreshClashNodes) return;
+    setRefreshingClash(true);
+    try {
+      await onRefreshClashNodes();
+      onNotify("已刷新本地 Clash Verge 监听端口");
+    } catch (err) {
+      onNotify(`刷新 Clash 端口失败: ${String(err)}`);
+    } finally {
+      setRefreshingClash(false);
+    }
+  };
+
+  const handleAutoMatchTzLocale = async () => {
+    setFormError("");
+    setAutoMatchingTz(true);
+    try {
+      let info: ExitIpInfo;
+      if (exitSource === "custom_proxy") {
+        if (!onProbeProxyExit) {
+          throw new Error("当前运行环境不支持本地代理探测");
+        }
+        const parsed = parseLoopbackProxyInput(form.customProxyUrl || "");
+        if (!parsed) {
+          throw new Error("请先填写或点选有效的本地代理端口");
+        }
+        info = await onProbeProxyExit(parsed);
+      } else {
+        const targetNodeId = form.nodeId?.trim() || config.activeNodeId;
+        info = await onProbeNodeExit(targetNodeId);
+        setNodeProbeResults((prev) => ({ ...prev, [targetNodeId]: info }));
+      }
+      const matched = inferTimezoneLocaleFromExit(info);
+      setForm((prev) => ({
+        ...prev,
+        fingerprint: {
+          ...prev.fingerprint,
+          timezone: matched.timezone,
+        },
+      }));
+      onNotify(
+        `已按出口 IP ${info.ip} (${info.countryCode || "--"}) 自动匹配时区: ${matched.timezone}（语言保持 ${form.fingerprint.locale || "跟随节点"}）`,
+      );
+    } catch (err) {
+      setFormError(`自动匹配时区失败: ${String(err)}`);
+    } finally {
+      setAutoMatchingTz(false);
+    }
+  };
+
+  const downloading = Boolean(dlProgress && dlProgress.stage !== "done");
   const activePrimaryNode = nodeById.get(config.activeNodeId);
   const secondaryPortEntries = Object.entries(status?.secondaryNodePorts ?? {});
 
@@ -464,9 +944,36 @@ export function BrowserProfilesView({
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {!status?.browserInstalled && (
-            <Button variant="soft" size="sm" onClick={() => void onInstallBrowser()}>
-              安装便携 Chromium (~200MB)
+          {status?.fpBrowserInstalled ? (
+            <>
+              <Badge variant="success">Fingerprint-Chromium 150</Badge>
+              {status?.webStoreExtInstalled ? (
+                <Badge variant="neutral" className="text-[0.68rem]">
+                  Chrome 商店插件就绪
+                </Badge>
+              ) : (
+                <Button
+                  variant="soft"
+                  size="sm"
+                  disabled={downloading}
+                  onClick={() => void onInstallBrowser()}
+                >
+                  <Download className="h-3.5 w-3.5" aria-hidden="true" />
+                  补装商店插件
+                </Button>
+              )}
+            </>
+          ) : (
+            <Button
+              variant="soft"
+              size="sm"
+              disabled={downloading}
+              onClick={() => void onInstallBrowser()}
+            >
+              <Download className="h-3.5 w-3.5" aria-hidden="true" />
+              {status?.browserInstalled
+                ? "升级到 Fingerprint-Chromium 150 (~185MB)"
+                : "安装 Fingerprint-Chromium 150 (~185MB)"}
             </Button>
           )}
           <Button variant="solid" size="sm" onClick={() => openCreateModal()}>
@@ -475,6 +982,42 @@ export function BrowserProfilesView({
           </Button>
         </div>
       </header>
+
+      {/* Live Engine Download / Extraction Progress */}
+      {downloading && dlProgress && (
+        <section className="flex flex-col gap-1.5 bg-[#f8f9ff] px-6 py-3">
+          <div className="flex items-center justify-between gap-2 text-[0.74rem]">
+            <span className="font-medium text-[#111827]">
+              {dlProgress.message}
+            </span>
+            {dlProgress.totalBytes > 0 && (
+              <span className="mono-num text-[0.7rem] text-[#6d5bd0]">
+                {Math.min(
+                  100,
+                  Math.round(
+                    (dlProgress.downloadedBytes / dlProgress.totalBytes) * 100,
+                  ),
+                )}
+                %
+              </span>
+            )}
+          </div>
+          <progress
+            className="h-1.5 w-full accent-[#6d5bd0]"
+            max={100}
+            value={
+              dlProgress.totalBytes > 0
+                ? Math.min(
+                    100,
+                    Math.round(
+                      (dlProgress.downloadedBytes / dlProgress.totalBytes) * 100,
+                    ),
+                  )
+                : undefined
+            }
+          />
+        </section>
+      )}
 
       {/* Concurrent Multi-Exit Routing Overview Strip */}
       <section className="flex flex-wrap items-center justify-between gap-3 bg-[#f9fafb] px-6 py-3 text-[0.74rem]">
@@ -534,7 +1077,7 @@ export function BrowserProfilesView({
             const effectiveTz =
               profile.fingerprint.timezone || boundNode?.timezone || "Asia/Seoul";
             const effectiveLocale =
-              profile.fingerprint.locale || boundNode?.locale || "ko-KR";
+              profile.fingerprint.locale || boundNode?.locale || "en-US";
             const canLaunch =
               !!status?.browserInstalled &&
               (hasCustomProxy ||
@@ -542,7 +1085,7 @@ export function BrowserProfilesView({
                   !(isPrimary && status?.blockedByKillSwitch) &&
                   !needsGatewayRestart));
             const probeInfo = hasCustomProxy
-              ? undefined
+              ? proxyProbeResults[profile.id]
               : isPrimary && status?.exitIp
                 ? status.exitIp
                 : nodeProbeResults[boundNodeId];
@@ -651,9 +1194,28 @@ export function BrowserProfilesView({
                       </span>
                     )}
                     {hasCustomProxy ? (
-                      <span className="text-[0.68rem] text-[#7c8495]">
-                        账号独立代理 · 需本地代理在线
-                      </span>
+                      onProbeProxyExit ? (
+                        <Button
+                          variant="ghost"
+                          size="xs"
+                          disabled={probingProfileId === profile.id}
+                          onClick={() =>
+                            void handleProbeCustomProxy(profile.id, customProxyUrl)
+                          }
+                        >
+                          <Activity
+                            className={`h-3 w-3 ${
+                              probingProfileId === profile.id ? "animate-spin" : ""
+                            }`}
+                            aria-hidden="true"
+                          />
+                          测速/查 IP
+                        </Button>
+                      ) : (
+                        <span className="text-[0.68rem] text-[#7c8495]">
+                          账号独立代理 · 需本地代理在线
+                        </span>
+                      )
                     ) : needsGatewayRestart && onRestartGateway ? (
                       <Button
                         variant="outline"
@@ -725,7 +1287,9 @@ export function BrowserProfilesView({
                   ) : (
                     <div className="col-span-2 flex items-center gap-1.5 text-[0.69rem] text-[#525866]">
                       <ShieldCheck className="h-3.5 w-3.5 text-[#16a34a]" aria-hidden="true" />
-                      仅对齐时区与语言，保留真实 Chromium 原生硬件信号以防 hCaptcha 拒绝
+                      {status?.fpBrowserInstalled
+                        ? "中文界面 · C++ 原生时区/语言与 Chrome 品牌对齐（无硬件噪声，Claude / hCaptcha 最稳）"
+                        : "中文界面 · 仅对齐时区与语言，保留真实 Chromium 原生硬件信号以防 hCaptcha 拒绝"}
                     </div>
                   )}
                 </dl>
@@ -749,12 +1313,35 @@ export function BrowserProfilesView({
                       onClick={() =>
                         void onLaunchProfile(
                           profile.id,
+                          "https://chromewebstore.google.com/",
+                        )
+                      }
+                    >
+                      <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                      扩展商店
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="xs"
+                      disabled={!canLaunch}
+                      onClick={() =>
+                        void onLaunchProfile(
+                          profile.id,
                           "https://fuck-claude.vercel.app/",
                         )
                       }
                     >
                       <ExternalLink className="h-3 w-3" aria-hidden="true" />
                       打开指纹检测
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="xs"
+                      disabled={!status?.browserInstalled}
+                      onClick={() => openCookieDialog(profile)}
+                    >
+                      <KeyRound className="h-3 w-3" aria-hidden="true" />
+                      Cookie
                     </Button>
                     {isRunning && (
                       <Button
@@ -864,43 +1451,150 @@ export function BrowserProfilesView({
               </div>
 
               <div className="space-y-1">
-                <label
-                  htmlFor={fid("bpNode")}
-                  className="block text-[0.72rem] font-medium text-[#525866]"
-                >
-                  绑定出口节点
-                </label>
-                <select
-                  id={fid("bpNode")}
-                  className={NATIVE_SELECT_CLASS}
-                  value={form.nodeId || "__active__"}
-                  onChange={(e) => handleNodeChangeInForm(e.target.value)}
-                >
-                  <option value="__active__">
-                    跟随当前主安全出口 ({activePrimaryNode?.name || config.activeNodeId})
-                  </option>
-                  {config.nodes.map((node) => (
-                    <option key={node.id} value={node.id}>
-                      {node.name} ({node.protocol.toUpperCase()}
-                      {node.expectedCountry ? ` · ${node.expectedCountry}` : ""})
-                    </option>
-                  ))}
-                </select>
-                {form.customProxyUrl?.trim() && (
-                  <div className="mt-1 flex items-center justify-between gap-2 rounded-md border border-[#fde68a] bg-[#fffbeb] px-2 py-1 text-[0.68rem] text-[#92400e]">
-                    <span className="mono-num truncate">
-                      当前使用独立代理: {form.customProxyUrl}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setForm({ ...form, customProxyUrl: null })}
-                      className="shrink-0 font-medium text-[#b45309] underline hover:text-[#78350f] cursor-pointer"
-                    >
-                      清除改用节点
-                    </button>
-                  </div>
-                )}
+                <span className="block text-[0.72rem] font-medium text-[#525866]">
+                  出口来源
+                </span>
+                <div className="grid grid-cols-2 gap-1.5 rounded-lg border border-[#dce0e6] bg-[#f8f9fb] p-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setExitSource("node");
+                      setForm((prev) => ({ ...prev, customProxyUrl: null }));
+                    }}
+                    className={`rounded-md px-2 py-1 text-[0.73rem] font-medium transition-colors cursor-pointer ${
+                      exitSource === "node"
+                        ? "bg-white text-[#111827] shadow-[0_1px_2px_rgba(15,23,42,0.08)]"
+                        : "text-[#525866] hover:text-[#111827]"
+                    }`}
+                  >
+                    AI NetGuard 节点
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setExitSource("custom_proxy");
+                      setForm((prev) => ({
+                        ...prev,
+                        nodeId: null,
+                        customProxyUrl:
+                          prev.customProxyUrl?.trim() ||
+                          clashPortPresets[0]?.url ||
+                          "socks5://127.0.0.1:10808",
+                      }));
+                    }}
+                    className={`rounded-md px-2 py-1 text-[0.73rem] font-medium transition-colors cursor-pointer ${
+                      exitSource === "custom_proxy"
+                        ? "bg-white text-[#111827] shadow-[0_1px_2px_rgba(15,23,42,0.08)]"
+                        : "text-[#525866] hover:text-[#111827]"
+                    }`}
+                  >
+                    Clash / 本地代理
+                  </button>
+                </div>
               </div>
+
+              {exitSource === "node" ? (
+                <div className="space-y-1 sm:col-span-2">
+                  <label
+                    htmlFor={fid("bpNode")}
+                    className="block text-[0.72rem] font-medium text-[#525866]"
+                  >
+                    绑定 AI NetGuard 出口节点
+                  </label>
+                  <select
+                    id={fid("bpNode")}
+                    className={NATIVE_SELECT_CLASS}
+                    value={form.nodeId || "__active__"}
+                    onChange={(e) => handleNodeChangeInForm(e.target.value)}
+                  >
+                    <option value="__active__">
+                      跟随当前主安全出口 ({activePrimaryNode?.name || config.activeNodeId})
+                    </option>
+                    {config.nodes.map((node) => (
+                      <option key={node.id} value={node.id}>
+                        {node.name} ({node.protocol.toUpperCase()}
+                        {node.expectedCountry ? ` · ${node.expectedCountry}` : ""})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ) : (
+                <div className="space-y-2 rounded-xl border border-[#eaecef] bg-[#f8f9fb] p-3 sm:col-span-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <label
+                      htmlFor={fid("bpCustomProxy")}
+                      className="text-[0.72rem] font-medium text-[#525866]"
+                    >
+                      指定本地代理地址（如 Clash Verge 独立 Listener）
+                    </label>
+                    {onRefreshClashNodes && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="xs"
+                        disabled={refreshingClash}
+                        onClick={() => void handleRefreshClashPorts()}
+                      >
+                        <RefreshCw
+                          className={`h-3 w-3 ${refreshingClash ? "animate-spin" : ""}`}
+                          aria-hidden="true"
+                        />
+                        刷新 Clash 端口
+                      </Button>
+                    )}
+                  </div>
+                  <Input
+                    id={fid("bpCustomProxy")}
+                    className="mono-num bg-white"
+                    placeholder="socks5://127.0.0.1:10808 或 http://127.0.0.1:7897"
+                    value={form.customProxyUrl || ""}
+                    onChange={(e) =>
+                      setForm({ ...form, customProxyUrl: e.target.value })
+                    }
+                  />
+                  {clashPortPresets.length > 0 ? (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="text-[0.68rem] text-[#7c8495]">
+                        本机 Clash 端口一键填入:
+                      </span>
+                      {clashPortPresets.map((preset) => {
+                        const selected =
+                          normalizeLoopbackProxyKey(form.customProxyUrl) ===
+                          normalizeLoopbackProxyKey(preset.url);
+                        return (
+                          <button
+                            key={preset.url}
+                            type="button"
+                            title={
+                              preset.nodeHint
+                                ? `${preset.url}（${preset.nodeHint}）`
+                                : preset.url
+                            }
+                            onClick={() =>
+                              setForm((prev) => ({
+                                ...prev,
+                                customProxyUrl: preset.url,
+                              }))
+                            }
+                            className={`mono-num rounded-md border px-2 py-0.5 text-[0.68rem] transition-colors cursor-pointer ${
+                              selected
+                                ? "border-[#6d5bd0] bg-[#f0edfc] font-semibold text-[#5b48c4]"
+                                : "border-[#dce0e6] bg-white text-[#525866] hover:border-[#c3cad6] hover:text-[#111827]"
+                            }`}
+                          >
+                            {preset.label}
+                            {preset.nodeHint ? ` · ${preset.nodeHint}` : ""}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <p className="text-[0.68rem] text-[#7c8495]">
+                      未读取到 Clash Verge 多端口 Listener，可手动输入 <code className="mono-num">socks5://127.0.0.1:10808</code> 或 <code className="mono-num">http://127.0.0.1:7897</code>
+                    </p>
+                  )}
+                </div>
+              )}
 
               <div className="space-y-1 sm:col-span-2">
                 <div className="flex items-center justify-between gap-2">
@@ -958,7 +1652,7 @@ export function BrowserProfilesView({
                     纯净对齐 (推荐 Claude)
                   </div>
                   <p className="text-[0.68rem] text-[#7c8495]">
-                    只对齐时区与语言，不做 Canvas/WebGL JS 改写，hCaptcha 与风控最稳。
+                    只做 C++ 原生时区/语言与 Chrome 品牌对齐，关闭硬件随机噪声，hCaptcha 最稳。
                   </p>
                 </label>
 
@@ -984,59 +1678,115 @@ export function BrowserProfilesView({
                     完整独立指纹 (防关联多开)
                   </div>
                   <p className="text-[0.68rem] text-[#7c8495]">
-                    记住固定的屏幕、CPU/内存、WebGL GPU 与 Canvas/Audio 种子，多账号彼此隔离。
+                    启用固定 C++ 底层硬件、Canvas/Audio/字体/GPU 指纹种子，多账号彻底隔离。
                   </p>
                 </label>
               </div>
             </fieldset>
 
-            {/* Timezone & Locale */}
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <div className="space-y-1">
-                <label
-                  htmlFor={fid("bpTz")}
-                  className="block text-[0.72rem] font-medium text-[#525866]"
+            {/* Timezone & Locale with Exit IP Auto-Match */}
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-[0.72rem] font-medium text-[#525866]">
+                  时区与语言对齐（界面保持中文，网页头与 JS 与代理出口一致）
+                </span>
+                <Button
+                  type="button"
+                  variant="soft"
+                  size="xs"
+                  disabled={autoMatchingTz}
+                  onClick={() => void handleAutoMatchTzLocale()}
                 >
-                  时区覆盖（留空则跟随所选节点）
-                </label>
-                <Input
-                  id={fid("bpTz")}
-                  className="mono-num"
-                  placeholder="Asia/Tokyo"
-                  value={form.fingerprint.timezone || ""}
-                  onChange={(e) =>
-                    setForm({
-                      ...form,
-                      fingerprint: {
-                        ...form.fingerprint,
-                        timezone: e.target.value,
-                      },
-                    })
-                  }
-                />
+                  <Activity
+                    className={`h-3 w-3 ${autoMatchingTz ? "animate-spin" : ""}`}
+                    aria-hidden="true"
+                  />
+                  {autoMatchingTz ? "探测出口中..." : "按出口 IP 自动匹配时区"}
+                </Button>
               </div>
-              <div className="space-y-1">
-                <label
-                  htmlFor={fid("bpLocale")}
-                  className="block text-[0.72rem] font-medium text-[#525866]"
-                >
-                  语言覆盖（留空则跟随所选节点）
-                </label>
-                <Input
-                  id={fid("bpLocale")}
-                  className="mono-num"
-                  placeholder="ja-JP"
-                  value={form.fingerprint.locale || ""}
-                  onChange={(e) =>
-                    setForm({
-                      ...form,
-                      fingerprint: {
-                        ...form.fingerprint,
-                        locale: e.target.value,
-                      },
-                    })
-                  }
-                />
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div className="space-y-1">
+                  <label
+                    htmlFor={fid("bpTz")}
+                    className="block text-[0.72rem] font-medium text-[#525866]"
+                  >
+                    时区覆盖（留空则跟随节点）
+                  </label>
+                  <Input
+                    id={fid("bpTz")}
+                    className="mono-num"
+                    placeholder="Asia/Tokyo"
+                    value={form.fingerprint.timezone || ""}
+                    onChange={(e) =>
+                      setForm({
+                        ...form,
+                        fingerprint: {
+                          ...form.fingerprint,
+                          timezone: e.target.value,
+                        },
+                      })
+                    }
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label
+                    htmlFor={fid("bpLocale")}
+                    className="block text-[0.72rem] font-medium text-[#525866]"
+                  >
+                    网页语言 Accept-Language（默认 en-US）
+                  </label>
+                  <select
+                    id={fid("bpLocale")}
+                    className={NATIVE_SELECT_CLASS}
+                    value={
+                      customLocaleMode ||
+                      !LOCALE_PRESETS.some(
+                        (p) => p.value === (form.fingerprint.locale ?? ""),
+                      )
+                        ? "__custom__"
+                        : (form.fingerprint.locale ?? "")
+                    }
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      if (v === "__custom__") {
+                        setCustomLocaleMode(true);
+                        return;
+                      }
+                      setCustomLocaleMode(false);
+                      setForm({
+                        ...form,
+                        fingerprint: {
+                          ...form.fingerprint,
+                          locale: v,
+                        },
+                      });
+                    }}
+                  >
+                    {LOCALE_PRESETS.map((p) => (
+                      <option key={p.value || "__node_default__"} value={p.value}>
+                        {p.label}
+                      </option>
+                    ))}
+                    <option value="__custom__">自定义语言代码...</option>
+                  </select>
+                  {customLocaleMode && (
+                    <Input
+                      aria-label="自定义 Accept-Language"
+                      className="mono-num mt-1.5"
+                      placeholder="例如 es-ES 或 en-AU"
+                      value={form.fingerprint.locale || ""}
+                      onChange={(e) =>
+                        setForm({
+                          ...form,
+                          fingerprint: {
+                            ...form.fingerprint,
+                            locale: e.target.value,
+                          },
+                        })
+                      }
+                    />
+                  )}
+                </div>
               </div>
             </div>
 
@@ -1046,7 +1796,7 @@ export function BrowserProfilesView({
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-1.5 text-[0.76rem] font-semibold text-[#111827]">
                     <Cpu className="h-3.5 w-3.5 text-[#6d5bd0]" aria-hidden="true" />
-                    固定一致性硬件与图像指纹（每次启动完全复现）
+                    固定 C++ 底层指纹参数（Fingerprint-Chromium 原生生效）
                   </div>
                   <Button
                     type="button"
@@ -1250,6 +2000,51 @@ export function BrowserProfilesView({
               </div>
             )}
 
+            {editingId ? (
+              <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[#eaecef] bg-[#f8f9fb] px-3 py-2.5">
+                <div className="min-w-0 space-y-0.5">
+                  <p className="text-[0.73rem] font-medium text-[#111827]">
+                    环境 Cookie 管理（支持 AdsPower / EditThisCookie JSON 与 Netscape）
+                  </p>
+                  <p className="text-[0.68rem] text-[#7c8495]">
+                    支持窗口开启时实时同步，或窗口关闭后离线直接读写该环境独立数据目录。
+                  </p>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="xs"
+                  disabled={!status?.browserInstalled}
+                  onClick={() => {
+                    const target =
+                      profiles.find((p) => p.id === editingId) || form;
+                    setEditorOpen(false);
+                    openCookieDialog(target);
+                  }}
+                >
+                  <KeyRound className="h-3.5 w-3.5" aria-hidden="true" />
+                  管理 / 编辑此环境 Cookie
+                </Button>
+              </div>
+            ) : (
+              <div className="space-y-1">
+                <label
+                  htmlFor={fid("bpInitCookies")}
+                  className="block text-[0.72rem] font-medium text-[#525866]"
+                >
+                  初始化导入 Cookie（可选 · 支持 AdsPower JSON / EditThisCookie / cookies.txt）
+                </label>
+                <textarea
+                  id={fid("bpInitCookies")}
+                  rows={3}
+                  className="w-full rounded-lg border border-[#dce0e6] bg-white px-2.5 py-1.5 font-mono text-[0.72rem] text-[#111827] placeholder:text-[#9ca3af] shadow-[0_1px_1px_rgba(15,23,42,0.02)] focus-visible:outline-2 focus-visible:outline-[#5b48c4] focus-visible:outline-offset-1"
+                  placeholder={'粘贴 [{"name":"sessionKey","value":"...","domain":".claude.ai",...}] 或 Netscape 文本，保存环境时自动写入'}
+                  value={initialCookiesText}
+                  onChange={(e) => setInitialCookiesText(e.target.value)}
+                />
+              </div>
+            )}
+
             <div className="space-y-1">
               <label
                 htmlFor={fid("bpNotes")}
@@ -1328,6 +2123,388 @@ export function BrowserProfilesView({
             >
               确认删除
             </Button>
+          </div>
+        </div>
+      </dialog>
+
+      {/* Native Top-Layer Modal <dialog>: AdsPower-Style Cookie Manager */}
+      <dialog
+        ref={cookieDialogRef}
+        {...({ closedby: "any" } as Record<string, string>)}
+        aria-labelledby={cookieTitleId}
+        onClose={(e) => {
+          e.currentTarget.returnValue = "";
+          setCookieDialogProfile(null);
+          setConfirmClearCookies(false);
+        }}
+        className="ng-dialog m-auto w-[min(46rem,calc(100vi-2rem))] max-h-[86dvh] overflow-hidden rounded-2xl border border-[#eaecef] bg-white p-0 text-[#111827] shadow-[0_24px_48px_-12px_rgba(15,23,42,0.22)]"
+      >
+        <div className="flex max-h-[86dvh] flex-col divide-y divide-[#eaecef]">
+          {/* Header */}
+          <div className="flex items-center justify-between gap-2 px-5 py-3.5">
+            <div className="min-w-0 flex-1 space-y-0.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <h2
+                  id={cookieTitleId}
+                  className="flex items-center gap-1.5 text-[0.94rem] font-semibold text-[#111827]"
+                >
+                  <KeyRound className="h-4 w-4 text-[#6d5bd0]" aria-hidden="true" />
+                  Cookie 管理器
+                </h2>
+                {cookieDialogProfile && (
+                  <Badge variant="neutral" className="max-w-[14rem] truncate text-[0.67rem]">
+                    {cookieDialogProfile.name}
+                  </Badge>
+                )}
+                {cookieSnapshot && (
+                  <Badge
+                    variant={cookieSnapshot.liveMode ? "success" : "neutral"}
+                    className="text-[0.65rem]"
+                  >
+                    {cookieSnapshot.liveMode ? "窗口运行中 · 实时同步" : "窗口已关闭 · 离线读写"}
+                  </Badge>
+                )}
+                {cookieSnapshot && (
+                  <span className="mono-num text-[0.7rem] text-[#7c8495]">
+                    共 {cookieSnapshot.cookies.length} 条
+                  </span>
+                )}
+              </div>
+              <p className="text-[0.69rem] text-[#7c8495]">
+                完全兼容 AdsPower / EditThisCookie JSON 与 Netscape cookies.txt，操作仅在本地回环完成。
+              </p>
+            </div>
+
+            <div className="flex shrink-0 items-center gap-1.5">
+              <Button
+                type="button"
+                variant="outline"
+                size="xs"
+                disabled={cookieLoading || cookieBusy || !cookieDialogProfile}
+                onClick={() =>
+                  cookieDialogProfile && void loadProfileCookies(cookieDialogProfile.id)
+                }
+              >
+                <RefreshCw
+                  className={`h-3 w-3 ${cookieLoading ? "animate-spin" : ""}`}
+                  aria-hidden="true"
+                />
+                刷新
+              </Button>
+              <button
+                ref={cookieCloseRef}
+                type="button"
+                aria-label="关闭"
+                onClick={() => setCookieDialogProfile(null)}
+                className="rounded-lg p-1 text-[#7c8495] hover:bg-[#f3f4f6] hover:text-[#111827] cursor-pointer"
+              >
+                <X className="h-4 w-4" aria-hidden="true" />
+              </button>
+            </div>
+          </div>
+
+          {/* Tabs + Toolbar */}
+          <div className="flex flex-wrap items-center justify-between gap-2 bg-[#fafbfc] px-5 py-2.5">
+            <div className="flex items-center gap-1" role="group" aria-label="Cookie 面板模式">
+              <button
+                type="button"
+                aria-pressed={cookieTab === "list"}
+                onClick={() => {
+                  setCookieTab("list");
+                  setCookieError("");
+                  setConfirmClearCookies(false);
+                }}
+                className={`rounded-md border px-2.5 py-1 text-[0.72rem] font-medium transition-colors cursor-pointer ${
+                  cookieTab === "list"
+                    ? "border-[#dcd4fb] bg-[#6d5bd0] text-white"
+                    : "border-[#dce0e6] bg-white text-[#525866] hover:bg-[#f3f4f6]"
+                }`}
+              >
+                查看与管理 ({cookieSnapshot?.cookies.length ?? 0})
+              </button>
+              <button
+                type="button"
+                aria-pressed={cookieTab === "import"}
+                onClick={() => {
+                  setCookieTab("import");
+                  setCookieError("");
+                  setConfirmClearCookies(false);
+                }}
+                className={`rounded-md border px-2.5 py-1 text-[0.72rem] font-medium transition-colors cursor-pointer ${
+                  cookieTab === "import"
+                    ? "border-[#dcd4fb] bg-[#6d5bd0] text-white"
+                    : "border-[#dce0e6] bg-white text-[#525866] hover:bg-[#f3f4f6]"
+                }`}
+              >
+                导入 / 批量粘贴
+              </button>
+            </div>
+
+            {cookieTab === "list" && (
+              <div className="flex flex-wrap items-center gap-1.5">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="xs"
+                  disabled={!cookieSnapshot || filteredCookies.length === 0 || cookieBusy}
+                  onClick={() => {
+                    if (!cookieSnapshot) return;
+                    const text = cookieSearch.trim()
+                      ? formatSubsetExportJson(filteredCookies)
+                      : cookieSnapshot.exportJson;
+                    void handleCopyTextFeedback(
+                      "__all__",
+                      text,
+                      `已复制 ${filteredCookies.length} 条 Cookie JSON（可直接导入 AdsPower）`,
+                    );
+                  }}
+                >
+                  {copiedCookieKey === "__all__" ? (
+                    <Check className="h-3 w-3 text-[#16a34a]" aria-hidden="true" />
+                  ) : (
+                    <Copy className="h-3 w-3" aria-hidden="true" />
+                  )}
+                  {copiedCookieKey === "__all__" ? "已复制 JSON" : "复制 JSON"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="xs"
+                  disabled={!cookieSnapshot || filteredCookies.length === 0 || cookieBusy}
+                  onClick={() => {
+                    if (!cookieSnapshot) return;
+                    const text = cookieSearch.trim()
+                      ? formatSubsetExportJson(filteredCookies)
+                      : cookieSnapshot.exportJson;
+                    handleDownloadExportJson(text);
+                  }}
+                >
+                  <Download className="h-3 w-3" aria-hidden="true" />
+                  下载 .json
+                </Button>
+                <Button
+                  type="button"
+                  variant={confirmClearCookies ? "destructive" : "destructive-outline"}
+                  size="xs"
+                  disabled={!cookieSnapshot || cookieSnapshot.cookies.length === 0 || cookieBusy}
+                  onClick={() => void handleClearAllCookies()}
+                >
+                  <Trash2 className="h-3 w-3" aria-hidden="true" />
+                  {confirmClearCookies ? "再次点击确认清空" : "清空全部"}
+                </Button>
+              </div>
+            )}
+          </div>
+
+          {/* Body */}
+          <div className="min-h-[16rem] flex-1 space-y-3 overflow-y-auto px-5 py-4">
+            {cookieError && (
+              <div className="rounded-lg border border-[#fecaca] bg-[#fef2f2] px-3 py-2 text-[0.74rem] text-[#b91c1c]">
+                {cookieError}
+              </div>
+            )}
+
+            {cookieTab === "list" ? (
+              <>
+                <div className="relative">
+                  <Search
+                    className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-[#9ca3af]"
+                    aria-hidden="true"
+                  />
+                  <Input
+                    aria-label="按域名、Cookie 名称或值搜索"
+                    className="pl-8"
+                    placeholder="按域名、Cookie 名称或值过滤，如 .claude.ai / sessionKey / accounts.google.com..."
+                    value={cookieSearch}
+                    onChange={(e) => setCookieSearch(e.target.value)}
+                  />
+                </div>
+
+                {cookieLoading && !cookieSnapshot ? (
+                  <div className="rounded-xl border border-dashed border-[#dce0e6] bg-[#fafbfc] px-4 py-10 text-center text-[0.76rem] text-[#7c8495]">
+                    正在通过本地回环通道读取该环境 Cookie...
+                  </div>
+                ) : groupedCookies.length === 0 ? (
+                  <div className="space-y-2 rounded-xl border border-dashed border-[#dce0e6] bg-[#fafbfc] px-4 py-8 text-center">
+                    <p className="text-[0.78rem] font-medium text-[#525866]">
+                      {cookieSearch.trim()
+                        ? "没有匹配当前搜索关键词的 Cookie"
+                        : "该浏览器环境当前暂无 Cookie 记录"}
+                    </p>
+                    {!cookieSearch.trim() && (
+                      <Button
+                        type="button"
+                        variant="soft"
+                        size="xs"
+                        onClick={() => setCookieTab("import")}
+                      >
+                        <ClipboardPaste className="h-3 w-3" aria-hidden="true" />
+                        去粘贴导入 Cookie
+                      </Button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="space-y-2.5">
+                    {groupedCookies.map(([domain, items]) => (
+                      <section
+                        key={domain}
+                        className="overflow-hidden rounded-xl border border-[#eaecef] bg-white"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#eaecef] bg-[#f8f9fb] px-3 py-2">
+                          <div className="flex min-w-0 items-center gap-2">
+                            <span className="mono-num truncate text-[0.76rem] font-semibold text-[#111827]">
+                              {domain}
+                            </span>
+                            <Badge variant="neutral" className="text-[0.64rem]">
+                              {items.length} 条
+                            </Badge>
+                          </div>
+                          <Button
+                            type="button"
+                            variant="destructive-outline"
+                            size="xs"
+                            disabled={cookieBusy}
+                            onClick={() => void handleDeleteDomainCookies(domain)}
+                          >
+                            <Trash2 className="h-3 w-3" aria-hidden="true" />
+                            删此域名
+                          </Button>
+                        </div>
+
+                        <ul className="divide-y divide-[#f1f3f5]">
+                          {items.map((c) => {
+                            const key = `${c.domain}|${c.path}|${c.name}`;
+                            const expText = c.session
+                              ? "会话"
+                              : c.expires
+                                ? new Date(c.expires * 1000).toLocaleDateString()
+                                : "--";
+                            return (
+                              <li
+                                key={key}
+                                className="flex items-center justify-between gap-3 px-3 py-2 text-[0.72rem]"
+                              >
+                                <div className="min-w-0 flex-1 space-y-0.5">
+                                  <div className="flex flex-wrap items-center gap-1.5">
+                                    <span className="mono-num truncate font-semibold text-[#111827]">
+                                      {c.name}
+                                    </span>
+                                    <span className="mono-num text-[0.65rem] text-[#7c8495]">
+                                      {c.path}
+                                    </span>
+                                    {c.httpOnly && (
+                                      <span className="rounded bg-[#eef2ff] px-1 py-0.2 text-[0.62rem] font-medium text-[#4f46e5]">
+                                        HttpOnly
+                                      </span>
+                                    )}
+                                    {c.secure && (
+                                      <span className="rounded bg-[#ecfdf5] px-1 py-0.2 text-[0.62rem] font-medium text-[#15803d]">
+                                        Secure
+                                      </span>
+                                    )}
+                                    {c.sameSite && (
+                                      <span className="rounded bg-[#f3f4f6] px-1 py-0.2 text-[0.62rem] text-[#525866]">
+                                        {c.sameSite}
+                                      </span>
+                                    )}
+                                    <span className="mono-num text-[0.64rem] text-[#9ca3af]">
+                                      到期 {expText}
+                                    </span>
+                                  </div>
+                                  <p className="mono-num truncate text-[0.69rem] text-[#525866]">
+                                    {c.value || "(空值)"}
+                                  </p>
+                                </div>
+
+                                <div className="flex shrink-0 items-center gap-1">
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="xs"
+                                    disabled={cookieBusy}
+                                    onClick={() =>
+                                      void handleCopyTextFeedback(
+                                        key,
+                                        c.value,
+                                        `已复制 Cookie 值: ${c.name}`,
+                                      )
+                                    }
+                                  >
+                                    {copiedCookieKey === key ? (
+                                      <Check className="h-3 w-3 text-[#16a34a]" aria-hidden="true" />
+                                    ) : (
+                                      <Copy className="h-3 w-3" aria-hidden="true" />
+                                    )}
+                                    复制值
+                                  </Button>
+                                  <Button
+                                    type="button"
+                                    variant="destructive-outline"
+                                    size="xs"
+                                    disabled={cookieBusy}
+                                    onClick={() => void handleDeleteSingleCookie(c)}
+                                  >
+                                    <Trash2 className="h-3 w-3" aria-hidden="true" />
+                                    删除
+                                  </Button>
+                                </div>
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      </section>
+                    ))}
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="space-y-3">
+                <div className="space-y-1">
+                  <label
+                    htmlFor={fid("cookieImportArea")}
+                    className="block text-[0.74rem] font-medium text-[#111827]"
+                  >
+                    粘贴 Cookie 文本（自动识别格式）
+                  </label>
+                  <p className="text-[0.69rem] text-[#7c8495]">
+                    支持 AdsPower 导出 JSON 数组、EditThisCookie / Cookie-Editor JSON、{" "}
+                    <span className="mono-num">{"{\"cookies\":[...]}"}</span> 或 Netscape{" "}
+                    <span className="mono-num">cookies.txt</span>（Tab 分隔 7 列）。
+                  </p>
+                  <textarea
+                    id={fid("cookieImportArea")}
+                    rows={9}
+                    className="w-full rounded-xl border border-[#dce0e6] bg-white px-3 py-2 font-mono text-[0.72rem] text-[#111827] placeholder:text-[#9ca3af] shadow-[0_1px_1px_rgba(15,23,42,0.02)] focus-visible:outline-2 focus-visible:outline-[#5b48c4] focus-visible:outline-offset-1"
+                    placeholder={'[\n  {\n    "domain": ".claude.ai",\n    "name": "sessionKey",\n    "value": "sk-ant-sid01-...",\n    "path": "/",\n    "secure": true,\n    "httpOnly": true\n  }\n]'}
+                    value={importText}
+                    onChange={(e) => setImportText(e.target.value)}
+                  />
+                </div>
+
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#eaecef] bg-[#fafbfc] px-3 py-2.5">
+                  <label className="flex cursor-pointer items-center gap-2 text-[0.74rem] text-[#111827]">
+                    <input
+                      type="checkbox"
+                      className="h-3.5 w-3.5 rounded border-[#c3cad6] accent-[#6d5bd0] cursor-pointer"
+                      checked={importReplace}
+                      onChange={(e) => setImportReplace(e.target.checked)}
+                    />
+                    <span>清空该环境现有 Cookie 后覆盖导入（默认勾选关闭 = 仅合并更新同名键）</span>
+                  </label>
+
+                  <Button
+                    type="button"
+                    variant="solid"
+                    size="sm"
+                    disabled={cookieBusy || !importText.trim()}
+                    onClick={() => void handleImportCookies()}
+                  >
+                    <ClipboardPaste className="h-3.5 w-3.5" aria-hidden="true" />
+                    {cookieBusy ? "写入中..." : "立即导入 Cookie"}
+                  </Button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </dialog>

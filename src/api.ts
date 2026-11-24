@@ -9,11 +9,17 @@ import type {
   AppConfig,
   AppEnvSnapshot,
   ClashVergeNodesSnapshot,
+  CookieDeleteTarget,
+  CookieImportOutcome,
   DiagnosticCheck,
   DownloadProgress,
   ExitIpInfo,
   GatewayStatus,
   NodeProfile,
+  PendingUrlPickPayload,
+  ProfileCookiesSnapshot,
+  UrlRouteEvent,
+  UrlRouterStatus,
 } from "./types";
 
 export const api = {
@@ -40,8 +46,29 @@ export const api = {
     }),
   closeBrowserProfile: (profileId: string) =>
     invoke<GatewayStatus>("close_browser_profile", { profileId }),
+  getProfileCookies: (profileId: string) =>
+    invoke<ProfileCookiesSnapshot>("get_profile_cookies", { profileId }),
+  importProfileCookies: (
+    profileId: string,
+    rawText: string,
+    replaceExisting: boolean,
+  ) =>
+    invoke<CookieImportOutcome>("import_profile_cookies", {
+      profileId,
+      rawText,
+      replaceExisting,
+    }),
+  deleteProfileCookies: (profileId: string, targets: CookieDeleteTarget[]) =>
+    invoke<ProfileCookiesSnapshot>("delete_profile_cookies", {
+      profileId,
+      targets,
+    }),
+  clearProfileCookies: (profileId: string) =>
+    invoke<ProfileCookiesSnapshot>("clear_profile_cookies", { profileId }),
   probeNodeExit: (nodeId: string) =>
     invoke<ExitIpInfo>("probe_node_exit", { nodeId }),
+  probeProxyExit: (proxyUrl: string) =>
+    invoke<ExitIpInfo>("probe_proxy_exit", { proxyUrl }),
   launchClaudeDesktop: () => invoke<string>("launch_claude_desktop"),
   launchClaudeTerminal: (workDir: string, strictWfp: boolean) =>
     invoke<string>("launch_claude_terminal", { workDir, strictWfp }),
@@ -96,6 +123,24 @@ export const api = {
       serialNumber: serialNumber ?? null,
     }),
   connectGuard: () => invoke<GatewayStatus>("connect_guard"),
+  getUrlRouterStatus: () => invoke<UrlRouterStatus>("get_url_router_status"),
+  registerUrlRouter: () => invoke<UrlRouterStatus>("register_url_router"),
+  unregisterUrlRouter: () => invoke<UrlRouterStatus>("unregister_url_router"),
+  openDefaultAppsSettings: () => invoke<void>("open_default_apps_settings"),
+  listUrlRouteHistory: () => invoke<UrlRouteEvent[]>("list_url_route_history"),
+  testUrlRouterPicker: (url: string) =>
+    invoke<void>("test_url_router_picker", { url }),
+  getPendingUrlPick: () =>
+    invoke<PendingUrlPickPayload | null>("get_pending_url_pick"),
+  resolveUrlPick: (payload: {
+    pickId: string;
+    action: string;
+    adspowerUserId?: string | null;
+    adspowerSerialNumber?: string | null;
+    adspowerProfileName?: string | null;
+    browserProfileId?: string | null;
+    addEdgeBypassHost?: boolean;
+  }) => invoke<string>("resolve_url_pick", payload),
   clearLogs: () => invoke<void>("clear_logs"),
   generateVpsScript: (protocol: "vless-reality" | "hysteria2", port: number) =>
     invoke<string>("generate_vps_script", { protocol, port }),
@@ -105,4 +150,6 @@ export const api = {
     listen<DownloadProgress>("browser-download-progress", (e) => cb(e.payload)),
   onStatusUpdate: (cb: (status: GatewayStatus) => void): Promise<UnlistenFn> =>
     listen<GatewayStatus>("gateway-status-updated", (e) => cb(e.payload)),
+  onUrlPickerUpdated: (cb: () => void): Promise<UnlistenFn> =>
+    listen("url-picker-updated", () => cb()),
 };

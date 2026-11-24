@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -25,11 +25,52 @@ use windows::Win32::System::JobObjects::{
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const FALLBACK_CHROMIUM_URL: &str = "https://github.com/ungoogled-software/ungoogled-chromium-windows/releases/download/157.0.8103.78-1.1/ungoogled-chromium_157.0.8103.78-1.1_windows_x64.zip";
-const FALLBACK_CHROMIUM_SHA256: &str =
-    "2b1d113b055f827b573cd1fa2bc46511691c0aa427802397cfc05e52350ef212";
+const FP_CHROMIUM_REPO_PREFIX: &str = "/adryfish/fingerprint-chromium/releases/download/";
+const FP_CHROMIUM_FALLBACK_URL: &str = "https://github.com/adryfish/fingerprint-chromium/releases/download/150.0.7871.186/ungoogled-chromium_150.0.7871.186-1.1_windows_x64.zip";
+const FP_CHROMIUM_FALLBACK_SHA256: &str =
+    "4d549c326e51ebbabf562fd365eb5380d9d4a81200da2c60f075c688d9a77e03";
+const CWS_CRX_URL: &str = "https://github.com/NeverDecaf/chromium-web-store/releases/download/v1.5.5.4/Chromium.Web.Store.crx";
+const CWS_CRX_SHA256: &str =
+    "63c075b4a25b11af2c536dad191946e8d9547f92d5b6c257b2ce4138d2996f32";
+const FP_ENGINE_MARKER_FILE: &str = ".fingerprint-chromium";
 const MAX_ZIP_ENTRIES: usize = 20_000;
 const MAX_ZIP_UNCOMPRESSED_BYTES: u64 = 1_500_000_000;
+const MAX_CRX_ENTRIES: usize = 500;
+const MAX_CRX_UNCOMPRESSED_BYTES: u64 = 20_000_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedBrowserEngine {
+    FingerprintChromium(PathBuf),
+    LegacyChromium(PathBuf),
+}
+
+impl ResolvedBrowserEngine {
+    pub fn exe_path(&self) -> &PathBuf {
+        match self {
+            Self::FingerprintChromium(p) | Self::LegacyChromium(p) => p,
+        }
+    }
+
+    pub fn is_fingerprint_chromium(&self) -> bool {
+        matches!(self, Self::FingerprintChromium(_))
+    }
+}
+
+pub fn web_store_extension_dir() -> PathBuf {
+    app_data_dir()
+        .join("extensions")
+        .join("chromium-web-store")
+}
+
+pub fn chrome_newtab_extension_dir() -> PathBuf {
+    app_data_dir()
+        .join("extensions")
+        .join("chrome-newtab")
+}
+
+pub fn is_web_store_ext_installed() -> bool {
+    web_store_extension_dir().join("manifest.json").exists()
+}
 
 pub(crate) struct KillOnCloseJob(OwnedHandle);
 
@@ -60,9 +101,24 @@ impl KillOnCloseJob {
     }
 }
 
+struct RunningBrowserEntry {
+    child: Child,
+    cdp_port: u16,
+}
+
+pub fn pick_free_loopback_port() -> Result<u16, String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("分配本地回环 CDP 端口失败: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("读取本地回环端口失败: {e}"))?
+        .port();
+    Ok(port)
+}
+
 pub struct ProcessLauncher {
     job: Option<KillOnCloseJob>,
-    browser_children: HashMap<String, Child>,
+    browser_children: HashMap<String, RunningBrowserEntry>,
     desktop_child: Option<Child>,
 }
 
@@ -82,8 +138,8 @@ impl ProcessLauncher {
     }
 
     pub fn is_profile_running(&mut self, profile_id: &str) -> bool {
-        if let Some(child) = self.browser_children.get_mut(profile_id) {
-            match child.try_wait() {
+        if let Some(entry) = self.browser_children.get_mut(profile_id) {
+            match entry.child.try_wait() {
                 Ok(None) => return true,
                 _ => {
                     self.browser_children.remove(profile_id);
@@ -93,9 +149,21 @@ impl ProcessLauncher {
         false
     }
 
+    pub fn running_profile_cdp_port(&mut self, profile_id: &str) -> Option<u16> {
+        if let Some(entry) = self.browser_children.get_mut(profile_id) {
+            match entry.child.try_wait() {
+                Ok(None) => return Some(entry.cdp_port),
+                _ => {
+                    self.browser_children.remove(profile_id);
+                }
+            }
+        }
+        None
+    }
+
     pub fn running_browser_profile_ids(&mut self) -> Vec<String> {
         self.browser_children
-            .retain(|_, child| matches!(child.try_wait(), Ok(None)));
+            .retain(|_, entry| matches!(entry.child.try_wait(), Ok(None)));
         let mut ids: Vec<String> = self.browser_children.keys().cloned().collect();
         ids.sort();
         ids
@@ -106,25 +174,79 @@ impl ProcessLauncher {
     }
 
     pub fn close_browser_profile(&mut self, profile_id: &str) -> bool {
-        if let Some(mut child) = self.browser_children.remove(profile_id) {
-            if matches!(child.try_wait(), Ok(None)) {
-                let _ = child.kill();
-                let _ = child.wait();
+        if let Some(mut entry) = self.browser_children.remove(profile_id) {
+            if matches!(entry.child.try_wait(), Ok(None)) {
+                let _ = entry.child.kill();
+                let _ = entry.child.wait();
                 return true;
             }
         }
         false
     }
 
-    pub fn resolve_browser_path(&self, cfg: &AppConfig) -> Option<PathBuf> {
+    pub fn resolve_fp_browser_path(&self) -> Option<PathBuf> {
+        let dir = app_data_dir().join("browser-fp");
+        find_chrome_exe_in(&dir)
+    }
+
+    pub fn resolve_legacy_browser_path(&self) -> Option<PathBuf> {
+        let dir = app_data_dir().join("browser");
+        find_chrome_exe_in(&dir)
+    }
+
+    pub fn resolve_browser_engine(&self, cfg: &AppConfig) -> Option<ResolvedBrowserEngine> {
         if let Some(custom) = cfg.custom_browser_path.as_deref() {
             let p = PathBuf::from(custom.trim());
             if !custom.trim().is_empty() && p.exists() {
-                return Some(p);
+                let is_fp = p
+                    .parent()
+                    .map(|d| d.join(FP_ENGINE_MARKER_FILE).exists())
+                    .unwrap_or(false);
+                return Some(if is_fp {
+                    ResolvedBrowserEngine::FingerprintChromium(p)
+                } else {
+                    ResolvedBrowserEngine::LegacyChromium(p)
+                });
             }
         }
-        let dir = app_data_dir().join("browser");
-        find_chrome_exe_in(&dir)
+        if let Some(fp_exe) = self.resolve_fp_browser_path() {
+            return Some(ResolvedBrowserEngine::FingerprintChromium(fp_exe));
+        }
+        if let Some(legacy_exe) = self.resolve_legacy_browser_path() {
+            return Some(ResolvedBrowserEngine::LegacyChromium(legacy_exe));
+        }
+        None
+    }
+
+    pub fn resolve_browser_path(&self, cfg: &AppConfig) -> Option<PathBuf> {
+        self.resolve_browser_engine(cfg)
+            .map(|engine| engine.exe_path().clone())
+    }
+
+    pub fn resolve_all_browser_wfp_paths(&self, cfg: &AppConfig) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        let push_unique = |list: &mut Vec<PathBuf>, p: PathBuf| {
+            let p_str = p.to_string_lossy();
+            if !list
+                .iter()
+                .any(|existing| existing.to_string_lossy().eq_ignore_ascii_case(&p_str))
+            {
+                list.push(p);
+            }
+        };
+        if let Some(custom) = cfg.custom_browser_path.as_deref() {
+            let p = PathBuf::from(custom.trim());
+            if !custom.trim().is_empty() && p.exists() {
+                push_unique(&mut out, p);
+            }
+        }
+        if let Some(fp) = self.resolve_fp_browser_path() {
+            push_unique(&mut out, fp);
+        }
+        if let Some(legacy) = self.resolve_legacy_browser_path() {
+            push_unique(&mut out, legacy);
+        }
+        out
     }
 
     pub fn resolve_claude_desktop_path(&self, cfg: &AppConfig) -> Option<PathBuf> {
@@ -315,20 +437,27 @@ impl ProcessLauncher {
         target_url: &str,
         logs: Arc<LogBuffer>,
     ) -> Result<String, String> {
-        let exe = self
-            .resolve_browser_path(cfg)
-            .ok_or("未安装专属防泄漏浏览器，请先点击下载或指定便携 Chromium 路径")?;
+        let engine = self
+            .resolve_browser_engine(cfg)
+            .ok_or("未安装专属防泄漏浏览器，请先点击下载 Fingerprint-Chromium 150")?;
+        let is_fp = engine.is_fingerprint_chromium();
+        let exe = engine.exe_path().clone();
 
-        if !target_url.starts_with("https://") {
-            return Err("出于安全考虑，专属浏览器仅允许启动 https:// 目标地址".into());
+        let parsed_target = url::Url::parse(target_url.trim())
+            .map_err(|e| format!("专属浏览器目标 URL 格式无效: {e}"))?;
+        let scheme = parsed_target.scheme().to_ascii_lowercase();
+        if (scheme != "http" && scheme != "https")
+            || parsed_target.host_str().map(str::trim).unwrap_or("").is_empty()
+        {
+            return Err("出于安全考虑，专属浏览器仅允许启动有效的 http(s):// 目标地址".into());
         }
 
-        let (profile_dir, _) = profile_storage_dirs(&profile.id)?;
-        let should_inject_ext = matches!(
+        let (profile_dir, _) = profile_storage_dirs_for_engine(&profile.id, is_fp)?;
+        let should_align = matches!(
             profile.fingerprint_mode,
             BrowserFingerprintMode::IsolatedFingerprint
         ) || cfg.align_fingerprint;
-        let locale_for_prefs = should_inject_ext.then_some(effective_locale);
+        let locale_for_prefs = should_align.then_some(effective_locale);
         harden_browser_preferences(&profile_dir, locale_for_prefs)?;
 
         // If this exact profile window is already running, opening the URL passes a new tab
@@ -346,59 +475,64 @@ impl ProcessLauncher {
             return Ok(format!("已在 [{}] 打开 {target_url}", profile.name));
         }
 
-        let mut cmd = Command::new(&exe);
-        cmd.arg(format!("--user-data-dir={}", profile_dir.display()))
-            .arg(format!("--proxy-server={proxy_server_url}"))
-            .arg("--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1")
-            .arg("--force-webrtc-ip-handling-policy")
-            .arg("--webrtc-ip-handling-policy=disable_non_proxied_udp")
-            .arg("--disable-quic")
-            .arg("--no-first-run")
-            .arg("--no-default-browser-check")
-            .arg("--disable-sync")
-            .arg("--disable-background-networking");
-
-        if should_inject_ext {
-            cmd.arg(format!("--lang={effective_locale}"));
-            let ext_dir = ensure_profile_fingerprint_extension(profile, effective_tz, effective_locale)?;
-            cmd.arg("--disable-features=DisableLoadExtensionCommandLineSwitch")
-                .arg(format!("--load-extension={}", ext_dir.display()));
-        }
-
-        if matches!(
-            profile.fingerprint_mode,
-            BrowserFingerprintMode::IsolatedFingerprint
-        ) {
-            let sw = profile.fingerprint.screen_width.clamp(800, 3840);
-            let sh = profile.fingerprint.screen_height.clamp(600, 2160);
-            cmd.arg(format!("--window-size={sw},{sh}"));
-            if let Some(ua) = profile
-                .fingerprint
-                .user_agent
-                .as_deref()
-                .map(|s| s.chars().filter(|c| !c.is_control()).collect::<String>())
-            {
-                let trimmed = ua.trim();
-                if !trimmed.is_empty() {
-                    cmd.arg(format!("--user-agent={trimmed}"));
-                }
+        let legacy_ext_dir = if !is_fp && should_align {
+            Some(ensure_profile_fingerprint_extension(
+                profile,
+                effective_tz,
+                effective_locale,
+            )?)
+        } else {
+            None
+        };
+        let cws_dir = web_store_extension_dir();
+        let cws_ext_opt = cws_dir.join("manifest.json").exists().then_some(cws_dir);
+        let ntp_ext_opt = match ensure_chrome_newtab_extension() {
+            Ok(dir) => Some(dir),
+            Err(err) => {
+                logs.push(format!("生成 Chrome 风格新标签页扩展失败（已跳过）: {err}"));
+                None
             }
-        }
+        };
 
-        cmd.arg(target_url);
+        let cdp_port = pick_free_loopback_port()?;
+        let args = build_browser_launch_args(
+            is_fp,
+            profile,
+            &profile_dir,
+            proxy_server_url,
+            effective_tz,
+            effective_locale,
+            cfg.align_fingerprint,
+            cws_ext_opt.as_deref(),
+            ntp_ext_opt.as_deref(),
+            legacy_ext_dir.as_deref(),
+            Some(cdp_port),
+            target_url,
+        );
+
+        let mut cmd = Command::new(&exe);
+        cmd.args(&args);
 
         let child = cmd
             .spawn()
             .map_err(|e| format!("启动浏览器环境 [{}] 失败: {e}", profile.name))?;
         self.assign_to_job(&child);
-        self.browser_children.insert(profile.id.clone(), child);
+        self.browser_children.insert(
+            profile.id.clone(),
+            RunningBrowserEntry { child, cdp_port },
+        );
 
+        let engine_label = if is_fp {
+            "Fingerprint-Chromium"
+        } else {
+            "Chromium"
+        };
         let mode_label = match profile.fingerprint_mode {
             BrowserFingerprintMode::CleanAlign => "纯净对齐",
             BrowserFingerprintMode::IsolatedFingerprint => "完整独立指纹",
         };
         logs.push(format!(
-            "已启动浏览器环境 [{}] ({mode_label}, 出口: {node_label}, 代理 {proxy_server_url}) -> {target_url}",
+            "已启动 [{engine_label}] 浏览器环境 [{}] ({mode_label}, 出口: {node_label}, 代理 {proxy_server_url}) -> {target_url}",
             profile.name
         ));
         Ok(format!(
@@ -592,32 +726,40 @@ fn parse_sha256_digest(raw: &str) -> Option<String> {
     }
 }
 
-fn is_allowed_chromium_url(url_str: &str) -> bool {
+fn is_allowed_github_release_url(url_str: &str, repo_prefix: &str) -> bool {
     let Ok(url) = Url::parse(url_str) else {
         return false;
     };
     url.scheme() == "https"
         && matches!(
             url.host_str(),
-            Some("github.com") | Some("objects.githubusercontent.com") | Some("release-assets.githubusercontent.com")
+            Some("github.com")
+                | Some("objects.githubusercontent.com")
+                | Some("release-assets.githubusercontent.com")
         )
         && if url.host_str() == Some("github.com") {
-            url.path()
-                .starts_with("/ungoogled-software/ungoogled-chromium-windows/releases/download/")
+            url.path().starts_with(repo_prefix)
         } else {
             true
         }
 }
 
-fn parse_expanded_assets_html(html: &str) -> Option<(String, String)> {
-    let marker = "/ungoogled-software/ungoogled-chromium-windows/releases/download/";
+pub fn is_allowed_fp_chromium_url(url_str: &str) -> bool {
+    is_allowed_github_release_url(url_str, FP_CHROMIUM_REPO_PREFIX)
+}
+
+pub fn is_allowed_cws_url(url_str: &str) -> bool {
+    is_allowed_github_release_url(url_str, "/NeverDecaf/chromium-web-store/releases/download/")
+}
+
+fn parse_expanded_assets_html(html: &str, marker: &str, suffix: &str) -> Option<(String, String)> {
     let mut search_from = 0usize;
     while let Some(rel_idx) = html[search_from..].find(marker) {
         let abs_start = search_from + rel_idx;
         let rest = &html[abs_start..];
         let end_quote = rest.find('"')?;
         let rel_path = &rest[..end_quote];
-        if rel_path.ends_with("windows_x64.zip") {
+        if rel_path.ends_with(suffix) {
             let full_url = format!("https://github.com{rel_path}");
             let block_end = html[abs_start..]
                 .find("</a>")
@@ -642,11 +784,43 @@ fn parse_expanded_assets_html(html: &str) -> Option<(String, String)> {
     None
 }
 
-async fn resolve_chromium_download(client: &reqwest::Client) -> (String, String) {
-    if let Ok(resp) = client
-        .get("https://api.github.com/repos/ungoogled-software/ungoogled-chromium-windows/releases/latest")
-        .send()
-        .await
+async fn send_with_proxy_fallback(
+    direct: &reqwest::Client,
+    proxy: Option<&reqwest::Client>,
+    url: &str,
+) -> Result<reqwest::Response, String> {
+    match direct.get(url).send().await {
+        Ok(resp) if resp.status().is_success() => Ok(resp),
+        first_res => {
+            if let Some(px) = proxy {
+                match px.get(url).send().await {
+                    Ok(resp) => return Ok(resp),
+                    Err(pe) => {
+                        if let Ok(r) = first_res {
+                            return Ok(r);
+                        }
+                        return Err(format!("直连与代理下载均失败: {pe}"));
+                    }
+                }
+            }
+            match first_res {
+                Ok(resp) => Ok(resp),
+                Err(e) => Err(format!("网络请求失败: {e}")),
+            }
+        }
+    }
+}
+
+async fn resolve_fp_chromium_download(
+    direct: &reqwest::Client,
+    proxy: Option<&reqwest::Client>,
+) -> (String, String) {
+    if let Ok(resp) = send_with_proxy_fallback(
+        direct,
+        proxy,
+        "https://api.github.com/repos/adryfish/fingerprint-chromium/releases/latest",
+    )
+    .await
     {
         if resp.status().is_success() {
             if let Ok(rel) = resp.json::<GhRelease>().await {
@@ -656,7 +830,7 @@ async fn resolve_chromium_download(client: &reqwest::Client) -> (String, String)
                     .find(|a| a.name.ends_with("windows_x64.zip"))
                 {
                     if let Some(digest) = asset.digest.as_deref().and_then(parse_sha256_digest) {
-                        if is_allowed_chromium_url(&asset.browser_download_url) {
+                        if is_allowed_fp_chromium_url(&asset.browser_download_url) {
                             return (asset.browser_download_url, digest);
                         }
                     }
@@ -665,22 +839,31 @@ async fn resolve_chromium_download(client: &reqwest::Client) -> (String, String)
         }
     }
 
-    // Fallback metadata lookup via GitHub release redirect + expanded_assets HTML (not API rate-limited)
-    if let Ok(latest_resp) = client
-        .get("https://github.com/ungoogled-software/ungoogled-chromium-windows/releases/latest")
-        .send()
-        .await
+    if let Ok(latest_resp) = send_with_proxy_fallback(
+        direct,
+        proxy,
+        "https://github.com/adryfish/fingerprint-chromium/releases/latest",
+    )
+    .await
     {
         let resolved = latest_resp.url().as_str().to_string();
-        if let Some(tag) = resolved.rsplit('/').next().filter(|t| !t.is_empty() && *t != "latest") {
+        if let Some(tag) = resolved
+            .rsplit('/')
+            .next()
+            .filter(|t| !t.is_empty() && *t != "latest")
+        {
             let expanded_url = format!(
-                "https://github.com/ungoogled-software/ungoogled-chromium-windows/releases/expanded_assets/{tag}"
+                "https://github.com/adryfish/fingerprint-chromium/releases/expanded_assets/{tag}"
             );
-            if let Ok(exp_resp) = client.get(&expanded_url).send().await {
+            if let Ok(exp_resp) = send_with_proxy_fallback(direct, proxy, &expanded_url).await {
                 if exp_resp.status().is_success() {
                     if let Ok(html) = exp_resp.text().await {
-                        if let Some((url, hash)) = parse_expanded_assets_html(&html) {
-                            if is_allowed_chromium_url(&url) {
+                        if let Some((url, hash)) = parse_expanded_assets_html(
+                            &html,
+                            FP_CHROMIUM_REPO_PREFIX,
+                            "windows_x64.zip",
+                        ) {
+                            if is_allowed_fp_chromium_url(&url) {
                                 return (url, hash);
                             }
                         }
@@ -691,12 +874,12 @@ async fn resolve_chromium_download(client: &reqwest::Client) -> (String, String)
     }
 
     (
-        FALLBACK_CHROMIUM_URL.to_string(),
-        FALLBACK_CHROMIUM_SHA256.to_string(),
+        FP_CHROMIUM_FALLBACK_URL.to_string(),
+        FP_CHROMIUM_FALLBACK_SHA256.to_string(),
     )
 }
 
-pub fn validate_and_strip_zip_entry_path(raw_name: &str) -> Result<Option<PathBuf>, String> {
+fn validate_raw_zip_segments(raw_name: &str) -> Result<Vec<String>, String> {
     if raw_name.contains('\0') {
         return Err("ZIP 条目包含空字节，拒绝解压".into());
     }
@@ -705,27 +888,44 @@ pub fn validate_and_strip_zip_entry_path(raw_name: &str) -> Result<Option<PathBu
         return Err(format!("ZIP 条目包含绝对路径: {raw_name}"));
     }
 
-    let raw_segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
-    if raw_segments.is_empty() {
-        return Ok(None);
-    }
+    let raw_segments: Vec<String> = normalized
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
 
-    // Validate EVERY segment BEFORE stripping the top-level directory so payloads like
-    // `top/../../evil.txt` or `C:/evil.txt` cannot hide behind directory stripping.
+    // Validate EVERY segment BEFORE any stripping so payloads like `top/../../evil.txt`
+    // or `C:/evil.txt` cannot hide behind directory stripping.
     for seg in &raw_segments {
-        if *seg == "." || *seg == ".." || seg.contains(':') || seg.chars().any(|c| c.is_control())
-        {
+        if seg == "." || seg == ".." || seg.contains(':') || seg.chars().any(|c| c.is_control()) {
             return Err(format!("ZIP 条目存在非法路径成分: {raw_name}"));
         }
     }
+    Ok(raw_segments)
+}
 
-    let rest = &raw_segments[1..];
-    if rest.is_empty() {
+pub fn validate_zip_entry_path_no_strip(raw_name: &str) -> Result<Option<PathBuf>, String> {
+    let segs = validate_raw_zip_segments(raw_name)?;
+    if segs.is_empty() {
         return Ok(None);
     }
+    let mut path = PathBuf::new();
+    for seg in &segs {
+        path.push(seg);
+    }
+    if path.components().any(|c| !matches!(c, Component::Normal(_))) {
+        return Err(format!("ZIP 条目含非普通路径成分: {raw_name}"));
+    }
+    Ok(Some(path))
+}
 
+pub fn validate_and_strip_zip_entry_path(raw_name: &str) -> Result<Option<PathBuf>, String> {
+    let segs = validate_raw_zip_segments(raw_name)?;
+    if segs.len() <= 1 {
+        return Ok(None);
+    }
     let mut stripped = PathBuf::new();
-    for seg in rest {
+    for seg in &segs[1..] {
         stripped.push(seg);
     }
     if stripped.components().any(|c| !matches!(c, Component::Normal(_))) {
@@ -750,22 +950,23 @@ fn ensure_no_symlink_components(root: &Path, dest: &Path) -> Result<(), String> 
     Ok(())
 }
 
-pub fn extract_chromium_zip_safe(zip_path: &Path, target_dir: &Path) -> Result<(), String> {
-    if target_dir.exists() {
-        let _ = fs::remove_dir_all(target_dir);
-    }
-    fs::create_dir_all(target_dir).map_err(|e| e.to_string())?;
-    let canon_root = fs::canonicalize(target_dir).map_err(|e| e.to_string())?;
-
-    let file = File::open(zip_path).map_err(|e| e.to_string())?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-    if archive.len() > MAX_ZIP_ENTRIES {
+fn extract_zip_archive_safe<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    target_dir: &Path,
+    max_entries: usize,
+    max_bytes: u64,
+    allow_strip_common_top_dir: bool,
+) -> Result<(), String> {
+    if archive.len() > max_entries {
         return Err(format!("ZIP 文件条目数过多 ({}), 拒绝解压", archive.len()));
     }
 
-    let mut total_bytes: u64 = 0;
+    let mut common_top: Option<String> = None;
+    let mut uniform_top = true;
+    let mut has_nested = false;
+
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        let entry = archive.by_index(i).map_err(|e| e.to_string())?;
         if entry.is_symlink()
             || entry
                 .unix_mode()
@@ -777,12 +978,47 @@ pub fn extract_chromium_zip_safe(zip_path: &Path, target_dir: &Path) -> Result<(
         if entry.enclosed_name().is_none() {
             return Err(format!("ZIP 条目含未封闭不安全路径: {}", entry.name()));
         }
+        let segs = validate_raw_zip_segments(entry.name())?;
+        if let Some(first) = segs.first() {
+            if segs.len() >= 2 {
+                has_nested = true;
+            } else if !entry.is_dir() {
+                uniform_top = false;
+            }
+            match &common_top {
+                None => common_top = Some(first.clone()),
+                Some(prev) if prev != first => uniform_top = false,
+                _ => {}
+            }
+        }
+    }
 
-        let Some(stripped) = validate_and_strip_zip_entry_path(entry.name())? else {
+    let strip_top = allow_strip_common_top_dir && uniform_top && has_nested;
+
+    if target_dir.exists() {
+        fs::remove_dir_all(target_dir).map_err(|e| {
+            format!(
+                "清理旧目录 {} 失败（请先关闭正在运行的指纹浏览器窗口）: {e}",
+                target_dir.display()
+            )
+        })?;
+    }
+    fs::create_dir_all(target_dir).map_err(|e| e.to_string())?;
+    let canon_root = fs::canonicalize(target_dir).map_err(|e| e.to_string())?;
+
+    let mut total_bytes: u64 = 0;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        let rel_path_opt = if strip_top {
+            validate_and_strip_zip_entry_path(entry.name())?
+        } else {
+            validate_zip_entry_path_no_strip(entry.name())?
+        };
+        let Some(rel_path) = rel_path_opt else {
             continue;
         };
 
-        let dest = target_dir.join(&stripped);
+        let dest = target_dir.join(&rel_path);
         ensure_no_symlink_components(target_dir, &dest)?;
 
         if entry.is_dir() {
@@ -799,7 +1035,7 @@ pub fn extract_chromium_zip_safe(zip_path: &Path, target_dir: &Path) -> Result<(
                 return Err("解压文件路径越出目标根目录".into());
             }
 
-            let remaining = MAX_ZIP_UNCOMPRESSED_BYTES.saturating_sub(total_bytes);
+            let remaining = max_bytes.saturating_sub(total_bytes);
             if remaining == 0 {
                 return Err("ZIP 解压总大小超过安全上限".into());
             }
@@ -811,7 +1047,7 @@ pub fn extract_chromium_zip_safe(zip_path: &Path, target_dir: &Path) -> Result<(
             let mut bounded = (&mut entry).take(remaining + 1);
             let written = std::io::copy(&mut bounded, &mut outfile).map_err(|e| e.to_string())?;
             total_bytes = total_bytes.saturating_add(written);
-            if total_bytes > MAX_ZIP_UNCOMPRESSED_BYTES {
+            if total_bytes > max_bytes {
                 return Err("ZIP 解压体积异常膨胀（疑似 Zip Bomb），已终止".into());
             }
         }
@@ -819,35 +1055,197 @@ pub fn extract_chromium_zip_safe(zip_path: &Path, target_dir: &Path) -> Result<(
     Ok(())
 }
 
+pub fn extract_chromium_zip_safe(zip_path: &Path, target_dir: &Path) -> Result<(), String> {
+    let file = File::open(zip_path).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    extract_zip_archive_safe(
+        &mut archive,
+        target_dir,
+        MAX_ZIP_ENTRIES,
+        MAX_ZIP_UNCOMPRESSED_BYTES,
+        true,
+    )
+}
+
+pub fn extract_crx3_safe(crx_bytes: &[u8], target_dir: &Path) -> Result<(), String> {
+    if crx_bytes.len() < 16 || &crx_bytes[0..4] != b"Cr24" {
+        return Err("无效的 CRX3 扩展包（缺少 Cr24 文件头）".into());
+    }
+    let version = u32::from_le_bytes([crx_bytes[4], crx_bytes[5], crx_bytes[6], crx_bytes[7]]);
+    if version != 3 {
+        return Err(format!("不支持的 CRX 扩展版本: {version}（仅支持 CRX3）"));
+    }
+    let header_len =
+        u32::from_le_bytes([crx_bytes[8], crx_bytes[9], crx_bytes[10], crx_bytes[11]]) as usize;
+    let zip_offset = 12usize
+        .checked_add(header_len)
+        .ok_or_else(|| "CRX3 头长度溢出".to_string())?;
+    if zip_offset + 4 > crx_bytes.len() || &crx_bytes[zip_offset..zip_offset + 4] != b"PK\x03\x04" {
+        return Err("CRX3 扩展包 ZIP 载荷偏移无效".into());
+    }
+
+    let parent = target_dir.parent().ok_or("无效的扩展安装目录")?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let staging = parent.join(format!("cws-staging-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&staging);
+
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(&crx_bytes[zip_offset..])).map_err(|e| e.to_string())?;
+    if let Err(err) = extract_zip_archive_safe(
+        &mut archive,
+        &staging,
+        MAX_CRX_ENTRIES,
+        MAX_CRX_UNCOMPRESSED_BYTES,
+        false,
+    ) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(err);
+    }
+
+    if !staging.join("manifest.json").exists() {
+        let _ = fs::remove_dir_all(&staging);
+        return Err("CRX3 解压后缺少 manifest.json".into());
+    }
+
+    if target_dir.exists() {
+        fs::remove_dir_all(target_dir).map_err(|e| {
+            let _ = fs::remove_dir_all(&staging);
+            format!("替换扩展目录 {} 失败: {e}", target_dir.display())
+        })?;
+    }
+    fs::rename(&staging, target_dir).map_err(|e| {
+        let _ = fs::remove_dir_all(&staging);
+        format!("激活 Chrome 商店扩展目录失败: {e}")
+    })?;
+    Ok(())
+}
+
+fn mark_fp_engine_installed(browser_dir: &Path) -> Result<(), String> {
+    fs::write(browser_dir.join(FP_ENGINE_MARKER_FILE), b"fingerprint-chromium-150\n")
+        .map_err(|e| format!("写入内核标记失败: {e}"))?;
+    if let Some(exe) = find_chrome_exe_in(browser_dir) {
+        if let Some(exe_dir) = exe.parent() {
+            if exe_dir != browser_dir {
+                fs::write(exe_dir.join(FP_ENGINE_MARKER_FILE), b"fingerprint-chromium-150\n")
+                    .map_err(|e| format!("写入内核标记失败: {e}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn install_cws_extension(
+    direct: &reqwest::Client,
+    proxy: Option<&reqwest::Client>,
+    logs: &Arc<LogBuffer>,
+) -> Result<(), String> {
+    if !is_allowed_cws_url(CWS_CRX_URL) {
+        return Err("非受信任的 Chrome 商店扩展来源".into());
+    }
+    let resp = send_with_proxy_fallback(direct, proxy, CWS_CRX_URL).await?;
+    if !resp.status().is_success() {
+        return Err(format!("Chrome 商店扩展下载返回 HTTP {}", resp.status()));
+    }
+    let final_url = resp.url().as_str().to_string();
+    if !is_allowed_cws_url(&final_url) {
+        return Err(format!("扩展跳转来源不受信任: {final_url}"));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("读取扩展数据失败: {e}"))?;
+    let actual_sha256 = hex::encode(Sha256::digest(&bytes));
+    if !guard_protocol::constant_time_eq_bytes(&actual_sha256, CWS_CRX_SHA256) {
+        return Err(format!(
+            "Chrome 商店扩展 SHA-256 校验失败: 预期 {CWS_CRX_SHA256}, 实际 {actual_sha256}"
+        ));
+    }
+
+    let target_ext_dir = web_store_extension_dir();
+    let bytes_owned = bytes.to_vec();
+    tokio::task::spawn_blocking(move || extract_crx3_safe(&bytes_owned, &target_ext_dir))
+        .await
+        .map_err(|e| e.to_string())??;
+
+    logs.push(format!(
+        "Chrome 商店扩展 (chromium-web-store v1.5.5.4) SHA-256 校验通过并安装至 {}",
+        web_store_extension_dir().display()
+    ));
+    Ok(())
+}
+
 pub async fn download_and_install_browser(
     app: AppHandle,
+    proxy_fallback: Option<String>,
     logs: Arc<LogBuffer>,
 ) -> Result<String, String> {
-    let client = reqwest::Client::builder()
+    let direct_client = reqwest::Client::builder()
         .user_agent("AI-NetGuard/0.1")
+        .connect_timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| e.to_string())?;
+    let proxy_client = match proxy_fallback.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p_url) => reqwest::Proxy::all(p_url).ok().and_then(|proxy| {
+            reqwest::Client::builder()
+                .user_agent("AI-NetGuard/0.1")
+                .proxy(proxy)
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .build()
+                .ok()
+        }),
+        None => None,
+    };
 
-    let (download_url, expected_sha256) = resolve_chromium_download(&client).await;
-    if !is_allowed_chromium_url(&download_url) {
+    let mut cws_note: Option<String> = None;
+
+    // If Fingerprint-Chromium 150 is already installed cleanly, allow repairing missing CWS extension alone.
+    let target_dir = app_data_dir().join("browser-fp");
+    if target_dir.join(FP_ENGINE_MARKER_FILE).exists() && find_chrome_exe_in(&target_dir).is_some() {
+        if !is_web_store_ext_installed() {
+            let _ = app.emit(
+                "browser-download-progress",
+                DownloadProgress {
+                    stage: "extracting".into(),
+                    downloaded_bytes: 0,
+                    total_bytes: 0,
+                    message: "Fingerprint-Chromium 150 已安装，正在补装 Chrome 应用商店扩展...".into(),
+                },
+            );
+            install_cws_extension(&direct_client, proxy_client.as_ref(), &logs).await?;
+            let _ = app.emit(
+                "browser-download-progress",
+                DownloadProgress {
+                    stage: "done".into(),
+                    downloaded_bytes: 0,
+                    total_bytes: 0,
+                    message: "Chrome 应用商店扩展安装完成".into(),
+                },
+            );
+            return Ok("已为 Fingerprint-Chromium 150 补装 Chrome 商店扩展".into());
+        }
+    }
+
+    let (download_url, expected_sha256) =
+        resolve_fp_chromium_download(&direct_client, proxy_client.as_ref()).await;
+    if !is_allowed_fp_chromium_url(&download_url) {
         return Err(format!("拒绝从非受信任来源下载浏览器: {download_url}"));
     }
 
     logs.push(format!(
-        "开始下载便携版 Ungoogled-Chromium: {download_url} (SHA-256: {expected_sha256})"
+        "开始下载开源 Fingerprint-Chromium 150: {download_url} (SHA-256: {expected_sha256})"
     ));
 
-    let resp = client
-        .get(&download_url)
-        .send()
-        .await
-        .map_err(|e| format!("下载请求失败: {e}"))?;
+    let resp = send_with_proxy_fallback(&direct_client, proxy_client.as_ref(), &download_url).await?;
     if !resp.status().is_success() {
         return Err(format!("下载返回 HTTP {}", resp.status()));
     }
+    let final_url = resp.url().as_str().to_string();
+    if !is_allowed_fp_chromium_url(&final_url) {
+        return Err(format!("下载重定向来源不受信任: {final_url}"));
+    }
 
     let total = resp.content_length().unwrap_or(0);
-    let zip_path = app_data_dir().join("ungoogled-chromium.zip");
+    let zip_path = app_data_dir().join("fingerprint-chromium.zip");
     let mut out = File::create(&zip_path).map_err(|e| format!("创建临时压缩包失败: {e}"))?;
     let mut hasher = Sha256::new();
 
@@ -868,7 +1266,7 @@ pub async fn download_and_install_browser(
                     downloaded_bytes: downloaded,
                     total_bytes: total,
                     message: format!(
-                        "正在下载便携 Chromium ({:.1} MB / {:.1} MB)...",
+                        "正在下载 Fingerprint-Chromium 150 ({:.1} MB / {:.1} MB)...",
                         downloaded as f64 / 1048576.0,
                         total as f64 / 1048576.0
                     ),
@@ -882,10 +1280,12 @@ pub async fn download_and_install_browser(
     if !guard_protocol::constant_time_eq_bytes(&actual_sha256, &expected_sha256) {
         let _ = fs::remove_file(&zip_path);
         return Err(format!(
-            "Chromium 归档 SHA-256 校验失败: 预期 {expected_sha256}, 实际 {actual_sha256}"
+            "Fingerprint-Chromium 归档 SHA-256 校验失败: 预期 {expected_sha256}, 实际 {actual_sha256}"
         ));
     }
-    logs.push(format!("Chromium 归档 SHA-256 校验通过 ({actual_sha256})"));
+    logs.push(format!(
+        "Fingerprint-Chromium 归档 SHA-256 校验通过 ({actual_sha256})"
+    ));
 
     let _ = app.emit(
         "browser-download-progress",
@@ -893,20 +1293,64 @@ pub async fn download_and_install_browser(
             stage: "extracting".into(),
             downloaded_bytes: downloaded,
             total_bytes: total,
-            message: "SHA-256 校验通过，正在安全解压到独立目录...".into(),
+            message: "SHA-256 校验通过，正在安全解压到独立内核目录...".into(),
         },
     );
 
-    let target_dir = app_data_dir().join("browser");
+    let staging_dir = app_data_dir().join("browser-fp-staging");
     let zip_clone = zip_path.clone();
+    let staging_clone = staging_dir.clone();
     let target_clone = target_dir.clone();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let res = extract_chromium_zip_safe(&zip_clone, &target_clone);
+        let extract_res = extract_chromium_zip_safe(&zip_clone, &staging_clone);
         let _ = fs::remove_file(&zip_clone);
-        res
+        extract_res?;
+        if find_chrome_exe_in(&staging_clone).is_none() {
+            let _ = fs::remove_dir_all(&staging_clone);
+            return Err("解压完成但未找到 chrome.exe".into());
+        }
+        mark_fp_engine_installed(&staging_clone)?;
+
+        let backup_dir = app_data_dir().join("browser-fp-old");
+        let _ = fs::remove_dir_all(&backup_dir);
+        let had_existing = target_clone.exists();
+        if had_existing {
+            fs::rename(&target_clone, &backup_dir).map_err(|e| {
+                let _ = fs::remove_dir_all(&staging_clone);
+                format!("请先关闭所有正在运行的 Fingerprint-Chromium 窗口再升级内核: {e}")
+            })?;
+        }
+        if let Err(e) = fs::rename(&staging_clone, &target_clone) {
+            if had_existing {
+                let _ = fs::rename(&backup_dir, &target_clone);
+            }
+            let _ = fs::remove_dir_all(&staging_clone);
+            return Err(format!("激活 Fingerprint-Chromium 150 内核目录失败: {e}"));
+        }
+        if had_existing {
+            let _ = fs::remove_dir_all(&backup_dir);
+        }
+        Ok(())
     })
     .await
     .map_err(|e| e.to_string())??;
+
+    let _ = harden_browser_preferences(&app_data_dir().join("browser-profile-fp"), None);
+
+    let _ = app.emit(
+        "browser-download-progress",
+        DownloadProgress {
+            stage: "extracting".into(),
+            downloaded_bytes: downloaded,
+            total_bytes: total,
+            message: "正在安装 Chrome 应用商店扩展支持 (chromium-web-store)...".into(),
+        },
+    );
+
+    if let Err(err) = install_cws_extension(&direct_client, proxy_client.as_ref(), &logs).await {
+        logs.push(format!("Chrome 商店扩展自动安装跳过（可稍后重试）: {err}"));
+        cws_note = Some(err);
+    }
 
     let _ = app.emit(
         "browser-download-progress",
@@ -914,11 +1358,19 @@ pub async fn download_and_install_browser(
             stage: "done".into(),
             downloaded_bytes: downloaded,
             total_bytes: total,
-            message: "便携版防泄漏浏览器安装完成".into(),
+            message: "Fingerprint-Chromium 150 安装完成".into(),
         },
     );
-    logs.push(format!("专属防泄漏浏览器已解压至 {}", target_dir.display()));
-    Ok("专属防泄漏浏览器安装成功".into())
+    logs.push(format!(
+        "Fingerprint-Chromium 150 已安装至 {}",
+        target_dir.display()
+    ));
+    match cws_note {
+        None => Ok("Fingerprint-Chromium 150 内核与 Chrome 商店插件安装成功".into()),
+        Some(err) => Ok(format!(
+            "Fingerprint-Chromium 150 内核安装成功（Chrome 商店插件可稍后点「补装商店插件」重试: {err}）"
+        )),
+    }
 }
 
 fn find_latest_squirrel_claude_exe(anthropic_dir: &Path) -> Option<PathBuf> {
@@ -998,13 +1450,7 @@ fn harden_preferences_file(pref_path: &Path, locale: Option<&str>) -> Result<(),
     root["net"] = json!({ "network_prediction_options": 2 });
     root["safebrowsing"] = json!({ "enabled": false });
     if let Some(loc) = locale {
-        let base_lang = loc.split('-').next().unwrap_or(loc);
-        let accept = if base_lang.eq_ignore_ascii_case("en") {
-            format!("{loc},{base_lang}")
-        } else {
-            format!("{loc},{base_lang},en-US,en")
-        };
-        root["intl"] = json!({ "accept_languages": accept });
+        root["intl"] = json!({ "accept_languages": build_accept_languages(loc) });
     }
 
     let pretty = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
@@ -1068,6 +1514,871 @@ pub fn profile_storage_dirs(profile_id: &str) -> Result<(PathBuf, PathBuf), Stri
             app_data_dir().join("fingerprint-exts").join(&safe_id),
         ))
     }
+}
+
+pub fn profile_storage_dirs_for_engine(
+    profile_id: &str,
+    is_fp: bool,
+) -> Result<(PathBuf, PathBuf), String> {
+    if !is_fp {
+        return profile_storage_dirs(profile_id);
+    }
+    let safe_id = sanitize_profile_id(profile_id)?;
+    if safe_id == "default" {
+        Ok((
+            app_data_dir().join("browser-profile-fp"),
+            app_data_dir().join("fingerprint-ext-fp"),
+        ))
+    } else {
+        Ok((
+            app_data_dir().join("browser-profiles-fp").join(&safe_id),
+            app_data_dir().join("fingerprint-exts-fp").join(&safe_id),
+        ))
+    }
+}
+
+pub fn compute_fingerprint_seed_u32(seed_input: &str) -> u32 {
+    let trimmed = seed_input.trim();
+    let mut hash: u32 = 0x811c_9dc5;
+    for &b in trimmed.as_bytes() {
+        hash ^= u32::from(b);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    // Keep within positive signed 32-bit int range (1..=i32::MAX) for C++ StringToInt/Uint compatibility.
+    let masked = hash & 0x7FFF_FFFF;
+    if masked == 0 {
+        1
+    } else {
+        masked
+    }
+}
+
+pub fn build_accept_languages(locale: &str) -> String {
+    let loc = locale.trim();
+    if loc.is_empty() {
+        return "en-US,en".to_string();
+    }
+    let base_lang = loc.split('-').next().unwrap_or(loc);
+    if base_lang.eq_ignore_ascii_case("en") {
+        format!("{loc},{base_lang}")
+    } else {
+        format!("{loc},{base_lang},en-US,en")
+    }
+}
+
+const NTP_MANIFEST_JSON: &str = r#"{
+  "manifest_version": 3,
+  "name": "AI NetGuard New Tab",
+  "version": "1.0.0",
+  "description": "Clean offline Google Chrome-style New Tab page for AI NetGuard browser profiles.",
+  "chrome_url_overrides": {
+    "newtab": "newtab.html"
+  }
+}
+"#;
+
+const NTP_HTML: &str = r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>新标签页</title>
+  <link rel="stylesheet" href="newtab.css">
+</head>
+<body>
+  <header class="top-nav" aria-label="常用服务快捷入口">
+    <a class="nav-link" href="https://mail.google.com/">Gmail</a>
+    <a class="nav-link" href="https://gemini.google.com/app">Gemini</a>
+    <a class="nav-link" href="https://claude.ai/">Claude</a>
+    <a class="nav-link" href="https://fuck-claude.vercel.app/">IP 检测</a>
+  </header>
+
+  <main class="ntp-main">
+    <div class="google-wordmark" role="img" aria-label="Google">
+      <span class="g-blue">G</span><span class="g-red">o</span><span class="g-yellow">o</span><span class="g-blue">g</span><span class="g-green">l</span><span class="g-red">e</span>
+    </div>
+
+    <form id="search-form" class="search-form" role="search">
+      <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="2"></circle>
+        <line x1="15.5" y1="15.5" x2="20.5" y2="20.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"></line>
+      </svg>
+      <input
+        id="search-input"
+        class="search-input"
+        type="search"
+        autocomplete="off"
+        spellcheck="false"
+        autofocus
+        aria-label="在 Google 上搜索，或者输入一个网址"
+        placeholder="在 Google 上搜索，或者输入一个网址"
+      >
+      <button type="submit" class="search-submit-btn" aria-label="搜索或前往网址" title="Google 搜索">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path d="M5 12h13M13 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path>
+        </svg>
+      </button>
+    </form>
+
+    <section id="shortcuts-grid" class="shortcuts-grid" aria-label="快捷方式"></section>
+
+    <div class="ntp-actions">
+      <button id="reset-shortcuts-btn" type="button" class="reset-btn">
+        恢复默认快捷方式
+      </button>
+    </div>
+  </main>
+
+  <dialog id="add-shortcut-dialog" class="shortcut-dialog" aria-labelledby="add-shortcut-title">
+    <form id="add-shortcut-form" method="dialog" class="dialog-form">
+      <h2 id="add-shortcut-title" class="dialog-title">添加快捷方式</h2>
+      <div class="field">
+        <label for="sc-name">名称</label>
+        <input id="sc-name" type="text" maxlength="24" required placeholder="例如 ChatGPT">
+      </div>
+      <div class="field">
+        <label for="sc-url">网址</label>
+        <input id="sc-url" type="text" required placeholder="例如 https://chatgpt.com">
+      </div>
+      <p id="sc-error" class="dialog-error" hidden></p>
+      <div class="dialog-footer">
+        <button id="sc-cancel-btn" type="button" class="btn-secondary">取消</button>
+        <button type="submit" class="btn-primary">完成</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script defer src="newtab.js"></script>
+</body>
+</html>
+"#;
+
+const NTP_CSS: &str = r#":root {
+  --bg: #ffffff;
+  --fg: #202124;
+  --muted: #5f6368;
+  --surface: #ffffff;
+  --tile-bg: #f1f3f4;
+  --tile-hover: rgba(32, 33, 36, 0.08);
+  --shadow-search: 0 1px 6px rgba(32, 33, 36, 0.28);
+  --shadow-search-hover: 0 2px 10px rgba(32, 33, 36, 0.34);
+  --border-subtle: #dadce0;
+  --accent: #1a73e8;
+  --accent-fg: #ffffff;
+  --danger: #d93025;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #202124;
+    --fg: #e8eaed;
+    --muted: #9aa0a6;
+    --surface: #303134;
+    --tile-bg: #3c4043;
+    --tile-hover: rgba(232, 234, 237, 0.1);
+    --shadow-search: 0 1px 6px rgba(0, 0, 0, 0.45);
+    --shadow-search-hover: 0 2px 10px rgba(0, 0, 0, 0.55);
+    --border-subtle: #5f6368;
+    --accent: #8ab4f8;
+    --accent-fg: #202124;
+    --danger: #f28b82;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+  background-color: var(--bg);
+  color: var(--fg);
+  font-family: "Microsoft YaHei UI", "Segoe UI", system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.top-nav {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 18px;
+  padding: 16px 24px 0;
+  font-size: 13px;
+}
+
+.nav-link {
+  color: var(--fg);
+  text-decoration: none;
+  opacity: 0.88;
+}
+
+.nav-link:hover {
+  text-decoration: underline;
+  opacity: 1;
+}
+
+.ntp-main {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: clamp(54px, 11vh, 116px) 16px 40px;
+}
+
+.google-wordmark {
+  user-select: none;
+  font-family: "Product Sans", "Segoe UI", Arial, sans-serif;
+  font-size: clamp(56px, 8vw, 84px);
+  font-weight: 500;
+  line-height: 1.05;
+  letter-spacing: -2.2px;
+  margin-bottom: 28px;
+}
+
+.g-blue { color: #4285f4; }
+.g-red { color: #ea4335; }
+.g-yellow { color: #fbbc05; }
+.g-green { color: #34a853; }
+
+.search-form {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: min(561px, calc(100vw - 32px));
+  height: 46px;
+  padding: 0 8px 0 18px;
+  border-radius: 24px;
+  background-color: var(--surface);
+  box-shadow: var(--shadow-search);
+  transition: box-shadow 0.16s ease;
+}
+
+.search-form:hover,
+.search-form:focus-within {
+  box-shadow: var(--shadow-search-hover);
+}
+
+.search-icon {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  color: var(--muted);
+}
+
+.search-input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--fg);
+  font-size: 15px;
+  font-family: inherit;
+}
+
+.search-input::placeholder {
+  color: var(--muted);
+}
+
+.search-input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+}
+
+.search-submit-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background-color 0.14s ease, color 0.14s ease;
+}
+
+.search-submit-btn:hover {
+  background-color: var(--tile-hover);
+  color: var(--fg);
+}
+
+.shortcuts-grid {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px 4px;
+  width: min(576px, calc(100vw - 24px));
+  margin-top: 26px;
+}
+
+.tile-wrap {
+  position: relative;
+  width: 112px;
+  border-radius: 8px;
+  transition: background-color 0.14s ease;
+}
+
+.tile-wrap:hover {
+  background-color: var(--tile-hover);
+}
+
+.tile-link,
+.tile-add-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 100%;
+  padding: 14px 8px 12px;
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  text-decoration: none;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.tile-circle {
+  display: inline-grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background-color: var(--tile-bg);
+  margin-bottom: 12px;
+  font-size: 19px;
+  font-weight: 600;
+  color: #ffffff;
+}
+
+.tile-circle-add {
+  color: var(--fg);
+  font-size: 24px;
+  font-weight: 400;
+}
+
+.tile-title {
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+  font-size: 13px;
+  line-height: 1.3;
+}
+
+.tile-remove {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.14s ease, background-color 0.14s ease;
+}
+
+.tile-wrap:hover .tile-remove,
+.tile-wrap:focus-within .tile-remove {
+  opacity: 1;
+}
+
+.tile-remove:hover {
+  background-color: var(--tile-hover);
+  color: var(--fg);
+}
+
+.ntp-actions {
+  margin-top: 22px;
+}
+
+.reset-btn {
+  border: 1px solid var(--border-subtle);
+  border-radius: 16px;
+  background: transparent;
+  color: var(--muted);
+  padding: 5px 12px;
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  opacity: 0.72;
+  transition: opacity 0.14s ease, background-color 0.14s ease;
+}
+
+.reset-btn:hover {
+  opacity: 1;
+  background-color: var(--tile-hover);
+  color: var(--fg);
+}
+
+.shortcut-dialog {
+  width: min(360px, calc(100vw - 32px));
+  margin: auto;
+  padding: 20px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--fg);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.25);
+}
+
+.shortcut-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.42);
+}
+
+.dialog-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dialog-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.field input {
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 13px;
+  font-family: inherit;
+}
+
+.field input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.dialog-error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--danger);
+}
+
+.dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.btn-secondary,
+.btn-primary {
+  height: 32px;
+  padding: 0 14px;
+  border-radius: 16px;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.btn-secondary {
+  border: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--fg);
+}
+
+.btn-primary {
+  border: none;
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 500;
+}
+"#;
+
+const NTP_JS: &str = r##"(() => {
+  const STORAGE_KEY = "ng_ntp_shortcuts_v1";
+  const DEFAULT_SHORTCUTS = [
+    { title: "Google", url: "https://www.google.com/", color: "#4285f4" },
+    { title: "Gmail", url: "https://mail.google.com/", color: "#ea4335" },
+    { title: "Gemini", url: "https://gemini.google.com/app", color: "#8e24aa" },
+    { title: "Claude", url: "https://claude.ai/", color: "#d97706" },
+    { title: "ChatGPT", url: "https://chatgpt.com/", color: "#10a37f" },
+    { title: "YouTube", url: "https://www.youtube.com/", color: "#e53935" },
+    { title: "GitHub", url: "https://github.com/", color: "#24292f" },
+    { title: "IP 检测", url: "https://fuck-claude.vercel.app/", color: "#6d5bd0" }
+  ];
+  const PALETTE = ["#4285f4", "#ea4335", "#0f9d58", "#8e24aa", "#d97706", "#00897b", "#5c6bc0"];
+
+  const searchForm = document.getElementById("search-form");
+  const searchInput = document.getElementById("search-input");
+  const grid = document.getElementById("shortcuts-grid");
+  const resetBtn = document.getElementById("reset-shortcuts-btn");
+  const dialog = document.getElementById("add-shortcut-dialog");
+  const dialogForm = document.getElementById("add-shortcut-form");
+  const scName = document.getElementById("sc-name");
+  const scUrl = document.getElementById("sc-url");
+  const scError = document.getElementById("sc-error");
+  const scCancelBtn = document.getElementById("sc-cancel-btn");
+
+  function colorForText(s) {
+    let h = 0;
+    for (let i = 0; i < s.length; i += 1) {
+      h = (h * 31 + s.charCodeAt(i)) >>> 0;
+    }
+    return PALETTE[h % PALETTE.length];
+  }
+
+  function normalizeHttpUrl(raw) {
+    const trimmed = String(raw || "").trim();
+    if (!trimmed) return null;
+    const candidate = /^https?:\/\//i.test(trimmed) ? trimmed : "https://" + trimmed;
+    try {
+      const parsed = new URL(candidate);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return null;
+      }
+      return parsed.href;
+    } catch {
+      return null;
+    }
+  }
+
+  function resolveNavigationTarget(raw) {
+    const trimmed = String(raw || "").trim();
+    if (!trimmed) return null;
+    if (/^https?:\/\//i.test(trimmed)) {
+      try {
+        const parsed = new URL(trimmed);
+        if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+          return parsed.href;
+        }
+      } catch {
+        // Fall through to Google search
+      }
+    }
+    if (!/\s/.test(trimmed)) {
+      if (/^(localhost|(\d{1,3}\.){3}\d{1,3})(:\d{1,5})?(\/.*)?$/i.test(trimmed)) {
+        return "http://" + trimmed;
+      }
+      if (/^[a-z0-9-]+(\.[a-z0-9-]+)+(:\d{1,5})?(\/.*)?$/i.test(trimmed)) {
+        return "https://" + trimmed;
+      }
+    }
+    return "https://www.google.com/search?q=" + encodeURIComponent(trimmed);
+  }
+
+  function loadShortcuts() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return DEFAULT_SHORTCUTS.map((s) => Object.assign({}, s));
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) {
+        return DEFAULT_SHORTCUTS.map((s) => Object.assign({}, s));
+      }
+      return parsed.filter((item) => item && typeof item.title === "string" && normalizeHttpUrl(item.url));
+    } catch {
+      return DEFAULT_SHORTCUTS.map((s) => Object.assign({}, s));
+    }
+  }
+
+  function saveShortcuts(list) {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+    } catch {
+      // Ignore storage errors inside restricted contexts
+    }
+  }
+
+  function badgeLetter(title, url) {
+    const clean = String(title || "").trim();
+    if (clean) return Array.from(clean)[0].toUpperCase();
+    try {
+      const host = new URL(url).hostname.replace(/^www\./, "");
+      return (host[0] || "W").toUpperCase();
+    } catch {
+      return "W";
+    }
+  }
+
+  function renderShortcuts() {
+    const list = loadShortcuts();
+    grid.replaceChildren();
+
+    list.forEach((sc, index) => {
+      const wrap = document.createElement("div");
+      wrap.className = "tile-wrap";
+
+      const link = document.createElement("a");
+      link.className = "tile-link";
+      link.href = normalizeHttpUrl(sc.url) || "https://www.google.com/";
+      link.title = sc.title + " · " + link.href;
+
+      const circle = document.createElement("span");
+      circle.className = "tile-circle";
+      circle.style.backgroundColor = sc.color || colorForText(sc.title || link.href);
+      circle.textContent = badgeLetter(sc.title, link.href);
+
+      const label = document.createElement("span");
+      label.className = "tile-title";
+      label.textContent = sc.title;
+
+      link.appendChild(circle);
+      link.appendChild(label);
+
+      const removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.className = "tile-remove";
+      removeBtn.setAttribute("aria-label", "移除快捷方式 " + sc.title);
+      removeBtn.textContent = "×";
+      removeBtn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const next = loadShortcuts().filter((_, idx) => idx !== index);
+        saveShortcuts(next);
+        renderShortcuts();
+      });
+
+      wrap.appendChild(link);
+      wrap.appendChild(removeBtn);
+      grid.appendChild(wrap);
+    });
+
+    if (list.length < 16) {
+      const addWrap = document.createElement("div");
+      addWrap.className = "tile-wrap";
+
+      const addBtn = document.createElement("button");
+      addBtn.type = "button";
+      addBtn.className = "tile-add-btn";
+
+      const circle = document.createElement("span");
+      circle.className = "tile-circle tile-circle-add";
+      circle.textContent = "+";
+
+      const label = document.createElement("span");
+      label.className = "tile-title";
+      label.textContent = "添加快捷方式";
+
+      addBtn.appendChild(circle);
+      addBtn.appendChild(label);
+      addBtn.addEventListener("click", () => {
+        scName.value = "";
+        scUrl.value = "";
+        scError.hidden = true;
+        scError.textContent = "";
+        dialog.showModal();
+        scName.focus();
+      });
+
+      addWrap.appendChild(addBtn);
+      grid.appendChild(addWrap);
+    }
+  }
+
+  searchForm.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const target = resolveNavigationTarget(searchInput.value);
+    if (target) {
+      window.location.href = target;
+    }
+  });
+
+  scCancelBtn.addEventListener("click", () => {
+    dialog.close();
+  });
+
+  dialogForm.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const title = scName.value.trim();
+    const normalizedUrl = normalizeHttpUrl(scUrl.value);
+    if (!title) {
+      scError.textContent = "请输入快捷方式名称";
+      scError.hidden = false;
+      return;
+    }
+    if (!normalizedUrl) {
+      scError.textContent = "请输入有效的 http:// 或 https:// 网址";
+      scError.hidden = false;
+      return;
+    }
+    const list = loadShortcuts();
+    list.push({
+      title,
+      url: normalizedUrl,
+      color: colorForText(title)
+    });
+    saveShortcuts(list);
+    dialog.close();
+    renderShortcuts();
+  });
+
+  resetBtn.addEventListener("click", () => {
+    localStorage.removeItem(STORAGE_KEY);
+    renderShortcuts();
+  });
+
+  renderShortcuts();
+})();
+"##;
+
+pub fn write_chrome_newtab_extension_to(ext_dir: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(ext_dir).map_err(|e| format!("创建新标签页扩展目录失败: {e}"))?;
+    fs::write(ext_dir.join("manifest.json"), NTP_MANIFEST_JSON)
+        .map_err(|e| format!("写入新标签页 manifest.json 失败: {e}"))?;
+    fs::write(ext_dir.join("newtab.html"), NTP_HTML)
+        .map_err(|e| format!("写入 newtab.html 失败: {e}"))?;
+    fs::write(ext_dir.join("newtab.css"), NTP_CSS)
+        .map_err(|e| format!("写入 newtab.css 失败: {e}"))?;
+    fs::write(ext_dir.join("newtab.js"), NTP_JS)
+        .map_err(|e| format!("写入 newtab.js 失败: {e}"))?;
+    Ok(ext_dir.to_path_buf())
+}
+
+pub fn ensure_chrome_newtab_extension() -> Result<PathBuf, String> {
+    write_chrome_newtab_extension_to(&chrome_newtab_extension_dir())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_browser_launch_args(
+    is_fp: bool,
+    profile: &BrowserProfile,
+    profile_dir: &Path,
+    proxy_server_url: &str,
+    effective_tz: &str,
+    effective_locale: &str,
+    align_fingerprint: bool,
+    cws_ext_dir: Option<&Path>,
+    ntp_ext_dir: Option<&Path>,
+    legacy_ext_dir: Option<&Path>,
+    cdp_port: Option<u16>,
+    target_url: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        format!("--user-data-dir={}", profile_dir.display()),
+        format!("--proxy-server={proxy_server_url}"),
+        "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1 , EXCLUDE localhost , EXCLUDE ::1".to_string(),
+        "--force-webrtc-ip-handling-policy".to_string(),
+        "--webrtc-ip-handling-policy=disable_non_proxied_udp".to_string(),
+        "--disable-quic".to_string(),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--disable-sync".to_string(),
+        "--disable-background-networking".to_string(),
+        "--lang=zh-CN".to_string(),
+    ];
+
+    let should_align = matches!(
+        profile.fingerprint_mode,
+        BrowserFingerprintMode::IsolatedFingerprint
+    ) || align_fingerprint;
+
+    let clean_ua = profile
+        .fingerprint
+        .user_agent
+        .as_deref()
+        .map(|s| s.chars().filter(|c| !c.is_control()).collect::<String>())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if is_fp {
+        args.push("--disable-non-proxied-udp".to_string());
+        args.push("--extension-mime-request-handling=always-prompt-for-install".to_string());
+
+        if should_align {
+            let raw_seed = profile.fingerprint.noise_seed.trim();
+            let seed_src = if raw_seed.is_empty() {
+                profile.id.as_str()
+            } else {
+                raw_seed
+            };
+            let seed_num = compute_fingerprint_seed_u32(seed_src);
+            args.push(format!("--fingerprint={seed_num}"));
+            args.push("--fingerprint-platform=windows".to_string());
+            args.push("--fingerprint-brand=Chrome".to_string());
+            args.push(format!("--timezone={effective_tz}"));
+            args.push(format!(
+                "--accept-lang={}",
+                build_accept_languages(effective_locale)
+            ));
+
+            if matches!(profile.fingerprint_mode, BrowserFingerprintMode::CleanAlign) {
+                args.push("--disable-spoofing=font,audio,canvas,clientrects,gpu".to_string());
+            } else {
+                let hw = profile.fingerprint.hardware_concurrency.clamp(2, 64);
+                let sw = profile.fingerprint.screen_width.clamp(800, 3840);
+                let sh = profile.fingerprint.screen_height.clamp(600, 2160);
+                args.push(format!("--fingerprint-hardware-concurrency={hw}"));
+                args.push(format!("--window-size={sw},{sh}"));
+                if let Some(ua) = clean_ua {
+                    args.push(format!("--user-agent={ua}"));
+                }
+            }
+        }
+
+        let mut ext_paths: Vec<String> = Vec::new();
+        if let Some(cws) = cws_ext_dir {
+            ext_paths.push(cws.display().to_string());
+        }
+        if let Some(ntp) = ntp_ext_dir {
+            ext_paths.push(ntp.display().to_string());
+        }
+        if !ext_paths.is_empty() {
+            args.push("--disable-features=DisableLoadExtensionCommandLineSwitch".to_string());
+            args.push(format!("--load-extension={}", ext_paths.join(",")));
+        }
+    } else {
+        let mut ext_paths: Vec<String> = Vec::new();
+        if should_align {
+            if let Some(leg) = legacy_ext_dir {
+                ext_paths.push(leg.display().to_string());
+            }
+        }
+        if let Some(cws) = cws_ext_dir {
+            ext_paths.push(cws.display().to_string());
+            args.push("--extension-mime-request-handling=always-prompt-for-install".to_string());
+        }
+        if let Some(ntp) = ntp_ext_dir {
+            ext_paths.push(ntp.display().to_string());
+        }
+        if !ext_paths.is_empty() {
+            args.push("--disable-features=DisableLoadExtensionCommandLineSwitch".to_string());
+            args.push(format!("--load-extension={}", ext_paths.join(",")));
+        }
+        if matches!(
+            profile.fingerprint_mode,
+            BrowserFingerprintMode::IsolatedFingerprint
+        ) {
+            let sw = profile.fingerprint.screen_width.clamp(800, 3840);
+            let sh = profile.fingerprint.screen_height.clamp(600, 2160);
+            args.push(format!("--window-size={sw},{sh}"));
+            if let Some(ua) = clean_ua {
+                args.push(format!("--user-agent={ua}"));
+            }
+        }
+    }
+
+    if let Some(port) = cdp_port {
+        args.push(format!("--remote-debugging-port={port}"));
+        args.push("--remote-debugging-address=127.0.0.1".to_string());
+    }
+
+    args.push(target_url.to_string());
+    args
 }
 
 #[cfg(test)]
@@ -1536,6 +2847,232 @@ mod tests {
         }
         extract_chromium_zip_safe(&good_zip, &target).unwrap();
         assert!(target.join("chrome.exe").exists());
+
+        // 4. Flat archive without top-level folder keeps root files intact
+        let flat_zip = base.join("flat.zip");
+        {
+            let f = File::create(&flat_zip).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            zw.start_file("chrome.exe", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(b"MZ").unwrap();
+            zw.start_file("locales/zh-CN.pak", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(b"pak").unwrap();
+            zw.finish().unwrap();
+        }
+        let flat_target = base.join("out-flat");
+        extract_chromium_zip_safe(&flat_zip, &flat_target).unwrap();
+        assert!(flat_target.join("chrome.exe").exists());
+        assert!(flat_target.join("locales").join("zh-CN.pak").exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fingerprint_seed_and_accept_languages_are_deterministic() {
+        let s1 = compute_fingerprint_seed_u32("ng-seed-001");
+        let s2 = compute_fingerprint_seed_u32("ng-seed-001");
+        let s3 = compute_fingerprint_seed_u32("ng-seed-002");
+        assert_eq!(s1, s2);
+        assert_ne!(s1, s3);
+        assert!(s1 >= 1 && s1 <= i32::MAX as u32);
+        assert!(compute_fingerprint_seed_u32("") >= 1);
+
+        assert_eq!(build_accept_languages("en-US"), "en-US,en");
+        assert_eq!(build_accept_languages("ko-KR"), "ko-KR,ko,en-US,en");
+        assert_eq!(build_accept_languages("ja-JP"), "ja-JP,ja,en-US,en");
+    }
+
+    #[test]
+    fn allowed_fp_chromium_and_cws_urls_strictly_validate_repos() {
+        assert!(is_allowed_fp_chromium_url(FP_CHROMIUM_FALLBACK_URL));
+        assert!(is_allowed_cws_url(CWS_CRX_URL));
+        assert!(!is_allowed_fp_chromium_url(
+            "https://github.com/evil/repo/releases/download/1.0/x.zip"
+        ));
+        assert!(!is_allowed_fp_chromium_url("http://github.com/adryfish/fingerprint-chromium/releases/download/1/a.zip"));
+        assert!(!is_allowed_cws_url(
+            "https://example.com/Chromium.Web.Store.crx"
+        ));
+    }
+
+    #[test]
+    fn extract_crx3_safe_unpacks_valid_crx_and_rejects_bad_headers_and_traversal() {
+        let base = std::env::temp_dir().join("ng-crx3-sec-test");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let make_crx3 = |files: &[(&str, &[u8])]| -> Vec<u8> {
+            let mut zip_buf = Cursor::new(Vec::<u8>::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut zip_buf);
+                for (name, data) in files {
+                    zw.start_file(*name, zip::write::SimpleFileOptions::default())
+                        .unwrap();
+                    zw.write_all(data).unwrap();
+                }
+                zw.finish().unwrap();
+            }
+            let header = b"dummy-pb-header";
+            let mut out = Vec::new();
+            out.extend_from_slice(b"Cr24");
+            out.extend_from_slice(&3u32.to_le_bytes());
+            out.extend_from_slice(&(header.len() as u32).to_le_bytes());
+            out.extend_from_slice(header);
+            out.extend_from_slice(&zip_buf.into_inner());
+            out
+        };
+
+        let target = base.join("cws-out");
+        let valid_crx = make_crx3(&[
+            ("manifest.json", br#"{"manifest_version":3,"name":"CWS","version":"1.5.5.4"}"#),
+            ("scripts/inject.js", b"console.log('ok');"),
+        ]);
+        extract_crx3_safe(&valid_crx, &target).unwrap();
+        assert!(target.join("manifest.json").exists());
+        assert!(target.join("scripts").join("inject.js").exists());
+
+        // Reject bad magic
+        let mut bad_magic = valid_crx.clone();
+        bad_magic[0] = b'X';
+        assert!(extract_crx3_safe(&bad_magic, &target).is_err());
+
+        // Reject traversal inside CRX3 ZIP
+        let evil_crx = make_crx3(&[
+            ("manifest.json", br#"{"manifest_version":3}"#),
+            ("../pwn.js", b"alert(1)"),
+        ]);
+        assert!(extract_crx3_safe(&evil_crx, &base.join("evil-out")).is_err());
+        assert!(!base.join("pwn.js").exists());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn build_browser_launch_args_sets_native_fp_flags_and_chinese_ui() {
+        let prof_dir = PathBuf::from(r"C:\Temp\bp-test");
+        let cws_dir = PathBuf::from(r"C:\Temp\cws-ext");
+        let ntp_dir = PathBuf::from(r"C:\Temp\ntp-ext");
+        let legacy_dir = PathBuf::from(r"C:\Temp\legacy-ext");
+
+        let mut clean_profile = default_browser_profiles().into_iter().next().unwrap();
+        clean_profile.fingerprint_mode = BrowserFingerprintMode::CleanAlign;
+        clean_profile.fingerprint.noise_seed = "seed-claude-main".into();
+
+        let clean_args = build_browser_launch_args(
+            true,
+            &clean_profile,
+            &prof_dir,
+            "socks5://127.0.0.1:17891",
+            "Asia/Seoul",
+            "ko-KR",
+            true,
+            Some(&cws_dir),
+            Some(&ntp_dir),
+            None,
+            Some(19555),
+            "https://claude.ai",
+        );
+        assert!(clean_args.contains(&"--lang=zh-CN".to_string()));
+        assert!(clean_args.contains(
+            &"--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1 , EXCLUDE localhost , EXCLUDE ::1".to_string()
+        ));
+        assert!(clean_args.contains(&"--accept-lang=ko-KR,ko,en-US,en".to_string()));
+        assert!(clean_args.contains(&"--timezone=Asia/Seoul".to_string()));
+        assert!(clean_args.contains(&"--fingerprint-brand=Chrome".to_string()));
+        assert!(clean_args.contains(&"--fingerprint-platform=windows".to_string()));
+        assert!(clean_args.contains(&"--disable-non-proxied-udp".to_string()));
+        assert!(clean_args.contains(&"--disable-spoofing=font,audio,canvas,clientrects,gpu".to_string()));
+        assert!(clean_args.iter().any(|a| a.starts_with("--fingerprint=")));
+        assert!(clean_args.contains(&format!(
+            "--load-extension={},{}",
+            cws_dir.display(),
+            ntp_dir.display()
+        )));
+        assert!(clean_args.contains(&"--extension-mime-request-handling=always-prompt-for-install".to_string()));
+        assert!(clean_args.contains(&"--remote-debugging-port=19555".to_string()));
+        assert!(clean_args.contains(&"--remote-debugging-address=127.0.0.1".to_string()));
+
+        let mut iso_profile = clean_profile.clone();
+        iso_profile.id = "bp-jp-01".into();
+        iso_profile.fingerprint_mode = BrowserFingerprintMode::IsolatedFingerprint;
+        iso_profile.fingerprint.hardware_concurrency = 12;
+        iso_profile.fingerprint.screen_width = 1680;
+        iso_profile.fingerprint.screen_height = 1050;
+
+        let iso_args = build_browser_launch_args(
+            true,
+            &iso_profile,
+            &prof_dir,
+            "socks5://127.0.0.1:10808",
+            "Asia/Tokyo",
+            "ja-JP",
+            true,
+            Some(&cws_dir),
+            Some(&ntp_dir),
+            None,
+            None,
+            "https://accounts.google.com/",
+        );
+        assert!(!iso_args.iter().any(|a| a.starts_with("--disable-spoofing=")));
+        assert!(iso_args.contains(&"--fingerprint-hardware-concurrency=12".to_string()));
+        assert!(iso_args.contains(&"--window-size=1680,1050".to_string()));
+        assert!(iso_args.contains(&"--lang=zh-CN".to_string()));
+
+        // Legacy Chromium still uses Simplified Chinese UI + legacy align ext + CWS + NTP
+        let leg_args = build_browser_launch_args(
+            false,
+            &iso_profile,
+            &prof_dir,
+            "socks5://127.0.0.1:17891",
+            "Asia/Tokyo",
+            "ja-JP",
+            true,
+            Some(&cws_dir),
+            Some(&ntp_dir),
+            Some(&legacy_dir),
+            None,
+            "https://claude.ai",
+        );
+        assert!(leg_args.contains(&"--lang=zh-CN".to_string()));
+        assert!(!leg_args.iter().any(|a| a.starts_with("--fingerprint=")));
+        assert!(leg_args.contains(&format!(
+            "--load-extension={},{},{}",
+            legacy_dir.display(),
+            cws_dir.display(),
+            ntp_dir.display()
+        )));
+    }
+
+    #[test]
+    fn chrome_newtab_extension_writes_clean_zero_permission_mv3() {
+        let base = std::env::temp_dir().join(format!(
+            "ai-netguard-ntp-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let written = write_chrome_newtab_extension_to(&base).unwrap();
+        assert_eq!(written, base);
+
+        let manifest_raw = fs::read_to_string(base.join("manifest.json")).unwrap();
+        let manifest: Value = serde_json::from_str(&manifest_raw).unwrap();
+        assert_eq!(manifest["manifest_version"], json!(3));
+        assert_eq!(
+            manifest["chrome_url_overrides"]["newtab"],
+            json!("newtab.html")
+        );
+        assert!(manifest.get("permissions").is_none());
+        assert!(manifest.get("host_permissions").is_none());
+        assert!(manifest.get("content_scripts").is_none());
+
+        let html = fs::read_to_string(base.join("newtab.html")).unwrap();
+        assert!(!html.contains("<script>"));
+        assert!(html.contains(r#"<script defer src="newtab.js"></script>"#));
+        assert!(base.join("newtab.css").exists());
+        assert!(base.join("newtab.js").exists());
+
         let _ = fs::remove_dir_all(&base);
     }
 }

@@ -15,7 +15,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const CLASH_API_PORT: u16 = 17899;
+pub const CLASH_API_PORT: u16 = 17899;
 
 pub struct SingBoxManager {
     process: Option<SingBoxProcess>,

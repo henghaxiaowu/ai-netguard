@@ -1,6 +1,7 @@
 mod accounts;
 mod adspower;
 mod app_env;
+mod browser_cookies;
 mod healthcheck;
 mod ipc_client;
 mod launcher;
@@ -9,6 +10,7 @@ mod network;
 mod pac;
 mod singbox;
 mod uri_parser;
+mod url_router;
 
 use accounts::{
     default_env_presets, discover_clash_verge_nodes, load_accounts, load_env_presets,
@@ -34,7 +36,7 @@ use network::{
 };
 use pac::{PacServer, PAC_PORT};
 use singbox::{send_kill_switch_http, SingBoxManager};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{
@@ -55,6 +57,7 @@ struct InnerState {
     active_account_session: Option<ActiveAccountSession>,
     running_adspower_ids: HashSet<String>,
     extra_wfp_targets: Vec<ProtectedTarget>,
+    oauth_callback_ports: HashSet<u16>,
     manual_kill_switch: bool,
     starting_gateway: bool,
     active_nic_name: Option<String>,
@@ -75,6 +78,9 @@ pub struct AppState {
     inner: Mutex<InnerState>,
     accounts: Mutex<Vec<AccountRecord>>,
     account_envs: Mutex<Vec<AccountEnvPreset>>,
+    pending_url_picks: Mutex<VecDeque<url_router::PendingUrlPick>>,
+    url_route_history: Mutex<VecDeque<url_router::UrlRouteEvent>>,
+    cookie_op_lock: Arc<tokio::sync::Mutex<()>>,
     logs: Arc<LogBuffer>,
 }
 
@@ -111,6 +117,7 @@ impl AppState {
                 active_account_session: None,
                 running_adspower_ids: HashSet::new(),
                 extra_wfp_targets: Vec::new(),
+                oauth_callback_ports: HashSet::new(),
                 manual_kill_switch: false,
                 starting_gateway: false,
                 active_nic_name: None,
@@ -118,6 +125,9 @@ impl AppState {
             }),
             accounts: Mutex::new(accounts),
             account_envs: Mutex::new(account_envs),
+            pending_url_picks: Mutex::new(VecDeque::new()),
+            url_route_history: Mutex::new(VecDeque::new()),
+            cookie_op_lock: Arc::new(tokio::sync::Mutex::new(())),
             logs,
         }
     }
@@ -128,6 +138,10 @@ impl AppState {
 
     fn allowed_browser_ports(inner: &InnerState) -> Vec<u16> {
         let mut ports = Self::allowed_ports(&inner.config);
+        let probe_port = SingBoxManager::probe_port(&inner.config);
+        let is_internal_blocked =
+            |p: u16| p < 1024 || p == probe_port || p == singbox::CLASH_API_PORT;
+
         for &p in SingBoxManager::secondary_node_port_map(&inner.config).values() {
             if !ports.contains(&p) {
                 ports.push(p);
@@ -149,6 +163,14 @@ impl AppState {
                 ports.push(p);
             }
         }
+        if !is_internal_blocked(1455) && !ports.contains(&1455) {
+            ports.push(1455);
+        }
+        for &p in &inner.oauth_callback_ports {
+            if !is_internal_blocked(p) && !ports.contains(&p) {
+                ports.push(p);
+            }
+        }
         ports
     }
 
@@ -166,6 +188,7 @@ impl AppState {
                 exe_path: p.to_string_lossy().to_string(),
                 allow_private_lan: false,
                 allowed_loopback_ports: ports.clone(),
+                allowed_loopback_port_ranges: Vec::new(),
             })
             .collect()
     }
@@ -173,11 +196,12 @@ impl AppState {
     fn build_wfp_targets(inner: &InnerState) -> Vec<ProtectedTarget> {
         let browser_ports = Self::allowed_browser_ports(inner);
         let mut targets = Vec::new();
-        if let Some(browser) = inner.launcher.resolve_browser_path(&inner.config) {
+        for browser in inner.launcher.resolve_all_browser_wfp_paths(&inner.config) {
             targets.push(ProtectedTarget {
                 exe_path: browser.to_string_lossy().to_string(),
                 allow_private_lan: false,
-                allowed_loopback_ports: browser_ports,
+                allowed_loopback_ports: browser_ports.clone(),
+                allowed_loopback_port_ranges: vec![(49152, 65535)],
             });
         }
         targets.extend(Self::build_desktop_wfp_targets(inner, true));
@@ -198,6 +222,7 @@ impl AppState {
                             exe_path: exe_str,
                             allow_private_lan: false,
                             allowed_loopback_ports: vec![inner.config.cli_port],
+                            allowed_loopback_port_ranges: Vec::new(),
                         });
                     }
                 }
@@ -222,6 +247,7 @@ impl AppState {
             inner.running_adspower_ids.iter().cloned().collect();
         running_adspower_profiles.sort();
         let browser_path = inner.launcher.resolve_browser_path(&inner.config);
+        let fp_browser_path = inner.launcher.resolve_fp_browser_path();
         let desktop_path = inner.launcher.resolve_claude_desktop_path(&inner.config);
         let cli_found = inner.launcher.detect_claude_cli().is_some();
         let nic = detect_physical_nic();
@@ -256,6 +282,9 @@ impl AppState {
             browser_running,
             browser_installed: browser_path.is_some(),
             browser_path: browser_path.map(|p| p.to_string_lossy().to_string()),
+            fp_browser_installed: fp_browser_path.is_some(),
+            fp_browser_path: fp_browser_path.map(|p| p.to_string_lossy().to_string()),
+            web_store_ext_installed: launcher::is_web_store_ext_installed(),
             claude_desktop_found: desktop_path.is_some(),
             claude_desktop_path: desktop_path.map(|p| p.to_string_lossy().to_string()),
             claude_cli_found: cli_found,
@@ -687,8 +716,13 @@ async fn fix_diagnostic(state: State<'_, Arc<AppState>>, action: String) -> Resu
 
 #[tauri::command]
 async fn install_browser(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    let msg = download_and_install_browser(app, state.logs.clone()).await?;
-    // Refresh WFP rules if guard is already active so newly installed chrome.exe gets locked
+    let proxy_fallback = {
+        let mut inner = state.inner.lock().unwrap();
+        (inner.singbox.is_running() && !inner.singbox.is_blocked())
+            .then(|| format!("http://127.0.0.1:{}", inner.config.cli_port))
+    };
+    let msg = download_and_install_browser(app, proxy_fallback, state.logs.clone()).await?;
+    // Refresh WFP rules if guard is already active so newly installed browser binary gets locked
     let mut inner = state.inner.lock().unwrap();
     if inner.guard.is_connected() && inner.config.wfp_lock_enabled {
         let targets = AppState::build_wfp_targets(&inner);
@@ -707,11 +741,63 @@ fn launch_browser_url(state: State<'_, Arc<AppState>>, url: String) -> Result<St
     launch_browser_profile(state, "default".into(), Some(url))
 }
 
-#[tauri::command]
-fn launch_browser_profile(
-    state: State<'_, Arc<AppState>>,
-    profile_id: String,
-    url: Option<String>,
+fn loopback_port_from_parsed_url(parsed: &url::Url, blocked_ports: &[u16]) -> Option<u16> {
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let host = parsed
+        .host_str()
+        .map(|h| h.trim().trim_matches(['[', ']']).to_ascii_lowercase())?;
+    if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+        return None;
+    }
+    let port = parsed.port()?;
+    if port < 1024 || blocked_ports.contains(&port) {
+        return None;
+    }
+    Some(port)
+}
+
+fn extract_oauth_loopback_callback_port(raw_url: &str, blocked_ports: &[u16]) -> Option<u16> {
+    let parsed = url::Url::parse(raw_url.trim()).ok()?;
+    if let Some(p) = loopback_port_from_parsed_url(&parsed, blocked_ports) {
+        return Some(p);
+    }
+    for (k, v) in parsed.query_pairs() {
+        let key_lc = k.to_ascii_lowercase();
+        if key_lc == "redirect_uri" || key_lc == "callback" || key_lc == "callback_url" {
+            if let Ok(cb) = url::Url::parse(v.trim()) {
+                if let Some(p) = loopback_port_from_parsed_url(&cb, blocked_ports) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn record_oauth_callback_port_for_url(inner: &mut InnerState, raw_url: &str) -> bool {
+    let blocked = [
+        SingBoxManager::probe_port(&inner.config),
+        singbox::CLASH_API_PORT,
+    ];
+    let Some(port) = extract_oauth_loopback_callback_port(raw_url, &blocked) else {
+        return false;
+    };
+    if port >= 49152 || inner.oauth_callback_ports.contains(&port) {
+        return false;
+    }
+    if inner.oauth_callback_ports.len() >= 32 {
+        inner.oauth_callback_ports.clear();
+    }
+    inner.oauth_callback_ports.insert(port)
+}
+
+fn launch_profile_url_internal(
+    state: &Arc<AppState>,
+    profile_id: &str,
+    url: Option<&str>,
 ) -> Result<String, String> {
     let mut inner = state.inner.lock().unwrap();
     let profile: BrowserProfile = if let Some(found) = inner
@@ -840,16 +926,7 @@ fn launch_browser_profile(
         )
     };
 
-    if inner.config.wfp_lock_enabled {
-        inner.guard.ensure_started()?;
-        let targets = AppState::build_wfp_targets(&inner);
-        inner
-            .guard
-            .call(GuardRequest::ApplyWfpLock { targets })?;
-    }
-
     let target_url = url
-        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| {
@@ -857,6 +934,16 @@ fn launch_browser_profile(
             if hp.is_empty() { "https://claude.ai" } else { hp }
         })
         .to_string();
+
+    record_oauth_callback_port_for_url(&mut inner, &target_url);
+
+    if inner.config.wfp_lock_enabled {
+        inner.guard.ensure_started()?;
+        let targets = AppState::build_wfp_targets(&inner);
+        inner
+            .guard
+            .call(GuardRequest::ApplyWfpLock { targets })?;
+    }
 
     let cfg = inner.config.clone();
     inner.launcher.launch_browser_profile(
@@ -869,6 +956,15 @@ fn launch_browser_profile(
         &target_url,
         state.logs.clone(),
     )
+}
+
+#[tauri::command]
+fn launch_browser_profile(
+    state: State<'_, Arc<AppState>>,
+    profile_id: String,
+    url: Option<String>,
+) -> Result<String, String> {
+    launch_profile_url_internal(state.inner(), &profile_id, url.as_deref())
 }
 
 #[tauri::command]
@@ -886,6 +982,142 @@ fn close_browser_profile(
             .push(format!("已关闭浏览器环境窗口: {profile_id}"));
     }
     Ok(state.snapshot_status())
+}
+
+async fn run_profile_cookie_op(
+    state: &Arc<AppState>,
+    profile_id: &str,
+    op: browser_cookies::CookieOp,
+) -> Result<browser_cookies::CookieOpResult, String> {
+    let _guard = state.cookie_op_lock.lock().await;
+    let (cfg, profile, exe_path, profile_dir, live_cdp_port) = {
+        let mut inner = state.inner.lock().unwrap();
+        let profile = inner
+            .config
+            .browser_profiles
+            .iter()
+            .find(|p| p.id == profile_id)
+            .cloned()
+            .or_else(|| {
+                (profile_id == "default").then(|| default_browser_profiles().into_iter().next().unwrap())
+            })
+            .ok_or_else(|| format!("未找到浏览器环境配置: {profile_id}"))?;
+        let engine = inner
+            .launcher
+            .resolve_browser_engine(&inner.config)
+            .ok_or("未安装指纹浏览器内核，请先安装 Fingerprint-Chromium 150")?;
+        let is_fp = engine.is_fingerprint_chromium();
+        let exe_path = engine.exe_path().clone();
+        let (profile_dir, _) = launcher::profile_storage_dirs_for_engine(&profile.id, is_fp)?;
+        let live_cdp_port = inner.launcher.running_profile_cdp_port(&profile.id);
+        (
+            inner.config.clone(),
+            profile,
+            exe_path,
+            profile_dir,
+            live_cdp_port,
+        )
+    };
+
+    tokio::task::spawn_blocking(move || {
+        browser_cookies::execute_cookie_op_blocking(
+            &cfg,
+            &profile,
+            &exe_path,
+            &profile_dir,
+            live_cdp_port,
+            op,
+        )
+    })
+    .await
+    .map_err(|e| format!("Cookie 后台任务异常: {e}"))?
+}
+
+#[tauri::command]
+async fn get_profile_cookies(
+    state: State<'_, Arc<AppState>>,
+    profile_id: String,
+) -> Result<browser_cookies::ProfileCookiesSnapshot, String> {
+    match run_profile_cookie_op(state.inner(), &profile_id, browser_cookies::CookieOp::Get).await? {
+        browser_cookies::CookieOpResult::Snapshot(snap) => Ok(snap),
+        browser_cookies::CookieOpResult::Import(_) => unreachable!(),
+    }
+}
+
+#[tauri::command]
+async fn import_profile_cookies(
+    state: State<'_, Arc<AppState>>,
+    profile_id: String,
+    raw_text: String,
+    replace_existing: bool,
+) -> Result<browser_cookies::CookieImportOutcome, String> {
+    let outcome = match run_profile_cookie_op(
+        state.inner(),
+        &profile_id,
+        browser_cookies::CookieOp::Import {
+            raw_text,
+            replace_existing,
+        },
+    )
+    .await?
+    {
+        browser_cookies::CookieOpResult::Import(out) => out,
+        browser_cookies::CookieOpResult::Snapshot(_) => unreachable!(),
+    };
+    state.logs.push(format!(
+        "[Cookie 管理] 环境 [{}] 已{}导入 {} 条 Cookie（{}）",
+        profile_id,
+        if replace_existing { "覆盖" } else { "合并" },
+        outcome.imported_count,
+        if outcome.live_mode { "实时写入" } else { "离线写入" }
+    ));
+    Ok(outcome)
+}
+
+#[tauri::command]
+async fn delete_profile_cookies(
+    state: State<'_, Arc<AppState>>,
+    profile_id: String,
+    targets: Vec<browser_cookies::CookieDeleteTarget>,
+) -> Result<browser_cookies::ProfileCookiesSnapshot, String> {
+    let del_len = targets.len();
+    let snap = match run_profile_cookie_op(
+        state.inner(),
+        &profile_id,
+        browser_cookies::CookieOp::Delete { targets },
+    )
+    .await?
+    {
+        browser_cookies::CookieOpResult::Snapshot(snap) => snap,
+        browser_cookies::CookieOpResult::Import(_) => unreachable!(),
+    };
+    state.logs.push(format!(
+        "[Cookie 管理] 环境 [{}] 已删除 {del_len} 条 Cookie 规则",
+        profile_id
+    ));
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn clear_profile_cookies(
+    state: State<'_, Arc<AppState>>,
+    profile_id: String,
+) -> Result<browser_cookies::ProfileCookiesSnapshot, String> {
+    let snap = match run_profile_cookie_op(
+        state.inner(),
+        &profile_id,
+        browser_cookies::CookieOp::Clear,
+    )
+    .await?
+    {
+        browser_cookies::CookieOpResult::Snapshot(snap) => snap,
+        browser_cookies::CookieOpResult::Import(_) => unreachable!(),
+    };
+    state.logs.push(format!(
+        "[Cookie 管理] 环境 [{}] 已清空全部 Cookie",
+        profile_id
+    ));
+    Ok(snap)
 }
 
 #[tauri::command]
@@ -911,6 +1143,65 @@ async fn probe_node_exit(
     probe_exit_ip(probe_port).await
 }
 
+pub fn normalize_loopback_proxy_url_for_probe(raw: &str) -> Result<(String, String), String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("代理地址不能为空且不能包含空白或控制字符".into());
+    }
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    let parsed = url::Url::parse(&with_scheme)
+        .map_err(|e| format!("代理地址格式无效 ({trimmed}): {e}"))?;
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https" | "socks5" | "socks5h") {
+        return Err(format!(
+            "仅支持 http:// / https:// / socks5:// 本地代理，收到: {scheme}"
+        ));
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || (parsed.path() != "" && parsed.path() != "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("代理地址仅允许 protocol://127.0.0.1:port 格式".into());
+    }
+    let host = parsed
+        .host_str()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if host != "127.0.0.1" && host != "localhost" {
+        return Err(format!(
+            "出于防 SSRF 安全限制，仅允许探测本机回环代理 (127.0.0.1 / localhost)，拒绝: {host}"
+        ));
+    }
+    let port = parsed
+        .port()
+        .filter(|&p| p > 1024)
+        .ok_or_else(|| "代理端口必须为大于 1024 的有效本地端口".to_string())?;
+    let host_port = format!("{host}:{port}");
+    let normalized_scheme = if scheme == "socks5" {
+        "socks5h"
+    } else {
+        scheme.as_str()
+    };
+    Ok((host_port, format!("{normalized_scheme}://{host}:{port}")))
+}
+
+#[tauri::command]
+async fn probe_proxy_exit(proxy_url: String) -> Result<ExitIpInfo, String> {
+    let (host_port, probe_url) = normalize_loopback_proxy_url_for_probe(&proxy_url)?;
+    if !app_env::is_tcp_host_port_alive(&host_port) {
+        return Err(format!(
+            "本地代理端口 {host_port} 未在监听，请先启动 Clash Verge 或对应代理"
+        ));
+    }
+    probe_exit_ip_via_proxy(&probe_url).await
+}
+
 #[derive(Clone, Debug)]
 struct ResolvedAccountProxy {
     node_source: String,
@@ -932,6 +1223,71 @@ struct AccountLaunchOutcome {
     session: ActiveAccountSession,
 }
 
+fn resolve_netguard_node_proxy(
+    cfg: &AppConfig,
+    target_id: Option<&str>,
+    fallback_name: Option<&str>,
+    gateway_running: bool,
+    gateway_starting: bool,
+    gateway_blocked: bool,
+    active_secondary_ports: &BTreeMap<String, u16>,
+    context_label: &str,
+) -> Result<ResolvedAccountProxy, String> {
+    if !gateway_running {
+        return Err(format!(
+            "{context_label}绑定了 AI NetGuard 节点，但安全网关尚未启动，已拒绝拉起"
+        ));
+    }
+    if gateway_starting {
+        return Err("AI NetGuard 安全网关正在启动中，请稍候再试".into());
+    }
+    let clean_id = target_id.map(str::trim).filter(|s| !s.is_empty());
+    let node = clean_id
+        .and_then(|id| cfg.nodes.iter().find(|n| n.id == id))
+        .or_else(|| {
+            fallback_name
+                .map(str::trim)
+                .and_then(|name| cfg.nodes.iter().find(|n| n.name == name))
+        })
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "未在 AI NetGuard 节点列表找到绑定的节点（{}）",
+                fallback_name.or(clean_id).unwrap_or("未知")
+            )
+        })?;
+
+    let port = if node.id == cfg.active_node_id {
+        if gateway_blocked {
+            return Err(format!(
+                "安全主节点 [{}] 当前处于 Fail-Closed 熔断阻断状态，已拒绝拉起防泄漏保护",
+                node.name
+            ));
+        }
+        cfg.browser_port
+    } else {
+        active_secondary_ports
+            .get(&node.id)
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "备用节点 [{}] 尚未分配本地端口（请保存配置并重启网关后再拉起）",
+                    node.name
+                )
+            })?
+    };
+
+    Ok(ResolvedAccountProxy {
+        node_source: "netguard".into(),
+        node_name: node.name.clone(),
+        local_port: port,
+        http_proxy_url: format!("http://127.0.0.1:{port}"),
+        browser_proxy_url: format!("socks5://127.0.0.1:{port}"),
+        probe_proxy_url: format!("socks5h://127.0.0.1:{port}"),
+        netguard_node: Some(node),
+    })
+}
+
 fn resolve_account_proxy_target(
     account: &AccountRecord,
     cfg: &AppConfig,
@@ -942,72 +1298,79 @@ fn resolve_account_proxy_target(
     clash: &ClashVergeNodesSnapshot,
 ) -> Result<ResolvedAccountProxy, String> {
     match account.linked_node_source {
-        AccountNodeSource::None => Err(
-            "该账号尚未绑定出口节点，为防止默认系统代理造成 IP 污染已拒绝启动；请先点击「编辑」绑定节点".into(),
-        ),
-        AccountNodeSource::Netguard => {
-            if !gateway_running {
-                return Err("该账号绑定了 AI NetGuard 节点，但安全网关尚未启动，已拒绝拉起".into());
-            }
-            if gateway_starting {
-                return Err("AI NetGuard 安全网关正在启动中，请稍候再试".into());
-            }
-            let target_id = account
-                .linked_node_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            let node = target_id
-                .and_then(|id| cfg.nodes.iter().find(|n| n.id == id))
-                .or_else(|| {
-                    account
-                        .linked_node_name
-                        .as_deref()
-                        .map(str::trim)
-                        .and_then(|name| cfg.nodes.iter().find(|n| n.name == name))
-                })
-                .cloned()
-                .ok_or_else(|| {
-                    format!(
-                        "未在 AI NetGuard 节点列表找到账号绑定的节点（{}）",
-                        account
-                            .linked_node_name
+        AccountNodeSource::None => {
+            if account.browser_kind == AccountBrowserKind::Netguard {
+                if let Some(pid) = account
+                    .linked_browser_profile_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if let Some(bp) = cfg.browser_profiles.iter().find(|p| p.id == pid) {
+                        if let Some(custom_url) = bp
+                            .custom_proxy_url
                             .as_deref()
-                            .or(target_id)
-                            .unwrap_or("未知")
-                    )
-                })?;
-
-            let port = if node.id == cfg.active_node_id {
-                if gateway_blocked {
-                    return Err(format!(
-                        "安全主节点 [{}] 当前处于 Fail-Closed 熔断阻断状态，已拒绝拉起防泄漏保护",
-                        node.name
-                    ));
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            let hp = app_env::extract_proxy_host_port(custom_url)
+                                .ok_or_else(|| format!("指纹环境 [{}] 代理地址无效: {custom_url}", bp.name))?;
+                            let port = extract_loopback_port(custom_url)
+                                .or_else(|| hp.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()))
+                                .unwrap_or(0);
+                            let full_url = if custom_url.contains("://") {
+                                custom_url.to_string()
+                            } else {
+                                format!("socks5://{hp}")
+                            };
+                            let probe_url = if let Some(rest) = full_url.strip_prefix("socks5://") {
+                                format!("socks5h://{rest}")
+                            } else {
+                                full_url.clone()
+                            };
+                            return Ok(ResolvedAccountProxy {
+                                node_source: "browser_profile".into(),
+                                node_name: format!("指纹环境 · {}", bp.name),
+                                local_port: port,
+                                http_proxy_url: full_url.clone(),
+                                browser_proxy_url: full_url,
+                                probe_proxy_url: probe_url,
+                                netguard_node: None,
+                            });
+                        }
+                        let target_node_id = bp
+                            .node_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(cfg.active_node_id.as_str());
+                        return resolve_netguard_node_proxy(
+                            cfg,
+                            Some(target_node_id),
+                            None,
+                            gateway_running,
+                            gateway_starting,
+                            gateway_blocked,
+                            active_secondary_ports,
+                            &format!("指纹环境 [{}]", bp.name),
+                        );
+                    }
                 }
-                cfg.browser_port
-            } else {
-                active_secondary_ports
-                    .get(&node.id)
-                    .copied()
-                    .ok_or_else(|| {
-                        format!(
-                            "备用节点 [{}] 尚未分配本地端口（请保存配置并重启网关后再拉起）",
-                            node.name
-                        )
-                    })?
-            };
-
-            Ok(ResolvedAccountProxy {
-                node_source: "netguard".into(),
-                node_name: node.name.clone(),
-                local_port: port,
-                http_proxy_url: format!("http://127.0.0.1:{port}"),
-                browser_proxy_url: format!("socks5://127.0.0.1:{port}"),
-                probe_proxy_url: format!("socks5h://127.0.0.1:{port}"),
-                netguard_node: Some(node),
-            })
+            }
+            Err(
+                "该账号尚未绑定出口节点（且未关联已有指纹浏览器环境），为防止默认系统代理造成 IP 污染已拒绝启动；请先点击「编辑」绑定节点或指纹环境".into(),
+            )
         }
+        AccountNodeSource::Netguard => resolve_netguard_node_proxy(
+            cfg,
+            account.linked_node_id.as_deref(),
+            account.linked_node_name.as_deref(),
+            gateway_running,
+            gateway_starting,
+            gateway_blocked,
+            active_secondary_ports,
+            "该账号",
+        ),
         AccountNodeSource::ClashVerge => {
             let node_name = account
                 .linked_node_name
@@ -1406,7 +1769,7 @@ async fn launch_account_browser(
             .lock()
             .map_err(|_| "账号库状态锁定失败".to_string())?;
 
-        let (fallback_tz, fallback_loc) =
+        let (fallback_tz, _fallback_loc) =
             infer_locale_for_country(verified_exit.country_code.as_deref());
         let resolved_tz = resolved
             .netguard_node
@@ -1424,14 +1787,7 @@ async fn launch_account_browser(
                     .map(str::to_string)
             })
             .unwrap_or_else(|| fallback_tz.to_string());
-        let resolved_loc = resolved
-            .netguard_node
-            .as_ref()
-            .and_then(|n| n.locale.as_deref())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| fallback_loc.to_string());
+        let resolved_loc = "en-US".to_string();
 
         let requested_profile_id = account
             .linked_browser_profile_id
@@ -1452,21 +1808,46 @@ async fn launch_account_browser(
         let profile = if let Some(idx) = existing_idx {
             let mut prof = inner.config.browser_profiles[idx].clone();
             if prof.id.starts_with("bp-acc-") {
-                let desired_node_id = resolved.netguard_node.as_ref().map(|n| n.id.clone());
-                let desired_custom_proxy = if resolved.netguard_node.is_none() {
-                    Some(resolved.browser_proxy_url.clone())
-                } else {
-                    None
-                };
-                if prof.node_id != desired_node_id
-                    || prof.custom_proxy_url != desired_custom_proxy
-                    || prof.fingerprint.timezone.as_deref() != Some(resolved_tz.as_str())
-                    || prof.fingerprint.locale.as_deref() != Some(resolved_loc.as_str())
+                let mut touched = false;
+                if account.linked_node_source != AccountNodeSource::None {
+                    let desired_node_id = resolved.netguard_node.as_ref().map(|n| n.id.clone());
+                    let desired_custom_proxy = if resolved.netguard_node.is_none() {
+                        Some(resolved.browser_proxy_url.clone())
+                    } else {
+                        None
+                    };
+                    if prof.node_id != desired_node_id || prof.custom_proxy_url != desired_custom_proxy {
+                        prof.node_id = desired_node_id;
+                        prof.custom_proxy_url = desired_custom_proxy;
+                        touched = true;
+                    }
+                    if prof.fingerprint.timezone.as_deref() != Some(resolved_tz.as_str()) {
+                        prof.fingerprint.timezone = Some(resolved_tz.clone());
+                        touched = true;
+                    }
+                } else if prof
+                    .fingerprint
+                    .timezone
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
                 {
-                    prof.node_id = desired_node_id;
-                    prof.custom_proxy_url = desired_custom_proxy;
                     prof.fingerprint.timezone = Some(resolved_tz.clone());
+                    touched = true;
+                }
+                if prof
+                    .fingerprint
+                    .locale
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
                     prof.fingerprint.locale = Some(resolved_loc.clone());
+                    touched = true;
+                }
+                if touched {
                     inner.config.browser_profiles[idx] = prof.clone();
                     cfg_changed = true;
                 }
@@ -1539,6 +1920,18 @@ async fn launch_account_browser(
             save_config_to_disk(&inner.config)?;
         }
 
+        let target_url = url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                let hp = profile.homepage.trim();
+                if hp.is_empty() { "https://accounts.google.com/" } else { hp }
+            })
+            .to_string();
+
+        record_oauth_callback_port_for_url(&mut inner, &target_url);
+
         if inner.config.wfp_lock_enabled && inner.guard.is_connected() {
             let targets = AppState::build_wfp_targets(&inner);
             inner
@@ -1562,15 +1955,6 @@ async fn launch_account_browser(
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| resolved_loc.clone());
-        let target_url = url
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| {
-                let hp = profile.homepage.trim();
-                if hp.is_empty() { "https://accounts.google.com/" } else { hp }
-            })
-            .to_string();
 
         let cfg_clone = inner.config.clone();
         let launch_msg = inner.launcher.launch_browser_profile(
@@ -1751,6 +2135,285 @@ async fn close_adspower_profile(
     Ok(state.snapshot_status())
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingUrlPickPayload {
+    pick: url_router::PendingUrlPick,
+    remaining_count: usize,
+}
+
+fn record_url_route_event(
+    state: &Arc<AppState>,
+    pick: &url_router::PendingUrlPick,
+    action: &str,
+    target: &str,
+) {
+    let ev = url_router::UrlRouteEvent {
+        time: chrono::Local::now().format("%H:%M:%S").to_string(),
+        host: pick.host.clone(),
+        display_url: pick.display_url.clone(),
+        action: action.to_string(),
+        target: target.to_string(),
+    };
+    if let Ok(mut hist) = state.url_route_history.lock() {
+        hist.push_front(ev);
+        hist.truncate(40);
+    }
+    state.logs.push(format!(
+        "[链接分流] {} ({}) -> {} [{}]",
+        pick.display_url, pick.host, target, action
+    ));
+}
+
+fn show_url_picker_window(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    pick: url_router::PendingUrlPick,
+) {
+    if let Ok(mut q) = state.pending_url_picks.lock() {
+        if !q.front().is_some_and(|cur| cur.url == pick.url) {
+            if q.len() >= 16 {
+                q.pop_back();
+            }
+            q.push_back(pick);
+        }
+    }
+
+    if let Some(w) = app.get_webview_window("url-picker") {
+        let _ = w.center();
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+        let _ = app.emit("url-picker-updated", ());
+    } else {
+        // Fallback if window was destroyed: create on an off-UI thread to avoid Windows WebView2 COM deadlock.
+        let app_clone = app.clone();
+        std::thread::spawn(move || {
+            if let Ok(win) = tauri::WebviewWindowBuilder::new(
+                &app_clone,
+                "url-picker",
+                tauri::WebviewUrl::App("index.html?mode=url-picker".into()),
+            )
+            .title("AI NetGuard — 选择打开环境")
+            .inner_size(520.0, 580.0)
+            .min_inner_size(440.0, 480.0)
+            .center()
+            .always_on_top(true)
+            .resizable(true)
+            .build()
+            {
+                let _ = win.set_focus();
+            }
+            let _ = app_clone.emit("url-picker-updated", ());
+        });
+    }
+}
+
+#[tauri::command]
+fn get_url_router_status(state: State<'_, Arc<AppState>>) -> url_router::UrlRouterStatus {
+    let inner = state.inner.lock().unwrap();
+    url_router::inspect_router_status(&inner.config.url_router)
+}
+
+#[tauri::command]
+fn register_url_router(
+    state: State<'_, Arc<AppState>>,
+) -> Result<url_router::UrlRouterStatus, String> {
+    let msg = url_router::register_as_windows_browser()?;
+    state.logs.push(format!("[链接分流] {msg}"));
+    let inner = state.inner.lock().unwrap();
+    Ok(url_router::inspect_router_status(&inner.config.url_router))
+}
+
+#[tauri::command]
+fn unregister_url_router(
+    state: State<'_, Arc<AppState>>,
+) -> Result<url_router::UrlRouterStatus, String> {
+    let msg = url_router::unregister_from_windows_browser()?;
+    state.logs.push(format!("[链接分流] {msg}"));
+    let inner = state.inner.lock().unwrap();
+    Ok(url_router::inspect_router_status(&inner.config.url_router))
+}
+
+#[tauri::command]
+fn open_default_apps_settings() -> Result<(), String> {
+    url_router::open_windows_default_apps_settings()
+}
+
+#[tauri::command]
+fn list_url_route_history(state: State<'_, Arc<AppState>>) -> Vec<url_router::UrlRouteEvent> {
+    state
+        .url_route_history
+        .lock()
+        .map(|g| g.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+async fn test_url_router_picker(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    url: String,
+) -> Result<(), String> {
+    let parsed = url_router::validate_routable_url(&url)?;
+    let pick = url_router::build_pending_pick(&parsed, "手动测试分流弹窗");
+    show_url_picker_window(&app, state.inner(), pick);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_pending_url_pick(state: State<'_, Arc<AppState>>) -> Option<PendingUrlPickPayload> {
+    let q = state.pending_url_picks.lock().ok()?;
+    let front = q.front()?.clone();
+    Some(PendingUrlPickPayload {
+        pick: front,
+        remaining_count: q.len().saturating_sub(1),
+    })
+}
+
+#[tauri::command]
+async fn resolve_url_pick(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    pick_id: String,
+    action: String,
+    adspower_user_id: Option<String>,
+    adspower_serial_number: Option<String>,
+    adspower_profile_name: Option<String>,
+    browser_profile_id: Option<String>,
+    add_edge_bypass_host: Option<bool>,
+) -> Result<String, String> {
+    let pick = {
+        let q = state
+            .pending_url_picks
+            .lock()
+            .map_err(|_| "链接队列锁定失败".to_string())?;
+        q.iter()
+            .find(|p| p.id == pick_id)
+            .cloned()
+            .or_else(|| q.front().cloned())
+            .ok_or_else(|| "当前没有待处理的链接请求".to_string())?
+    };
+
+    let outcome_msg = if action == "cancel" {
+        "已取消".to_string()
+    } else if action == "copied" {
+        record_url_route_event(&state, &pick, "已复制链接", "剪贴板");
+        "已复制链接到剪贴板".to_string()
+    } else {
+        let parsed = url_router::validate_routable_url(&pick.url)?;
+        match action.as_str() {
+            "adspower" => {
+                let settings = adspower::load_settings()?;
+                let clean_uid = adspower_user_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let clean_sn = adspower_serial_number
+                    .as_deref()
+                    .map(|s| s.trim().trim_start_matches('#').trim())
+                    .filter(|s| !s.is_empty());
+                adspower::open_url_in_browser(&settings, clean_uid, clean_sn, parsed.as_str())
+                    .await?;
+                if let Some(track_key) = clean_uid.or(clean_sn) {
+                    if let Ok(mut inner) = state.inner.lock() {
+                        inner.running_adspower_ids.insert(track_key.to_string());
+                    }
+                }
+                let target_label = adspower_profile_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| clean_sn.map(|s| format!("#{s}")))
+                    .or_else(|| clean_uid.map(str::to_string))
+                    .unwrap_or_else(|| "AdsPower".into());
+                record_url_route_event(&state, &pick, "AdsPower 打开", &target_label);
+                format!("已在 AdsPower 环境 [{target_label}] 打开页面")
+            }
+            "netguard_browser" => {
+                let pid = browser_profile_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("default");
+                let msg = launch_profile_url_internal(state.inner(), pid, Some(parsed.as_str()))?;
+                let target_label = {
+                    let inner = state.inner.lock().unwrap();
+                    inner
+                        .config
+                        .browser_profiles
+                        .iter()
+                        .find(|b| b.id == pid)
+                        .map(|b| b.name.clone())
+                        .unwrap_or_else(|| pid.to_string())
+                };
+                record_url_route_event(&state, &pick, "NetGuard 浏览器", &target_label);
+                msg
+            }
+            "edge" | "edge_and_allow_domain" => {
+                let allow_domain =
+                    action == "edge_and_allow_domain" || add_edge_bypass_host.unwrap_or(false);
+                let router_cfg = {
+                    let mut inner = state.inner.lock().unwrap();
+                    if allow_domain {
+                        let host_norm = pick.host.trim().to_ascii_lowercase();
+                        if !host_norm.is_empty()
+                            && !inner
+                                .config
+                                .url_router
+                                .edge_bypass_domains
+                                .iter()
+                                .any(|d| d.eq_ignore_ascii_case(&host_norm))
+                        {
+                            inner.config.url_router.edge_bypass_domains.push(host_norm);
+                            save_config_to_disk(&inner.config)?;
+                        }
+                    }
+                    inner.config.url_router.clone()
+                };
+                let target_name = url_router::open_url_in_fallback_browser(&parsed, &router_cfg)?;
+                record_url_route_event(
+                    &state,
+                    &pick,
+                    if allow_domain {
+                        "Edge 直通（已加白名单）"
+                    } else {
+                        "临时转交 Edge"
+                    },
+                    &target_name,
+                );
+                if allow_domain {
+                    format!("已将 {} 加入 Edge 直通白名单并打开", pick.host)
+                } else {
+                    format!("已转交 {target_name} 打开")
+                }
+            }
+            _ => return Err(format!("未知的分流操作: {action}")),
+        }
+    };
+
+    let has_more = if let Ok(mut q) = state.pending_url_picks.lock() {
+        if let Some(pos) = q.iter().position(|p| p.id == pick.id) {
+            q.remove(pos);
+        } else {
+            q.pop_front();
+        }
+        !q.is_empty()
+    } else {
+        false
+    };
+
+    if has_more {
+        let _ = app.emit("url-picker-updated", ());
+    } else if let Some(w) = app.get_webview_window("url-picker") {
+        let _ = w.hide();
+    }
+    let _ = app.emit("gateway-status-updated", state.snapshot_status());
+
+    Ok(outcome_msg)
+}
+
 #[tauri::command]
 async fn toggle_kill_switch(
     state: State<'_, Arc<AppState>>,
@@ -1858,6 +2521,7 @@ fn launch_claude_terminal(
                 exe_path: shim_str,
                 allow_private_lan: true,
                 allowed_loopback_ports: cli_ports,
+                allowed_loopback_port_ranges: Vec::new(),
             });
         }
         inner.guard.ensure_started()?;
@@ -2452,6 +3116,13 @@ pub fn run() {
         std::process::exit(exit_code);
     }
 
+    // Sub-20ms headless fast-path for default browser URL router: `--open-url <url>`
+    let boot_pick = match url_router::try_handle_cli_open_url() {
+        url_router::UrlCliOutcome::NotUrlInvocation => None,
+        url_router::UrlCliOutcome::HandledAndExit(code) => std::process::exit(code),
+        url_router::UrlCliOutcome::BootWithPicker(pick) => Some(pick),
+    };
+
     let _single_instance = unsafe {
         use windows::core::w;
         use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
@@ -2461,6 +3132,10 @@ pub fn run() {
         };
         let mutex = CreateMutexW(None, false, w!("Local\\AI-NetGuard-SingleInstance"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            if let Some(ref pick) = boot_pick {
+                let _ = url_router::try_dispatch_to_running_instance(pick, 3000);
+                return;
+            }
             if let Ok(hwnd) = FindWindowW(
                 None,
                 w!("AI NetGuard — 本地零泄漏 AI 安全网关"),
@@ -2506,6 +3181,7 @@ pub fn run() {
                             inner.guard.try_shutdown();
                             inner.singbox.stop();
                         }
+                        url_router::cleanup_ipc_file();
                         app.exit(0);
                     }
                     _ => {}
@@ -2526,11 +3202,29 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            let state_ipc = state_for_setup.clone();
+            let app_ipc = app.handle().clone();
+            url_router::start_ipc_server(move |pick| {
+                show_url_picker_window(&app_ipc, &state_ipc, pick);
+            });
+
+            if let Some(pick) = boot_pick {
+                if let Some(main_win) = app.get_webview_window("main") {
+                    let _ = main_win.hide();
+                }
+                show_url_picker_window(app.handle(), &state_for_setup, pick);
+            }
+
             spawn_monitor_loop(app.handle().clone(), state_for_setup);
             Ok(())
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "url-picker" {
+                    if let Ok(mut q) = window.state::<Arc<AppState>>().pending_url_picks.lock() {
+                        q.pop_front();
+                    }
+                }
                 let _ = window.hide();
                 api.prevent_close();
             }
@@ -2551,7 +3245,12 @@ pub fn run() {
             launch_browser_url,
             launch_browser_profile,
             close_browser_profile,
+            get_profile_cookies,
+            import_profile_cookies,
+            delete_profile_cookies,
+            clear_profile_cookies,
             probe_node_exit,
+            probe_proxy_exit,
             launch_account_browser,
             clear_active_account_session,
             toggle_kill_switch,
@@ -2576,6 +3275,14 @@ pub fn run() {
             test_adspower_connection,
             list_adspower_profiles,
             close_adspower_profile,
+            get_url_router_status,
+            register_url_router,
+            unregister_url_router,
+            open_default_apps_settings,
+            list_url_route_history,
+            test_url_router_picker,
+            get_pending_url_pick,
+            resolve_url_pick,
             clear_logs,
         ])
         .run(tauri::generate_context!())
@@ -2693,6 +3400,7 @@ mod tests {
             active_account_session: None,
             running_adspower_ids: HashSet::new(),
             extra_wfp_targets: Vec::new(),
+            oauth_callback_ports: HashSet::new(),
             manual_kill_switch: false,
             starting_gateway: false,
             active_nic_name: None,
@@ -2702,10 +3410,19 @@ mod tests {
         let browser_ports = AppState::allowed_browser_ports(&inner);
         assert!(browser_ports.contains(&17901));
         assert!(browser_ports.contains(&10809));
+        assert!(browser_ports.contains(&1455));
         assert!(browser_ports.contains(&cfg.browser_port));
 
         let desktop_targets = AppState::build_desktop_wfp_targets(&inner, true);
         for dt in desktop_targets {
+            assert!(
+                dt.allowed_loopback_port_ranges.is_empty(),
+                "claude.exe must never receive ephemeral loopback port ranges"
+            );
+            assert!(
+                !dt.allowed_loopback_ports.contains(&1455),
+                "claude.exe must never receive Codex OAuth port 1455"
+            );
             assert!(
                 !dt.allowed_loopback_ports.contains(&17901),
                 "claude.exe must never receive secondary browser port 17901"
@@ -2716,6 +3433,49 @@ mod tests {
             );
             assert!(dt.allowed_loopback_ports.contains(&cfg.browser_port));
         }
+
+        let wfp_targets = AppState::build_wfp_targets(&inner);
+        let browser_target_count = inner
+            .launcher
+            .resolve_all_browser_wfp_paths(&inner.config)
+            .len();
+        assert_eq!(
+            wfp_targets
+                .iter()
+                .filter(|t| t.allowed_loopback_port_ranges == vec![(49152, 65535)])
+                .count(),
+            browser_target_count
+        );
+    }
+
+    #[test]
+    fn extract_oauth_loopback_callback_port_parses_redirect_and_blocks_internal_ports() {
+        let blocked = [17892, singbox::CLASH_API_PORT];
+        let auth_url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=demo&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback";
+        assert_eq!(
+            extract_oauth_loopback_callback_port(auth_url, &blocked),
+            Some(1455)
+        );
+        assert_eq!(
+            extract_oauth_loopback_callback_port(
+                "http://127.0.0.1:54172/oauth-callback?code=abc",
+                &blocked
+            ),
+            Some(54172)
+        );
+        // Never allow sing-box probe or Clash API port even if injected into query params
+        let poisoned = format!(
+            "https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=http%3A%2F%2F127.0.0.1%3A{}%2Fcb",
+            singbox::CLASH_API_PORT
+        );
+        assert_eq!(
+            extract_oauth_loopback_callback_port(&poisoned, &blocked),
+            None
+        );
+        assert_eq!(
+            extract_oauth_loopback_callback_port("http://localhost:80/cb", &blocked),
+            None
+        );
     }
 
     #[test]
@@ -2783,5 +3543,93 @@ mod tests {
         acc.linked_node_source = AccountNodeSource::Netguard;
         acc.linked_node_id = Some("seoul-vps".into());
         assert!(resolve_account_proxy_target(&acc, &cfg, true, false, true, &sec_ports, &clash).is_err());
+
+        // 4. Inheriting linked BrowserProfile custom proxy when linked_node_source == None
+        cfg.browser_profiles.push(BrowserProfile {
+            id: "bp-clash-us".into(),
+            name: "US Clash 环境".into(),
+            builtin: false,
+            node_id: None,
+            custom_proxy_url: Some("socks5://127.0.0.1:10808".into()),
+            homepage: "https://claude.ai".into(),
+            fingerprint_mode: BrowserFingerprintMode::IsolatedFingerprint,
+            fingerprint: BrowserFingerprintConfig::default(),
+            notes: None,
+        });
+        acc.linked_node_source = AccountNodeSource::None;
+        acc.linked_node_id = None;
+        acc.linked_node_name = None;
+        acc.linked_browser_profile_id = Some("bp-clash-us".into());
+        let inherited_custom =
+            resolve_account_proxy_target(&acc, &cfg, false, false, false, &sec_ports, &clash).unwrap();
+        assert_eq!(inherited_custom.node_source, "browser_profile");
+        assert_eq!(inherited_custom.local_port, 10808);
+        assert_eq!(inherited_custom.probe_proxy_url, "socks5h://127.0.0.1:10808");
+
+        // 5. Inheriting linked BrowserProfile NetGuard node when linked_node_source == None
+        cfg.browser_profiles.push(BrowserProfile {
+            id: "bp-ng-jp".into(),
+            name: "JP NetGuard 环境".into(),
+            builtin: false,
+            node_id: Some("node-jp".into()),
+            custom_proxy_url: None,
+            homepage: "https://claude.ai".into(),
+            fingerprint_mode: BrowserFingerprintMode::CleanAlign,
+            fingerprint: BrowserFingerprintConfig::default(),
+            notes: None,
+        });
+        cfg.nodes.push(NodeProfile {
+            id: "node-jp".into(),
+            name: "日本节点".into(),
+            protocol: models::ProxyProtocol::Socks,
+            server: "1.1.1.1".into(),
+            port: 1080,
+            uuid: None,
+            flow: None,
+            security: None,
+            sni: None,
+            fingerprint: None,
+            public_key: None,
+            short_id: None,
+            method: None,
+            password: None,
+            username: None,
+            obfs: None,
+            obfs_password: None,
+            allow_insecure: None,
+            certificate_sha256: None,
+            expected_ip: None,
+            expected_country: Some("JP".into()),
+            timezone: Some("Asia/Tokyo".into()),
+            locale: Some("ja-JP".into()),
+            outbound_mode: None,
+        });
+        acc.linked_browser_profile_id = Some("bp-ng-jp".into());
+        let inherited_node =
+            resolve_account_proxy_target(&acc, &cfg, true, false, false, &sec_ports, &clash).unwrap();
+        assert_eq!(inherited_node.node_source, "netguard");
+        assert_eq!(inherited_node.local_port, 17901);
+        assert_eq!(inherited_node.probe_proxy_url, "socks5h://127.0.0.1:17901");
+    }
+
+    #[test]
+    fn normalize_loopback_proxy_url_for_probe_enforces_ssrf_guard() {
+        assert_eq!(
+            normalize_loopback_proxy_url_for_probe("socks5://127.0.0.1:10808").unwrap(),
+            ("127.0.0.1:10808".into(), "socks5h://127.0.0.1:10808".into())
+        );
+        assert_eq!(
+            normalize_loopback_proxy_url_for_probe("localhost:7897").unwrap(),
+            ("localhost:7897".into(), "http://localhost:7897".into())
+        );
+        // Reject non-loopback targets (SSRF)
+        assert!(normalize_loopback_proxy_url_for_probe("http://192.168.1.5:7897").is_err());
+        assert!(normalize_loopback_proxy_url_for_probe("http://169.254.169.254:8080").is_err());
+        assert!(normalize_loopback_proxy_url_for_probe("socks5://example.com:1080").is_err());
+        // Reject privileged ports, bad schemes, credentials, or extra path
+        assert!(normalize_loopback_proxy_url_for_probe("http://127.0.0.1:80").is_err());
+        assert!(normalize_loopback_proxy_url_for_probe("file://127.0.0.1:8080").is_err());
+        assert!(normalize_loopback_proxy_url_for_probe("http://user:pass@127.0.0.1:7897").is_err());
+        assert!(normalize_loopback_proxy_url_for_probe("http://127.0.0.1:7897/admin").is_err());
     }
 }

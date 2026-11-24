@@ -309,6 +309,7 @@ function providerAvatar(provider: string): { code: string; classes: string } {
 function resolveAccountNodeDisplay(
   acc: AccountRecord,
   nodeById: Map<string, NodeProfile>,
+  browserProfileById?: Map<string, BrowserProfile>,
 ): {
   source: AccountNodeSource;
   sourceLabel: string;
@@ -317,7 +318,33 @@ function resolveAccountNodeDisplay(
   variant: "iris" | "warning" | "neutral";
 } | null {
   const source = normalizeNodeSource(acc.linkedNodeSource, acc.linkedNodeId);
-  if (source === "none") return null;
+  if (source === "none") {
+    const pid = acc.linkedBrowserProfileId?.trim();
+    const bp =
+      acc.browserKind !== "adspower" && pid && browserProfileById
+        ? browserProfileById.get(pid)
+        : undefined;
+    if (!bp) return null;
+    if (bp.customProxyUrl?.trim()) {
+      const hostPort = bp.customProxyUrl.trim().replace(/^[a-zA-Z0-9+.-]+:\/\//, "");
+      return {
+        source: "netguard",
+        sourceLabel: "指纹环境",
+        name: bp.name,
+        badgeText: `继承环境 · ${hostPort}`,
+        variant: "iris",
+      };
+    }
+    const targetNode = bp.nodeId ? nodeById.get(bp.nodeId) : undefined;
+    const nodeName = targetNode?.name || (bp.nodeId ? bp.nodeId : "主安全出口");
+    return {
+      source: "netguard",
+      sourceLabel: "指纹环境",
+      name: bp.name,
+      badgeText: `继承环境 · ${nodeName}`,
+      variant: "iris",
+    };
+  }
 
   if (source === "netguard") {
     const node = acc.linkedNodeId ? nodeById.get(acc.linkedNodeId) : undefined;
@@ -384,10 +411,31 @@ function resolveAccountPreviewPort(
   gatewayActiveNodeId: string,
   gatewayBrowserPort: number,
   secondaryNodePorts: Record<string, number>,
+  browserProfileById?: Map<string, BrowserProfile>,
 ): { port: number | null; reason?: string } {
   const source = normalizeNodeSource(acc.linkedNodeSource, acc.linkedNodeId);
   if (source === "none") {
-    return { port: null, reason: "未绑定节点（禁止裸连），请先在「编辑」中绑定节点" };
+    const pid = acc.linkedBrowserProfileId?.trim();
+    const bp =
+      acc.browserKind !== "adspower" && pid && browserProfileById
+        ? browserProfileById.get(pid)
+        : undefined;
+    if (bp) {
+      if (bp.customProxyUrl?.trim()) {
+        const m = bp.customProxyUrl.trim().match(/:(\d{2,5})(?:$|[/?#])/);
+        if (m) return { port: Number(m[1]) };
+        return { port: null, reason: "指纹环境独立代理格式异常" };
+      }
+      const id = bp.nodeId?.trim() || gatewayActiveNodeId;
+      if (!gatewayRunning) {
+        return { port: null, reason: "NetGuard 安全网关未运行" };
+      }
+      if (id === gatewayActiveNodeId) return { port: gatewayBrowserPort };
+      const sec = secondaryNodePorts[id];
+      if (sec) return { port: sec };
+      return { port: null, reason: "指纹环境绑定多出口副端口未激活" };
+    }
+    return { port: null, reason: "未绑定节点（禁止裸连），请先在「编辑」中绑定节点或指纹环境" };
   }
   if (source === "netguard") {
     const id = acc.linkedNodeId?.trim();
@@ -512,6 +560,7 @@ export function AccountsView({
   const [form, setForm] = useState<AccountFormState>(emptyFormState);
   const [formError, setFormError] = useState("");
   const [showFormPassword, setShowFormPassword] = useState(false);
+  const [overrideProfileExit, setOverrideProfileExit] = useState(false);
 
   const [adsBaseUrl, setAdsBaseUrl] = useState("http://127.0.0.1:50325");
   const [adsApiKeyInput, setAdsApiKeyInput] = useState("");
@@ -665,6 +714,14 @@ export function AccountsView({
     return map;
   }, [nodes]);
 
+  const browserProfileById = useMemo(() => {
+    const map = new Map<string, BrowserProfile>();
+    for (const bp of browserProfiles) {
+      map.set(bp.id, bp);
+    }
+    return map;
+  }, [browserProfiles]);
+
   const runningBrowserSet = useMemo(
     () => new Set(runningBrowserProfiles),
     [runningBrowserProfiles],
@@ -806,7 +863,7 @@ export function AccountsView({
         return false;
       }
       if (!query) return true;
-      const nodeDisplay = resolveAccountNodeDisplay(acc, nodeById);
+      const nodeDisplay = resolveAccountNodeDisplay(acc, nodeById, browserProfileById);
       const envMeta = ENV_TYPE_META[normalizeEnvType(acc.envType)];
       const haystack = [
         acc.label,
@@ -835,6 +892,7 @@ export function AccountsView({
     envFilter,
     search,
     nodeById,
+    browserProfileById,
   ]);
 
   const filteredClashGroups = useMemo(() => {
@@ -867,14 +925,42 @@ export function AccountsView({
     return { present: true, result: generateTotp(trimmed, nowMs) };
   }, [form.totpSecret, nowMs]);
 
+  const selectedLinkedProfile =
+    form.browserKind === "netguard" && form.linkedBrowserProfileId.trim()
+      ? browserProfileById.get(form.linkedBrowserProfileId.trim())
+      : undefined;
+
+  const selectedLinkedProfileExitSummary = useMemo(() => {
+    if (!selectedLinkedProfile) return "";
+    if (selectedLinkedProfile.customProxyUrl?.trim()) {
+      return `自定义代理 ${selectedLinkedProfile.customProxyUrl.trim()}`;
+    }
+    if (selectedLinkedProfile.nodeId) {
+      const n = nodeById.get(selectedLinkedProfile.nodeId);
+      return n ? `NetGuard 节点「${n.name}」` : `NetGuard 节点 ${selectedLinkedProfile.nodeId}`;
+    }
+    const active = nodeById.get(gatewayActiveNodeId);
+    return active
+      ? `NetGuard 当前活动节点「${active.name}」`
+      : "NetGuard 当前活动节点";
+  }, [selectedLinkedProfile, nodeById, gatewayActiveNodeId]);
+
   const openEditor = (existing?: AccountRecord) => {
-    setForm(existing ? recordToFormState(existing) : emptyFormState());
+    const nextForm = existing ? recordToFormState(existing) : emptyFormState();
+    setForm(nextForm);
     setFormError("");
     setShowFormPassword(false);
     setAddingPreset(false);
     setNewPresetName("");
     setNewPresetType("custom");
     setClashSearch("");
+    setOverrideProfileExit(
+      Boolean(
+        nextForm.browserKind === "netguard" &&
+          nextForm.linkedBrowserProfileId.trim() &&
+          nextForm.linkedNodeSource !== "none",
+      ),
+    );
     setEditorOpen(true);
     if (!clashNodes?.detected) {
       void onRefreshClashNodes();
@@ -2116,7 +2202,11 @@ export function AccountsView({
               const envMeta = ENV_TYPE_META[envType];
               const envNameTrimmed = acc.environmentName.trim();
               const envProfileTrimmed = acc.environmentProfile?.trim() || "";
-              const nodeDisplay = resolveAccountNodeDisplay(acc, nodeById);
+              const nodeDisplay = resolveAccountNodeDisplay(
+                acc,
+                nodeById,
+                browserProfileById,
+              );
               const previewPort = resolveAccountPreviewPort(
                 acc,
                 nodeById,
@@ -2125,10 +2215,9 @@ export function AccountsView({
                 gatewayActiveNodeId,
                 gatewayBrowserPort,
                 secondaryNodePorts,
+                browserProfileById,
               );
-              const isUnbound =
-                normalizeNodeSource(acc.linkedNodeSource, acc.linkedNodeId) === "none" ||
-                !nodeDisplay;
+              const isUnbound = !nodeDisplay;
               const showBrowserBtn = acc.browserKind !== "none";
               const rowQuota = quotaByAccountId.get(acc.id);
               const isAdspower = acc.browserKind === "adspower";
@@ -3473,12 +3562,23 @@ export function AccountsView({
                       id={fid("linkedBrowserProfileId")}
                       className={NATIVE_SELECT_CLASS}
                       value={form.linkedBrowserProfileId}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        const nextPid = e.target.value;
+                        const hasSelectedProfile = Boolean(nextPid.trim());
                         setForm((prev) => ({
                           ...prev,
-                          linkedBrowserProfileId: e.target.value,
-                        }))
-                      }
+                          linkedBrowserProfileId: nextPid,
+                          ...(hasSelectedProfile
+                            ? {
+                                linkedNodeSource: "none" as AccountNodeSource,
+                                linkedNodeId: "",
+                                linkedNodeName: "",
+                                linkedProxyPort: "",
+                              }
+                            : {}),
+                        }));
+                        setOverrideProfileExit(!hasSelectedProfile);
+                      }}
                     >
                       <option value="">
                         自动为本账号创建并记住独立环境（推荐，独立缓存目录 + 指纹）
@@ -3642,12 +3742,75 @@ export function AccountsView({
               </div>
 
               {/* Multi-Source Node Binding */}
+              {selectedLinkedProfile && !overrideProfileExit ? (
+                <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[#dcd4fb] bg-[#f7f5fe] p-3">
+                  <div className="min-w-0 space-y-0.5">
+                    <div className="flex flex-wrap items-center gap-1.5 text-[0.74rem] font-medium text-[#111827]">
+                      <ShieldCheck
+                        className="h-3.5 w-3.5 shrink-0 text-[#6d5bd0]"
+                        aria-hidden="true"
+                      />
+                      <span>
+                        已直接继承指纹环境网络：{selectedLinkedProfile.name}
+                      </span>
+                    </div>
+                    <p className="text-[0.69rem] text-[#525866]">
+                      当前出口：{" "}
+                      <span className="font-medium text-[#111827]">
+                        {selectedLinkedProfileExitSummary}
+                      </span>
+                      {" · "}
+                      时区 / 语言：{" "}
+                      <span className="mono-num">
+                        {selectedLinkedProfile.fingerprint.timezone || "跟随节点"} /{" "}
+                        {selectedLinkedProfile.fingerprint.locale || "en-US"}
+                      </span>
+                      （启动前仍强制 Fail-Closed 校验真实出口 IP）
+                    </p>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="xs"
+                    onClick={() => {
+                      setOverrideProfileExit(true);
+                      if (form.linkedNodeSource === "none") {
+                        handleSelectNodeSource("netguard");
+                      }
+                    }}
+                  >
+                    单独覆盖出口
+                  </Button>
+                </div>
+              ) : (
               <div className="space-y-2.5 rounded-xl border border-[#eaecef] bg-[#fafbfc] p-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-[0.73rem] font-medium text-[#525866]">
-                    绑定出口节点（支持 NetGuard / Clash Verge / 自定义）
+                    {selectedLinkedProfile
+                      ? `单独覆盖「${selectedLinkedProfile.name}」的出口节点（保存后优先使用此节点）`
+                      : "绑定出口节点（支持 NetGuard / Clash Verge / 自定义）"}
                   </span>
-                  <div className="flex flex-wrap gap-1" role="group" aria-label="节点来源">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {selectedLinkedProfile && (
+                      <Button
+                        type="button"
+                        variant="soft"
+                        size="xs"
+                        onClick={() => {
+                          setOverrideProfileExit(false);
+                          setForm((prev) => ({
+                            ...prev,
+                            linkedNodeSource: "none",
+                            linkedNodeId: "",
+                            linkedNodeName: "",
+                            linkedProxyPort: "",
+                          }));
+                        }}
+                      >
+                        恢复继承环境网络
+                      </Button>
+                    )}
+                    <div className="flex flex-wrap gap-1" role="group" aria-label="节点来源">
                     {NODE_SOURCE_OPTIONS.map((opt) => {
                       const active = form.linkedNodeSource === opt.value;
                       return (
@@ -3666,6 +3829,7 @@ export function AccountsView({
                         </button>
                       );
                     })}
+                    </div>
                   </div>
                 </div>
 
@@ -3940,6 +4104,7 @@ export function AccountsView({
                   </div>
                 )}
               </div>
+              )}
             </fieldset>
 
             {/* Section 4: Cockpit-Style Quota & Cooldown */}

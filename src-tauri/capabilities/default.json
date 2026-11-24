@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability for AI NetGuard main window",
-  "windows": ["main"],
+  "description": "Default capability for AI NetGuard main window and URL router picker",
+  "windows": ["main", "url-picker"],
   "permissions": [
     "core:default"
   ]

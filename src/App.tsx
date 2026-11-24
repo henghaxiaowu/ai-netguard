@@ -31,6 +31,7 @@ import {
   Trash2,
   ChevronDown,
   ClipboardPaste,
+  Compass,
   KeyRound,
   X,
 } from "lucide-react";
@@ -39,6 +40,7 @@ import { AccountsView } from "./components/AccountsView";
 import { AppsEnvView } from "./components/AppsEnvView";
 import { BrowserProfilesView } from "./components/BrowserProfilesView";
 import { NodeEditor } from "./components/NodeEditor";
+import { UrlRouterView } from "./components/UrlRouterView";
 import { ClaudeStarburst } from "./components/ClaudeMotifs";
 import { ExitIpMap } from "./components/ExitIpMap";
 import { LatencySparkline, SegmentedMeter } from "./components/TelemetryWidgets";
@@ -72,12 +74,15 @@ import type {
   DownloadProgress,
   GatewayStatus,
   NodeProfile,
+  UrlRouteEvent,
+  UrlRouterStatus,
 } from "./types";
 
 type TabKey =
   | "dashboard"
   | "browsers"
   | "apps"
+  | "url_router"
   | "accounts"
   | "verify"
   | "nodes"
@@ -95,6 +100,7 @@ const NAV_GROUPS: {
       { key: "dashboard", label: "总览与安全启动", crumb: "总览", icon: Monitor },
       { key: "browsers", label: "指纹浏览器", crumb: "指纹浏览器", icon: Globe },
       { key: "apps", label: "AI 应用与环境", crumb: "AI 应用与环境", icon: AppWindow },
+      { key: "url_router", label: "默认浏览器分流", crumb: "默认浏览器分流", icon: Compass },
       { key: "accounts", label: "账号与环境库", crumb: "账号与环境库", icon: KeyRound },
       { key: "verify", label: "IP 与指纹体检", crumb: "IP 与指纹体检", icon: Fingerprint },
       { key: "nodes", label: "出口与共存路由", crumb: "出口与共存路由", icon: GitFork },
@@ -227,6 +233,9 @@ export default function App() {
   const [adspowerConfig, setAdspowerConfig] = useState<AdsPowerConfigStatus | null>(null);
   const [adspowerProfiles, setAdspowerProfiles] = useState<AdsPowerProfilesSnapshot | null>(null);
   const [loadingAdsPower, setLoadingAdsPower] = useState(false);
+  const [urlRouterStatus, setUrlRouterStatus] = useState<UrlRouterStatus | null>(null);
+  const [urlRouteHistory, setUrlRouteHistory] = useState<UrlRouteEvent[]>([]);
+  const [urlRouterBusyAction, setUrlRouterBusyAction] = useState<string | null>(null);
   const [quickProfileId, setQuickProfileId] = useState("default");
   const [preselectedBrowserNode, setPreselectedBrowserNode] = useState<{
     nodeId: string;
@@ -331,10 +340,26 @@ export default function App() {
     [tab],
   );
 
+  const refreshUrlRouter = useCallback(async () => {
+    try {
+      const [st, hist] = await Promise.all([
+        api.getUrlRouterStatus(),
+        api.listUrlRouteHistory(),
+      ]);
+      setUrlRouterStatus(st);
+      setUrlRouteHistory(hist);
+    } catch {
+      // Ignore outside Tauri runtime during preview
+    }
+  }, []);
+
   useEffect(() => {
     const item = NAV_GROUPS.flatMap((g) => g.items).find((i) => i.key === tab);
     document.title = `${item?.label || "总览与安全启动"} | AI NetGuard`;
-  }, [tab]);
+    if (tab === "url_router") {
+      void refreshUrlRouter();
+    }
+  }, [tab, refreshUrlRouter]);
 
   const refreshAppEnv = useCallback(async () => {
     setScanningApps(true);
@@ -390,6 +415,7 @@ export default function App() {
     void refreshAccounts();
     void refreshClashNodes();
     void refreshAdsPowerConfig();
+    void refreshUrlRouter();
     const [cfg, st] = await Promise.all([api.getConfig(), api.getStatus()]);
     setConfig(cfg);
     setStatus(st);
@@ -525,7 +551,7 @@ export default function App() {
         stage: "downloading",
         downloadedBytes: 0,
         totalBytes: 0,
-        message: "正在连接 GitHub 获取便携版 Ungoogled-Chromium...",
+        message: "正在连接 GitHub 获取 Fingerprint-Chromium 150 内核...",
       });
       const msg = await api.installBrowser();
       notify(msg);
@@ -1475,8 +1501,13 @@ export default function App() {
                               <Globe className="h-4 w-4" aria-hidden="true" />
                             </span>
                             <div className="min-w-0">
-                              <div className="text-[0.8rem] font-medium text-[#111827]">
+                              <div className="flex items-center gap-1.5 text-[0.8rem] font-medium text-[#111827]">
                                 防泄漏浏览器
+                                {status?.fpBrowserInstalled && (
+                                  <Badge variant="success" className="px-1.5 py-0 text-[0.62rem]">
+                                    FP-150
+                                  </Badge>
+                                )}
                               </div>
                               <div className="mono-num text-[0.67rem] text-[#7c8495]">
                                 {config?.alignFingerprint
@@ -1492,10 +1523,21 @@ export default function App() {
                               onClick={handleInstallBrowser}
                             >
                               <Download className="h-3.5 w-3.5" aria-hidden="true" />
-                              安装 (~200MB)
+                              安装 (~185MB)
                             </Button>
                           ) : (
                             <div className="flex shrink-0 items-center gap-1.5">
+                              {!status?.fpBrowserInstalled && (
+                                <Button
+                                  variant="soft"
+                                  size="xs"
+                                  disabled={Boolean(dlProgress && dlProgress.stage !== "done")}
+                                  onClick={handleInstallBrowser}
+                                  title="升级至开源 Fingerprint-Chromium 150 + Chrome 商店支持"
+                                >
+                                  升级内核
+                                </Button>
+                              )}
                               <Button
                                 variant="ghost"
                                 size="xs"
@@ -2073,11 +2115,15 @@ export default function App() {
                 config={config}
                 status={status}
                 gatewayReady={gatewayReady}
+                dlProgress={dlProgress}
+                clashNodes={clashNodes}
                 preselectedNodeRequest={preselectedBrowserNode}
                 onSaveProfiles={handleSaveBrowserProfiles}
                 onLaunchProfile={handleLaunchBrowserProfile}
                 onCloseProfile={handleCloseBrowserProfile}
                 onProbeNodeExit={(nodeId) => api.probeNodeExit(nodeId)}
+                onProbeProxyExit={(proxyUrl) => api.probeProxyExit(proxyUrl)}
+                onRefreshClashNodes={refreshClashNodes}
                 onInstallBrowser={handleInstallBrowser}
                 onRestartGateway={handleRestartGateway}
                 onNotify={notify}
@@ -2107,6 +2153,84 @@ export default function App() {
                 onLaunchApp={handleLaunchManagedApp}
                 onCleanRegistryEnv={handleCleanRegistryEnv}
                 onCreateShortcut={handleCreateAppShortcut}
+              />
+            )}
+
+            {/* ======================= VIEW 01B2: URL ROUTER ======================= */}
+            {tab === "url_router" && config && (
+              <UrlRouterView
+                config={config}
+                routerStatus={urlRouterStatus}
+                routeHistory={urlRouteHistory}
+                dirty={dirty}
+                busyAction={urlRouterBusyAction}
+                onConfigChange={(next) => {
+                  setConfig(next);
+                  setDirty(true);
+                }}
+                onSave={async () => {
+                  setUrlRouterBusyAction("save");
+                  try {
+                    await handleSaveConfig();
+                    await refreshUrlRouter();
+                  } finally {
+                    setUrlRouterBusyAction(null);
+                  }
+                }}
+                onRefreshStatus={async () => {
+                  setUrlRouterBusyAction("refresh");
+                  try {
+                    await refreshUrlRouter();
+                  } finally {
+                    setUrlRouterBusyAction(null);
+                  }
+                }}
+                onRegister={async () => {
+                  setUrlRouterBusyAction("register");
+                  try {
+                    const st = await api.registerUrlRouter();
+                    setUrlRouterStatus(st);
+                    notify("已注册为 Windows 可选默认浏览器，请点「打开默认应用设置」选中 AI NetGuard 链接分流器");
+                  } catch (err) {
+                    notify(`注册失败: ${String(err)}`);
+                  } finally {
+                    setUrlRouterBusyAction(null);
+                  }
+                }}
+                onUnregister={async () => {
+                  setUrlRouterBusyAction("unregister");
+                  try {
+                    const st = await api.unregisterUrlRouter();
+                    setUrlRouterStatus(st);
+                    notify("已卸载 Windows 默认浏览器注册项");
+                  } catch (err) {
+                    notify(`卸载失败: ${String(err)}`);
+                  } finally {
+                    setUrlRouterBusyAction(null);
+                  }
+                }}
+                onOpenDefaultApps={async () => {
+                  setUrlRouterBusyAction("settings");
+                  try {
+                    await api.openDefaultAppsSettings();
+                    notify("已打开 Windows 默认应用设置，请选择「AI NetGuard 链接分流器」");
+                  } catch (err) {
+                    notify(`打开系统设置失败: ${String(err)}`);
+                  } finally {
+                    setUrlRouterBusyAction(null);
+                  }
+                }}
+                onTestPicker={async (testTargetUrl) => {
+                  setUrlRouterBusyAction("test");
+                  try {
+                    await api.testUrlRouterPicker(testTargetUrl);
+                    await refreshUrlRouter();
+                  } catch (err) {
+                    notify(`测试弹窗失败: ${String(err)}`);
+                  } finally {
+                    setUrlRouterBusyAction(null);
+                  }
+                }}
               />
             )}
 

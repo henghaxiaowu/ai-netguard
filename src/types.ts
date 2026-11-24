@@ -84,11 +84,91 @@ export interface BrowserProfile {
   notes?: string | null;
 }
 
+export interface BrowserCookieRecord {
+  name: string;
+  value: string;
+  domain: string;
+  path: string;
+  expires?: number | null;
+  httpOnly: boolean;
+  secure: boolean;
+  sameSite?: string | null;
+  hostOnly: boolean;
+  session: boolean;
+}
+
+export interface CookieDeleteTarget {
+  name: string;
+  domain: string;
+  path: string;
+  secure?: boolean;
+}
+
+export interface ProfileCookiesSnapshot {
+  profileId: string;
+  liveMode: boolean;
+  cookies: BrowserCookieRecord[];
+  exportJson: string;
+}
+
+export interface CookieImportOutcome {
+  importedCount: number;
+  skippedCount: number;
+  liveMode: boolean;
+  totalCount: number;
+  cookies: BrowserCookieRecord[];
+  exportJson: string;
+  warning?: string | null;
+}
+
 export interface UpstreamProxyConfig {
   enabled: boolean;
   protocol: "socks" | "http";
   server: string;
   port: number;
+}
+
+export type UrlRouterMode = "intercept_list" | "allow_edge_list" | "always_ask";
+
+export interface UrlRouterConfig {
+  mode: UrlRouterMode;
+  interceptLoopbackOauth: boolean;
+  fallbackBrowserPath?: string | null;
+  interceptDomains: string[];
+  edgeBypassDomains: string[];
+}
+
+export interface UrlRouterStatus {
+  registered: boolean;
+  registeredExeMatches: boolean;
+  isDefaultHttp: boolean;
+  isDefaultHttps: boolean;
+  currentHttpProgId?: string | null;
+  currentHttpsProgId?: string | null;
+  fallbackBrowserPath?: string | null;
+  currentExePath: string;
+}
+
+export interface PendingUrlPick {
+  id: string;
+  url: string;
+  displayUrl: string;
+  host: string;
+  reason: string;
+  createdAt: string;
+}
+
+export interface PendingUrlPickPayload {
+  pick: PendingUrlPick;
+  remainingCount: number;
+}
+
+export interface UrlRouteEvent {
+  time: string;
+  host: string;
+  displayUrl: string;
+  action: string;
+  target: string;
 }
 
 export interface AppConfig {
@@ -114,6 +194,7 @@ export interface AppConfig {
   managedAppsSchemaVersion?: number;
   managedApps: ManagedAppConfig[];
   browserProfiles?: BrowserProfile[];
+  urlRouter?: UrlRouterConfig;
 }
 
 export type CheckSeverity = "pass" | "warn" | "fail" | "pending";
@@ -159,6 +240,9 @@ export interface GatewayStatus {
   browserRunning: boolean;
   browserInstalled: boolean;
   browserPath?: string;
+  fpBrowserInstalled?: boolean;
+  fpBrowserPath?: string;
+  webStoreExtInstalled?: boolean;
   claudeDesktopFound: boolean;
   claudeDesktopPath?: string;
   claudeCliFound: boolean;

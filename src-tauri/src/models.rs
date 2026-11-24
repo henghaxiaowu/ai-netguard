@@ -342,6 +342,104 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UrlRouterMode {
+    #[default]
+    InterceptList,
+    AllowEdgeList,
+    AlwaysAsk,
+}
+
+pub fn default_url_intercept_domains() -> Vec<String> {
+    [
+        "accounts.google.com",
+        "myaccount.google.com",
+        "gemini.google.com",
+        "aistudio.google.com",
+        "antigravity.google",
+        "idx.google.com",
+        "claude.ai",
+        "console.anthropic.com",
+        "anthropic.com",
+        "chatgpt.com",
+        "auth.openai.com",
+        "platform.openai.com",
+        "openai.com",
+        "cursor.com",
+        "authenticator.cursor.sh",
+        "codeium.com",
+        "windsurf.com",
+        "x.ai",
+        "grok.com",
+        "perplexity.ai",
+        "poe.com",
+        "auth0.com",
+        "challenges.cloudflare.com",
+        "hcaptcha.com",
+        "stripe.com",
+        "checkout.stripe.com",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+pub fn default_url_edge_bypass_domains() -> Vec<String> {
+    [
+        "localhost",
+        "127.0.0.1",
+        "baidu.com",
+        "weixin.qq.com",
+        "qq.com",
+        "feishu.cn",
+        "dingtalk.com",
+        "aliyun.com",
+        "taobao.com",
+        "jd.com",
+        "zhihu.com",
+        "bilibili.com",
+        "163.com",
+        "weibo.com",
+        "csdn.net",
+        "gitee.com",
+        "deepseek.com",
+        "moonshot.cn",
+        "kimi.com",
+        "doubao.com",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UrlRouterConfig {
+    #[serde(default)]
+    pub mode: UrlRouterMode,
+    #[serde(default = "default_true")]
+    pub intercept_loopback_oauth: bool,
+    #[serde(default)]
+    pub fallback_browser_path: Option<String>,
+    #[serde(default = "default_url_intercept_domains")]
+    pub intercept_domains: Vec<String>,
+    #[serde(default = "default_url_edge_bypass_domains")]
+    pub edge_bypass_domains: Vec<String>,
+}
+
+impl Default for UrlRouterConfig {
+    fn default() -> Self {
+        Self {
+            mode: UrlRouterMode::InterceptList,
+            intercept_loopback_oauth: true,
+            fallback_browser_path: None,
+            intercept_domains: default_url_intercept_domains(),
+            edge_bypass_domains: default_url_edge_bypass_domains(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
@@ -377,6 +475,8 @@ pub struct AppConfig {
     pub managed_apps: Vec<ManagedAppConfig>,
     #[serde(default = "default_browser_profiles")]
     pub browser_profiles: Vec<BrowserProfile>,
+    #[serde(default)]
+    pub url_router: UrlRouterConfig,
 }
 
 impl Default for AppConfig {
@@ -448,6 +548,7 @@ impl Default for AppConfig {
             managed_apps_schema_version: CURRENT_MANAGED_APPS_SCHEMA_VERSION,
             managed_apps: default_managed_apps(),
             browser_profiles: default_browser_profiles(),
+            url_router: UrlRouterConfig::default(),
         }
     }
 }
@@ -513,6 +614,12 @@ pub struct GatewayStatus {
     pub browser_installed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser_path: Option<String>,
+    #[serde(default)]
+    pub fp_browser_installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fp_browser_path: Option<String>,
+    #[serde(default)]
+    pub web_store_ext_installed: bool,
     pub claude_desktop_found: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_desktop_path: Option<String>,

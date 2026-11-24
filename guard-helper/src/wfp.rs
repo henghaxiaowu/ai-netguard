@@ -14,8 +14,8 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_PROVIDER0, FWPM_PROVIDER_FLAG_PERSISTENT, FWPM_SESSION0,
     FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0, FWPM_SUBLAYER_FLAG_PERSISTENT, FWP_ACTION_BLOCK,
     FWP_ACTION_PERMIT, FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE, FWP_CONDITION_FLAG_IS_LOOPBACK,
-    FWP_MATCH_EQUAL, FWP_MATCH_FLAGS_ALL_SET, FWP_UINT16, FWP_UINT32, FWP_UINT8,
-    FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK,
+    FWP_MATCH_EQUAL, FWP_MATCH_FLAGS_ALL_SET, FWP_MATCH_RANGE, FWP_RANGE0, FWP_RANGE_TYPE,
+    FWP_UINT16, FWP_UINT32, FWP_UINT8, FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK, FWP_VALUE0,
 };
 use windows::Win32::System::Rpc::RPC_C_AUTHN_DEFAULT;
 
@@ -109,6 +109,7 @@ impl WfpManager {
                         app_blob,
                         target.allow_private_lan,
                         &target.allowed_loopback_ports,
+                        &target.allowed_loopback_port_ranges,
                         &mut added_ids,
                     );
                     FwpmFreeMemory0(&mut (app_blob as *mut c_void));
@@ -211,6 +212,7 @@ impl WfpManager {
                             app_blob,
                             false,
                             &target.allowed_loopback_ports,
+                            &[],
                             &mut added,
                         );
                         FwpmFreeMemory0(&mut (app_blob as *mut c_void));
@@ -256,6 +258,7 @@ impl WfpManager {
                 exe_path: t.exe_path.clone(),
                 allow_private_lan: false,
                 allowed_loopback_ports: Vec::new(),
+                allowed_loopback_port_ranges: Vec::new(),
             })
             .collect();
         self.install_persistent_lock(&offline_targets)
@@ -354,6 +357,7 @@ fn filter_existing_targets(targets: &[ProtectedTarget]) -> Vec<ProtectedTarget> 
                 exe_path: trimmed.to_string(),
                 allow_private_lan: t.allow_private_lan,
                 allowed_loopback_ports: t.allowed_loopback_ports.clone(),
+                allowed_loopback_port_ranges: t.allowed_loopback_port_ranges.clone(),
             })
         })
         .collect()
@@ -426,11 +430,16 @@ unsafe fn add_app_filters(
     app_blob: *mut FWP_BYTE_BLOB,
     allow_private_lan: bool,
     allowed_loopback_ports: &[u16],
+    allowed_loopback_port_ranges: &[(u16, u16)],
     out_ids: &mut Vec<u64>,
 ) -> Result<(), String> {
-    let plan = plan_app_filters(allow_private_lan, allowed_loopback_ports);
+    let plan = plan_app_filters(
+        allow_private_lan,
+        allowed_loopback_ports,
+        allowed_loopback_port_ranges,
+    );
     for layer in [FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6] {
-        // Empty `loopback_ports` emits 0 loopback permits -> full block (both loopback & external).
+        // Empty `loopback_ports` and `loopback_port_ranges` emits 0 permits -> full block.
         for &port in &plan.loopback_ports {
             let mut conds = [
                 app_id_condition(app_blob),
@@ -447,6 +456,35 @@ unsafe fn add_app_filters(
                 FWP_ACTION_PERMIT,
                 &mut conds,
                 "AI-NetGuard Permit Loopback Port",
+            )?);
+        }
+
+        for &(low, high) in &plan.loopback_port_ranges {
+            let mut low_val = FWP_VALUE0::default();
+            low_val.r#type = FWP_UINT16;
+            low_val.Anonymous.uint16 = low;
+            let mut high_val = FWP_VALUE0::default();
+            high_val.r#type = FWP_UINT16;
+            high_val.Anonymous.uint16 = high;
+            let mut range = FWP_RANGE0 {
+                valueLow: low_val,
+                valueHigh: high_val,
+            };
+            let mut conds = [
+                app_id_condition(app_blob),
+                loopback_condition(),
+                remote_port_range_condition(&mut range),
+            ];
+            out_ids.push(add_filter(
+                engine,
+                sublayer_key,
+                provider_key,
+                persistent,
+                layer,
+                15,
+                FWP_ACTION_PERMIT,
+                &mut conds,
+                "AI-NetGuard Permit Loopback Port Range",
             )?);
         }
 
@@ -584,16 +622,36 @@ unsafe fn remote_port_condition(port: u16) -> FWPM_FILTER_CONDITION0 {
     cond
 }
 
+unsafe fn remote_port_range_condition(range: *mut FWP_RANGE0) -> FWPM_FILTER_CONDITION0 {
+    let mut cond = FWPM_FILTER_CONDITION0::default();
+    cond.fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
+    cond.matchType = FWP_MATCH_RANGE;
+    cond.conditionValue.r#type = FWP_RANGE_TYPE;
+    cond.conditionValue.Anonymous.rangeValue = range;
+    cond
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct AppFilterPlan {
     loopback_ports: Vec<u16>,
+    loopback_port_ranges: Vec<(u16, u16)>,
     private_lan_v4: bool,
     block_direct_egress: bool,
 }
 
-fn plan_app_filters(allow_private_lan: bool, allowed_loopback_ports: &[u16]) -> AppFilterPlan {
+fn plan_app_filters(
+    allow_private_lan: bool,
+    allowed_loopback_ports: &[u16],
+    allowed_loopback_port_ranges: &[(u16, u16)],
+) -> AppFilterPlan {
+    let valid_ranges = allowed_loopback_port_ranges
+        .iter()
+        .copied()
+        .filter(|&(low, high)| low > 0 && low <= high)
+        .collect();
     AppFilterPlan {
         loopback_ports: allowed_loopback_ports.to_vec(),
+        loopback_port_ranges: valid_ranges,
         private_lan_v4: allow_private_lan,
         block_direct_egress: true,
     }
@@ -605,14 +663,29 @@ mod tests {
 
     #[test]
     fn empty_loopback_ports_grants_zero_permits() {
-        let offline = plan_app_filters(false, &[]);
+        let offline = plan_app_filters(false, &[], &[]);
         assert!(offline.loopback_ports.is_empty());
+        assert!(offline.loopback_port_ranges.is_empty());
         assert!(!offline.private_lan_v4);
         assert!(offline.block_direct_egress);
 
-        let cli = plan_app_filters(true, &[17890]);
+        let cli = plan_app_filters(true, &[17890], &[]);
         assert_eq!(cli.loopback_ports, vec![17890]);
+        assert!(cli.loopback_port_ranges.is_empty());
         assert!(cli.private_lan_v4);
         assert!(cli.block_direct_egress);
+    }
+
+    #[test]
+    fn validates_loopback_port_ranges() {
+        let browser = plan_app_filters(
+            false,
+            &[17891],
+            &[(49152, 65535), (0, 100), (60000, 1000)],
+        );
+        assert_eq!(browser.loopback_ports, vec![17891]);
+        assert_eq!(browser.loopback_port_ranges, vec![(49152, 65535)]);
+        assert!(!browser.private_lan_v4);
+        assert!(browser.block_direct_egress);
     }
 }

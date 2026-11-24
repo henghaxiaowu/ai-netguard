@@ -436,17 +436,140 @@ pub async fn start_browser(
         return Err(format!("AdsPower 启动环境失败: {msg}"));
     }
 
-    let debug_port = val
-        .get("data")
-        .and_then(|d| d.get("debug_port"))
-        .map(|v| json_str_or_num(Some(v)))
-        .filter(|s| !s.is_empty());
+    let debug_port = val.get("data").and_then(|d| {
+        d.get("debug_port")
+            .map(|v| json_str_or_num(Some(v)))
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                d.get("ws")
+                    .and_then(|w| w.get("puppeteer"))
+                    .and_then(Value::as_str)
+                    .and_then(|ws| url::Url::parse(ws).ok())
+                    .and_then(|u| u.port())
+                    .map(|p| p.to_string())
+            })
+    });
 
     Ok(AdsPowerStartResult {
         user_id: clean_uid.map(str::to_string),
         serial_number: clean_sn.map(str::to_string),
         debug_port,
     })
+}
+
+/// Strict RFC 3986 percent-encoding matching JavaScript `encodeURIComponent`, keeping
+/// ASCII alphanumerics and `-`, `_`, `.`, `~` unescaped so full URLs with `?`, `&`, `=`, `#`
+/// survive Chromium's `/json/new?<encoded_url>` query string intact.
+pub fn percent_encode_uri_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + input.len() / 2);
+    for &b in input.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+pub async fn open_cdp_tab_via_http(debug_port: u16, target_url: &str) -> Result<(), String> {
+    if debug_port <= 1024 {
+        return Err(format!("AdsPower 调试端口无效: {debug_port}"));
+    }
+    let parsed = url::Url::parse(target_url.trim())
+        .map_err(|e| format!("目标 URL 格式无效: {e}"))?;
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("不支持向 AdsPower 打开非 HTTP(S) 链接: {scheme}"));
+    }
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(6))
+        .build()
+        .map_err(|e| format!("初始化 CDP 客户端失败: {e}"))?;
+
+    let encoded = percent_encode_uri_component(parsed.as_str());
+    let new_tab_url = format!("http://127.0.0.1:{debug_port}/json/new?{encoded}");
+
+    let mut last_err: Option<String> = None;
+    let mut created_id: Option<String> = None;
+
+    for attempt in 0..6u8 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let resp = match client.put(&new_tab_url).send().await {
+            Ok(r) if r.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED => {
+                match client.get(&new_tab_url).send().await {
+                    Ok(r2) => r2,
+                    Err(e) => {
+                        last_err = Some(e.to_string());
+                        continue;
+                    }
+                }
+            }
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(e.to_string());
+                continue;
+            }
+        };
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            if let Ok(val) = serde_json::from_str::<Value>(&body) {
+                created_id = val
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            last_err = None;
+            break;
+        }
+        last_err = Some(format!("HTTP {} {}", status.as_u16(), body.trim()));
+    }
+
+    if let Some(err) = last_err {
+        return Err(format!(
+            "向 AdsPower 调试端口 :{debug_port} 打开新标签页失败: {err}"
+        ));
+    }
+
+    if let Some(id) = created_id {
+        let activate_url = format!("http://127.0.0.1:{debug_port}/json/activate/{id}");
+        let _ = client.get(&activate_url).send().await;
+    }
+
+    Ok(())
+}
+
+pub async fn open_url_in_browser(
+    settings: &AdsPowerSettingsDisk,
+    user_id: Option<&str>,
+    serial_number: Option<&str>,
+    target_url: &str,
+) -> Result<AdsPowerStartResult, String> {
+    let parsed = url::Url::parse(target_url.trim())
+        .map_err(|e| format!("目标 URL 格式无效: {e}"))?;
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("安全限制：仅允许在 AdsPower 中打开 http(s) 链接 ({scheme})"));
+    }
+
+    let start_res = start_browser(settings, user_id, serial_number).await?;
+    let port: u16 = start_res
+        .debug_port
+        .as_deref()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|&p| p > 1024)
+        .ok_or_else(|| {
+            "AdsPower 已拉起环境，但未返回有效的调试端口 (debug_port)，无法自动打开标签页".to_string()
+        })?;
+
+    open_cdp_tab_via_http(port, parsed.as_str()).await?;
+    Ok(start_res)
 }
 
 pub async fn stop_browser(
@@ -578,5 +701,66 @@ mod tests {
         assert_eq!(items[0].name, "JP 主力谷歌");
         assert_eq!(items[1].user_id, "k91abz02");
         assert_eq!(items[1].serial_number, "7");
+    }
+
+    #[test]
+    fn percent_encode_preserves_oauth_query_and_fragment() {
+        let raw = "https://accounts.google.com/o/oauth2/v2/auth?client_id=abc-123&redirect_uri=http%3A%2F%2F127.0.0.1%3A54321%2Fcb&scope=openid%20email#state=xyz";
+        let enc = percent_encode_uri_component(raw);
+        assert!(!enc.contains('&'));
+        assert!(!enc.contains('#'));
+        assert!(!enc.contains('?'));
+        assert!(enc.contains("https%3A%2F%2Faccounts.google.com%2Fo%2Foauth2%2Fv2%2Fauth%3F"));
+        assert!(enc.contains("%26redirect_uri%3D"));
+        assert!(enc.contains("%23state%3Dxyz"));
+    }
+
+    #[test]
+    fn open_cdp_tab_sends_encoded_put_and_activates_tab() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let target = "https://accounts.google.com/o/oauth2/v2/auth?a=1&b=2#s=3";
+            let expected_encoded = percent_encode_uri_component(target);
+
+            let server = tokio::spawn(async move {
+                let mut reqs = Vec::new();
+                for idx in 0..2 {
+                    let (mut sock, _) = listener.accept().await.unwrap();
+                    let mut buf = [0u8; 2048];
+                    let n = sock.read(&mut buf).await.unwrap();
+                    let first_line = String::from_utf8_lossy(&buf[..n])
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    reqs.push(first_line);
+                    let body = if idx == 0 {
+                        r#"{"id":"TAB-99","type":"page"}"#
+                    } else {
+                        "Target activated"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    sock.write_all(resp.as_bytes()).await.unwrap();
+                }
+                reqs
+            });
+
+            open_cdp_tab_via_http(port, target).await.unwrap();
+            let reqs = server.await.unwrap();
+            assert_eq!(
+                reqs[0],
+                format!("PUT /json/new?{expected_encoded} HTTP/1.1")
+            );
+            assert_eq!(reqs[1], "GET /json/activate/TAB-99 HTTP/1.1");
+        });
     }
 }

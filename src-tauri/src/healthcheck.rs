@@ -300,12 +300,14 @@ pub async fn run_eight_checks(cfg: &AppConfig, status: &GatewayStatus) -> Vec<Di
 }
 
 fn browser_prefs_hardened() -> bool {
-    let pref = app_data_dir()
-        .join("browser-profile")
-        .join("Default")
-        .join("Preferences");
-    if let Ok(raw) = std::fs::read_to_string(pref) {
-        return raw.contains("disable_non_proxied_udp");
+    let base = app_data_dir();
+    for dir_name in ["browser-profile-fp", "browser-profile"] {
+        let pref = base.join(dir_name).join("Default").join("Preferences");
+        if let Ok(raw) = std::fs::read_to_string(pref) {
+            if raw.contains("disable_non_proxied_udp") {
+                return true;
+            }
+        }
     }
     false
 }
@@ -382,16 +384,18 @@ pub fn apply_fix_action(action: &str, _cfg: &AppConfig) -> Result<String, String
             Ok("已清空用户级全局代理环境变量，后续仅由安全终端局部注入".into())
         }
         "harden_browser_prefs" => {
-            let default_dir = app_data_dir().join("browser-profile").join("Default");
-            std::fs::create_dir_all(&default_dir).map_err(|e| e.to_string())?;
-            let pref = default_dir.join("Preferences");
             let val = serde_json::json!({
                 "dns_over_https": { "mode": "off" },
                 "webrtc": { "ip_handling_policy": "disable_non_proxied_udp" },
                 "net": { "network_prediction_options": 2 }
             });
-            std::fs::write(pref, serde_json::to_string_pretty(&val).unwrap())
-                .map_err(|e| e.to_string())?;
+            let pretty = serde_json::to_string_pretty(&val).unwrap();
+            for dir_name in ["browser-profile-fp", "browser-profile"] {
+                let default_dir = app_data_dir().join(dir_name).join("Default");
+                std::fs::create_dir_all(&default_dir).map_err(|e| e.to_string())?;
+                std::fs::write(default_dir.join("Preferences"), &pretty)
+                    .map_err(|e| e.to_string())?;
+            }
             Ok("已初始化防泄漏浏览器 Preferences".into())
         }
         other => Err(format!("未知修复操作: {other}")),

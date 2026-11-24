@@ -7,6 +7,8 @@ pub struct ProtectedTarget {
     pub allow_private_lan: bool,
     #[serde(default)]
     pub allowed_loopback_ports: Vec<u16>,
+    #[serde(default)]
+    pub allowed_loopback_port_ranges: Vec<(u16, u16)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
